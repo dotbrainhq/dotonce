@@ -1,0 +1,48 @@
+# CI for dotonce: format, lint and tests on Linux and macOS, plus the benchmark compare tests.
+# Branch protection requires only the final "CI passed" job.
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-24.04, macos-15 ]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  bench:
+    name: Benchmark compare tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 bench/amb/test_compare.py
+
+  ci-passed:
+    name: CI passed
+    if: always()
+    needs: [ rust, bench ]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check that every job passed
+        run: |
+          test "${{ needs.rust.result }}" = success
+          test "${{ needs.bench.result }}" = success

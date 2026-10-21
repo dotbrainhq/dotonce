@@ -1,0 +1,49 @@
+name: Feature request
+description: An idea for something dotonce could do.
+labels: [ "enhancement" ]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. The problem you're trying to solve helps most, even more than the fix you have in mind.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of dotonce?
+      options:
+        - "Search and storage"
+        - "Command line"
+        - "Benchmark adapter"
+        - "Brand and docs"
+        - Something new
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's the problem?
+      description: What are you trying to do, and what gets in the way?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: What would you like dotonce to do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What do you do today instead?
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you send it
+      options:
+        - label: I searched the open and closed issues, and nobody has asked for this yet.
+          required: true
