@@ -3,6 +3,13 @@ name = "dotonce"
 version = "0.0.1"
 publish = false
 edition = "2024"
+rust-version = "1.85"
+description = "Memory and mistake checks for AI coding agents. Correct your agent once."
+license = "MIT"
+repository = "https://github.com/dotbrainhq/dotonce"
+readme = "README.md"
+keywords = ["ai", "agents", "memory", "claude-code", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1.0.104"
