@@ -21,8 +21,8 @@ dotonce is free and open source. It's in early development, and there's no relea
 
 ## What works today
 
-- **Search engine:** stores conversation turns exactly as written in one SQLite file per user, and finds the ones a question needs by keyword, typo-tolerant matching, names, and dates. Results are merged, grouped by conversation, and fitted into a token budget.
-- **Speed:** with 100,000 stored turns, a search takes about 24 ms, and 95% finish within 28 ms on an Apple M3 Pro.
+- **Search engine:** stores conversation turns exactly as written in one SQLite file per user, and finds the ones a question needs by keyword, typo-tolerant matching, names, and dates. Results are merged, grouped by conversation, and fitted into a token budget, with each conversation's weekday and how many days before the question it happened.
+- **Speed:** with 100,000 stored turns, a search takes about 26 ms, and 95% finish within 31 ms on an Apple M3 Pro.
 - **Benchmark adapter:** runs dotonce on LongMemEval and LoCoMo, two of the most used tests for AI agent memory, through the open [agent-memory-benchmark](https://github.com/vectorize-io/agent-memory-benchmark) runner. That puts it side by side with other memory tools, with the same answering model and the same judge.
 
 ## What's coming

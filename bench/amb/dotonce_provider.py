@@ -50,7 +50,9 @@ class DotonceMemoryProvider(MemoryProvider):
 
     def __init__(self):
         self._bin = os.environ.get("DOTONCE_BIN", "dotonce")
-        self._budget = int(os.environ.get("DOTONCE_BUDGET_TOKENS", "20000"))
+        self._budget = int(os.environ.get("DOTONCE_BUDGET_TOKENS", "40000"))
+        self._max_sessions = os.environ.get("DOTONCE_MAX_SESSIONS")
+        self._fill = os.environ.get("DOTONCE_FILL")
         self._proc = None
         self._lock = threading.Lock()
 
@@ -97,6 +99,8 @@ class DotonceMemoryProvider(MemoryProvider):
                 "user_id": user_id,
                 "query_timestamp": query_timestamp,
                 "budget_tokens": self._budget,
+                **({"max_sessions": int(self._max_sessions)} if self._max_sessions else {}),
+                **({"fill": self._fill == "1"} if self._fill is not None else {}),
             }
         )
         docs = [
