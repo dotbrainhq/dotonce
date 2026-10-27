@@ -1,5 +1,5 @@
 """Adapter smoke test: no model calls. Run from the runner checkout:
-DOTONCE_BIN=~/DotbrainLLC/dotonce/target/release/dotonce uv run python ~/DotbrainLLC/dotonce/bench/amb/smoke.py
+DOTONCE_BIN=/path/to/dotonce/target/release/dotonce uv run python /path/to/dotonce/bench/amb/smoke.py
 """
 
 import json

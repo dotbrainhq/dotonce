@@ -1,6 +1,6 @@
 """Adapter process-handling tests: no model calls. Install the adapter first, then
 run from the runner checkout:
-DOTONCE_BIN=~/DotbrainLLC/dotonce/target/release/dotonce uv run python ~/DotbrainLLC/dotonce/bench/amb/test_provider.py
+DOTONCE_BIN=/path/to/dotonce/target/release/dotonce uv run python /path/to/dotonce/bench/amb/test_provider.py
 """
 
 import os
