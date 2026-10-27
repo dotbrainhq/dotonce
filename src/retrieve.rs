@@ -13,15 +13,18 @@ pub struct Options {
     pub max_sessions: usize,
     pub rrf_k: f64,
     pub arm_limit: usize,
+    /// Fill budget left after the matched sessions with other sessions, newest first.
+    pub fill: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
-            budget_tokens: 20_000,
-            max_sessions: 40,
+            budget_tokens: 40_000,
+            max_sessions: 60,
             rrf_k: 60.0,
             arm_limit: 200,
+            fill: true,
         }
     }
 }
@@ -47,7 +50,7 @@ const RESERVE_PCT: usize = 20;
 const EXTRA_MATCHED: usize = 3;
 const SHORT_TURN_CHARS: usize = 500;
 
-fn window(s: &SessionRow, by_score: &[i64], (turns, radius): (usize, i64)) -> String {
+fn window(s: &SessionRow, by_score: &[i64], (turns, radius): (usize, i64), note: &str) -> String {
     let mut focus: BTreeSet<i64> = by_score.iter().take(turns).copied().collect();
     let mut shown: BTreeSet<i64> = focus.iter().flat_map(|h| h - radius..=h + radius).collect();
     let short: HashSet<i64> = s
@@ -62,14 +65,33 @@ fn window(s: &SessionRow, by_score: &[i64], (turns, radius): (usize, i64)) -> St
             shown.insert(*n);
         }
     }
-    render(s, Some((&focus, &shown)))
+    render(s, Some((&focus, &shown)), note)
+}
+
+/// Weekday and how long before the question a session happened, so the reader
+/// doesn't have to do date arithmetic. Empty when either date is unknown.
+fn date_note(ts: Option<i64>, anchor: Option<i64>) -> String {
+    let (Some(ts), Some(anchor)) = (ts, anchor) else {
+        return String::new();
+    };
+    let Some(day) = chrono::DateTime::from_timestamp(ts, 0) else {
+        return String::new();
+    };
+    let weekday = day.format("%A");
+    let days = (anchor - ts).div_euclid(86_400);
+    match days {
+        d if d < 0 => format!(" ({weekday}, after the question date)"),
+        0 => format!(" ({weekday}, the same day as the question)"),
+        1 => format!(" ({weekday}, 1 day before the question)"),
+        d => format!(" ({weekday}, {d} days before the question)"),
+    }
 }
 
 /// Renders a session, or with `focus` only the `shown` turns of it: focus turns
 /// whole, the others shortened.
-fn render(s: &SessionRow, focus: Option<(&BTreeSet<i64>, &BTreeSet<i64>)>) -> String {
+fn render(s: &SessionRow, focus: Option<(&BTreeSet<i64>, &BTreeSet<i64>)>, note: &str) -> String {
     let date = s.ts_text.as_deref().unwrap_or("unknown");
-    let mut out = format!("### Session | date: {date}\n");
+    let mut out = format!("### Session | date: {date}{note}\n");
     let mut last_kept: Option<i64> = None;
     let mut cut_after_last = false;
     for (no, speaker, text) in &s.turns {
@@ -180,7 +202,7 @@ pub fn retrieve(
         .collect();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
 
-    Ok(pack(ix, ranked, user, opt)?
+    Ok(pack(ix, ranked, user, anchor, opt)?
         .into_iter()
         .map(|(_, h)| h)
         .collect())
@@ -194,6 +216,7 @@ fn pack(
     ix: &Index,
     ranked: Vec<(i64, f64, Vec<i64>)>,
     user: &str,
+    anchor: Option<i64>,
     opt: &Options,
 ) -> Result<Vec<(Option<i64>, SessionHit)>> {
     let reserve = opt.budget_tokens * RESERVE_PCT / 100;
@@ -205,11 +228,12 @@ fn pack(
             break;
         }
         let s = ix.session(sid)?;
-        let full = render(&s, None);
+        let note = date_note(s.ts, anchor);
+        let full = render(&s, None, &note);
         let text = if estimate_tokens(&full) + reserve <= left {
             full
         } else {
-            let narrow = window(&s, &by_score, STEPS[0]);
+            let narrow = window(&s, &by_score, STEPS[0], &note);
             if estimate_tokens(&narrow) > left {
                 continue;
             }
@@ -221,8 +245,13 @@ fn pack(
     }
     for (s, _, by_score, text) in picked.iter_mut() {
         let now = estimate_tokens(text);
-        let wider = std::iter::once(render(s, None))
-            .chain(STEPS[1..].iter().rev().map(|st| window(s, by_score, *st)));
+        let note = date_note(s.ts, anchor);
+        let wider = std::iter::once(render(s, None, &note)).chain(
+            STEPS[1..]
+                .iter()
+                .rev()
+                .map(|st| window(s, by_score, *st, &note)),
+        );
         for t in wider {
             let need = estimate_tokens(&t);
             if need > now && need - now <= left {
@@ -232,7 +261,7 @@ fn pack(
             }
         }
     }
-    if !picked.is_empty() && left >= MIN_LEFT {
+    if opt.fill && !picked.is_empty() && left >= MIN_LEFT {
         for sid in ix.sessions_newest_first(user)? {
             if picked.len() >= opt.max_sessions || left < MIN_LEFT {
                 break;
@@ -241,7 +270,7 @@ fn pack(
                 continue;
             }
             let s = ix.session(sid)?;
-            let text = render(&s, None);
+            let text = render(&s, None, &date_note(s.ts, anchor));
             if estimate_tokens(&text) <= left {
                 left -= estimate_tokens(&text);
                 picked.push((s, 0.0, Vec::new(), text));
@@ -772,14 +801,14 @@ mod tests {
             .map(|(i, (sp, t))| (i as i64, sp.to_string(), t.to_string()))
             .collect(),
         };
-        let text = window(&s, &[1], STEPS[0]);
+        let text = window(&s, &[1], STEPS[0], "");
         assert!(text.contains("user: my bicycle is red\n"), "{text}");
         assert!(!text.contains(&long_reply), "{text}");
         assert!(
             estimate_tokens(&text) < estimate_tokens(&long_reply),
             "{text}"
         );
-        assert!(render(&s, None).contains(&long_reply));
+        assert!(render(&s, None, "").contains(&long_reply));
     }
 
     #[test]
@@ -799,18 +828,69 @@ mod tests {
                 .map(|(i, (sp, t))| (i as i64, sp.to_string(), t.to_string()))
                 .collect(),
         };
-        let text = window(&s, &[7, 8, 0], STEPS[0]);
+        let text = window(&s, &[7, 8, 0], STEPS[0], "");
         assert!(
             text.contains("user: my aunt gave me a ring today\n"),
             "{text}"
         );
         assert!(!text.contains("assistant: Nice."), "{text}");
-        let without_short = window(&s, &[7, 8], STEPS[0]);
+        let without_short = window(&s, &[7, 8], STEPS[0], "");
         assert!(!without_short.contains("aunt"), "{without_short}");
         assert!(
             !without_short.contains(&format!("user: {long_reply}")),
             "{without_short}"
         );
+    }
+
+    #[test]
+    fn headers_say_how_long_before_the_question() {
+        let mut ix = Index::open(":memory:").unwrap();
+        ix.add_sessions(&[doc(
+            "bake",
+            "u1",
+            "2022-03-21T15:54:00+00:00",
+            &["I took a baking class at the culinary school"],
+        )])
+        .unwrap();
+        let anchor = parse_ts("2022-04-15T18:46:00+00:00");
+        let hits = retrieve(&ix, "baking class", "u1", anchor, &Options::default()).unwrap();
+        assert!(
+            hits[0].text.starts_with("### Session | date: 2022-03-21T15:54:00+00:00 (Monday, 25 days before the question)\n"),
+            "{}",
+            hits[0].text
+        );
+        let none = retrieve(&ix, "baking class", "u1", None, &Options::default()).unwrap();
+        assert!(
+            none[0]
+                .text
+                .starts_with("### Session | date: 2022-03-21T15:54:00+00:00\n")
+        );
+    }
+
+    #[test]
+    fn fill_off_returns_only_matched_sessions() {
+        let mut ix = Index::open(":memory:").unwrap();
+        ix.add_sessions(&[
+            doc(
+                "dog",
+                "u1",
+                "2023-01-01T10:00:00+00:00",
+                &["I adopted a dog named Rex"],
+            ),
+            doc(
+                "lunch",
+                "u1",
+                "2023-01-02T10:00:00+00:00",
+                &["Lunch was pasta"],
+            ),
+        ])
+        .unwrap();
+        let opt = Options {
+            fill: false,
+            ..Options::default()
+        };
+        let hits = retrieve(&ix, "dog", "u1", None, &opt).unwrap();
+        assert_eq!(ids(&hits), vec!["dog"]);
     }
 
     #[test]
@@ -846,7 +926,7 @@ mod tests {
         let hits = retrieve(&ix, "dog", "u1", None, &Options::default()).unwrap();
         assert_eq!(ids(&hits), vec!["dog", "old", "new"]);
         assert_eq!(matched(&hits), vec!["dog"]);
-        let size = |sid| estimate_tokens(&render(&ix.session(sid).unwrap(), None));
+        let size = |sid| estimate_tokens(&render(&ix.session(sid).unwrap(), None, ""));
         let tight = Options {
             budget_tokens: size(1) + size(3) + MIN_LEFT - 1,
             ..Options::default()

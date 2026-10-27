@@ -21,6 +21,8 @@ enum Request {
         user_id: Option<String>,
         query_timestamp: Option<String>,
         budget_tokens: Option<usize>,
+        max_sessions: Option<usize>,
+        fill: Option<bool>,
     },
     Reset,
 }
@@ -47,10 +49,18 @@ fn run(st: &mut Store, req: Request) -> Result<Value> {
             user_id,
             query_timestamp,
             budget_tokens,
+            max_sessions,
+            fill,
         } => {
             let mut opt = Options::default();
             if let Some(b) = budget_tokens {
                 opt.budget_tokens = b;
+            }
+            if let Some(m) = max_sessions {
+                opt.max_sessions = m;
+            }
+            if let Some(f) = fill {
+                opt.fill = f;
             }
             let anchor = query_timestamp.as_deref().and_then(parse_ts);
             let user = user_id.unwrap_or_default();
