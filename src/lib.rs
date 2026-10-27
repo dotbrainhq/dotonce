@@ -1,3 +1,5 @@
+pub mod config;
+pub mod fact;
 pub mod fuse;
 pub mod index;
 pub mod model;
