@@ -2131,3 +2131,51 @@ fn display_hook_never_loses_held_lines() {
     assert_eq!(batch(no_final("Sorry for the wait.\n```\n")), None);
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+/// What a display hook call puts on screen, or None when the batch shows as it is.
+fn display_out(h: &Path, input: serde_json::Value) -> Option<String> {
+    let out = hook(h, "display", input);
+    if out.trim().is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "MessageDisplay");
+    Some(
+        v["hookSpecificOutput"]["displayContent"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    )
+}
+
+#[test]
+fn a_draft_after_the_send_back_always_shows() {
+    let h = ticket_home("displayagain", "fix");
+    use_skill(&h, "s1", "p1");
+    assert!(!sent_back(&stop(&h, "s1", "p1", BROKEN, false)).is_empty());
+    let again = "Second try:\n```markdown\nHi Sam,\nSorry for the wait.\n```\n";
+    assert_eq!(
+        display_out(
+            &h,
+            serde_json::json!({"session_id": "s1", "prompt_id": "p1", "message_id": "m2", "index": 0, "final": true, "delta": again})
+        ),
+        None,
+        "Stop won't send this draft back, so it shows in full"
+    );
+    assert_eq!(
+        display_out(
+            &h,
+            serde_json::json!({"session_id": "s1", "message_id": "m3", "index": 0, "final": true, "delta": again})
+        ),
+        None,
+        "without a prompt_id the session's turn is used"
+    );
+    use_skill(&h, "s1", "p2");
+    let out = display_out(
+        &h,
+        serde_json::json!({"session_id": "s1", "prompt_id": "p2", "message_id": "m4", "index": 0, "final": true, "delta": again}),
+    )
+    .unwrap();
+    assert!(out.contains("(dotonce held back a draft"), "{out}");
+    std::fs::remove_dir_all(&h).unwrap();
+}

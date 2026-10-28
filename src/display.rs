@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::approvals::{self, Live};
 use crate::checks::{self, fence_closes, fence_open};
-use crate::hook::{log_error, session_id, str_field};
+use crate::hook::{log_error, prompt_id, session_id, str_field};
 use crate::rules::Level;
 use crate::session;
 
@@ -98,13 +98,24 @@ fn load_held(path: &Path) -> Held {
         .unwrap_or_default()
 }
 
-/// The session's checking fix sets.
-fn fix_sets(live: Result<Vec<Live>>, dir: &Path, sid: &str) -> Result<Vec<Live>> {
+/// The session's checking fix sets. None once the turn was sent back: Stop
+/// sends a turn back once, so a draft held after that would never be
+/// followed by a corrected one.
+fn fix_sets(
+    live: Result<Vec<Live>>,
+    dir: &Path,
+    sid: &str,
+    turn: Option<&str>,
+) -> Result<Vec<Live>> {
     let live = live?;
     if live.is_empty() {
         return Ok(live);
     }
     let state = session::load(dir, sid)?;
+    let turn = turn.or(state.prompt_id.as_deref()).unwrap_or("unknown");
+    if state.sent_back(turn) {
+        return Ok(Vec::new());
+    }
     Ok(session::checking(&state, &live)
         .into_iter()
         .filter(|l| l.level == Level::Fix)
@@ -145,7 +156,7 @@ pub fn display(v: &Value) -> Result<Option<String>> {
     let delta = str_field(v, "delta");
     // Without a final flag, nothing is held past this batch.
     let last = v.get("final").and_then(Value::as_bool).unwrap_or(true);
-    let mut shown = match fix_sets(live, &dir, sid) {
+    let mut shown = match fix_sets(live, &dir, sid, prompt_id(v)) {
         Ok(fix) if fix.is_empty() && held.lines.is_empty() => return Ok(None),
         Ok(fix) => {
             if let Some(i) = v.get("index").and_then(Value::as_u64) {
