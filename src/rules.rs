@@ -415,9 +415,16 @@ pub fn load_dir(dir: &Path) -> Result<Loaded> {
         .collect();
     files.sort();
     for file in files {
-        let res = fs::read_to_string(&file)
-            .map_err(anyhow::Error::from)
-            .and_then(|src| parse(&src, &file));
+        // A link could point the folder at a file outside it, so it's an
+        // error rather than a set.
+        let linked = fs::symlink_metadata(&file).is_ok_and(|m| m.file_type().is_symlink());
+        let res = if linked {
+            Err(anyhow::anyhow!("symlinked rule files aren't loaded"))
+        } else {
+            fs::read_to_string(&file)
+                .map_err(anyhow::Error::from)
+                .and_then(|src| parse(&src, &file))
+        };
         match res {
             Ok(s) => out.sets.push(s),
             Err(e) => out.errors.push(FileError {
@@ -758,6 +765,29 @@ why = "No TODOs in Rust files."
             l.errors[0].line()
         );
         assert!(load_dir(&dir.join("missing")).unwrap().sets.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_rule_file_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("dotonce-rules-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let rules = dir.join("rules");
+        fs::create_dir_all(&rules).unwrap();
+        fs::write(dir.join("acme.toml"), "id = \"acme\"\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("acme.toml"), rules.join("acme.toml")).unwrap();
+        std::os::unix::fs::symlink(dir.join("missing.toml"), rules.join("gone.toml")).unwrap();
+        fs::write(rules.join("beta.toml"), "id = \"beta\"\n").unwrap();
+        let l = load_dir(&rules).unwrap();
+        let ids: Vec<&str> = l.sets.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["beta"]);
+        assert_eq!(l.errors.len(), 2, "{:?}", l.errors);
+        assert!(l.errors[0].file.ends_with("acme.toml"));
+        assert!(l.errors[1].file.ends_with("gone.toml"));
+        for e in &l.errors {
+            assert_eq!(e.error, "symlinked rule files aren't loaded");
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 
