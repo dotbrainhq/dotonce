@@ -499,6 +499,16 @@ impl Now {
 /// the text as it is, and Stop sends nothing back.
 pub fn checks_now(state: &State, cwd: &Path, prompt_id: Option<&str>) -> Result<Now> {
     let (live, _) = approvals::load_live()?;
+    checks_with(live, state, cwd, prompt_id)
+}
+
+/// Like `checks_now`, with the live sets already loaded.
+pub fn checks_with(
+    live: Vec<Live>,
+    state: &State,
+    cwd: &Path,
+    prompt_id: Option<&str>,
+) -> Result<Now> {
     let mut state = state.clone();
     if !live.is_empty() {
         let cfg = config::load_file()?.unwrap_or_default();

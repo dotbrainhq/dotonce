@@ -10,6 +10,7 @@ use anyhow::Result;
 use globset::Glob;
 use serde_json::{Value, json};
 
+use crate::approvals;
 use crate::catches::{self, Catch, Outcome};
 use crate::checks::{Failure, failing_line};
 use crate::config::{home_dir, lexical_normalize, resolve};
@@ -974,20 +975,18 @@ pub fn pre_tool(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
     let Some((path, body)) = tool_text(tool, &input) else {
         return Ok(None);
     };
-    let dir = session::dir()?;
-    let before = match session_id(v) {
-        Ok(sid) => session::load(&dir, sid)?,
-        Err(_) => session::State::default(),
-    };
-    let session::Now {
-        live,
-        mut state,
-        turn,
-    } = session::checks_now(&before, cwd, prompt_id(v))?;
+    let (live, _) = approvals::load_live()?;
     if live.is_empty() {
         return Ok(None);
     }
     let sid = session_id(v)?;
+    let dir = session::dir()?;
+    let before = session::load(&dir, sid)?;
+    let session::Now {
+        live,
+        mut state,
+        turn,
+    } = session::checks_with(live, &before, cwd, prompt_id(v))?;
     let abs = path
         .filter(|p| !p.is_empty())
         .map(|p| cwd.join(p).to_string_lossy().into_owned());

@@ -3419,3 +3419,24 @@ fn rules_test_takes_only_the_five_tool_names() {
     }
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+#[test]
+fn pre_tool_reads_the_session_file_only_with_rule_sets() {
+    let input = |cwd: &Path| serde_json::json!({"session_id": "///", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": cwd});
+    let errors =
+        |h: &Path| std::fs::read_to_string(h.join("dotonce/errors.log")).unwrap_or_default();
+    let h = home("presessionempty");
+    let proj = h.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    assert!(hook(&h, "pre-tool", input(&proj)).trim().is_empty());
+    assert_eq!(errors(&h), "", "no rule sets, no session file read");
+    std::fs::remove_dir_all(&h).unwrap();
+    let (h, proj) = code_home("presessionset", "warn");
+    assert!(hook(&h, "pre-tool", input(&proj)).trim().is_empty());
+    assert!(
+        errors(&h).contains("no usable session_id"),
+        "{}",
+        errors(&h)
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
