@@ -1316,20 +1316,34 @@ fn hook_path_never_writes_to_stderr() {
     }
     let log = std::fs::read_to_string(h.join("dotonce/errors.log")).unwrap();
     assert!(log.contains("hook arguments"), "{log}");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dotonce"))
-        .args(["hook", "prompt"])
-        .env("DOTONCE_HOME", h.join("dotonce"))
-        .env("HOME", &h)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    drop(child.stderr.take());
-    let _ = child.stdin.take().unwrap().write_all(b"not json");
-    let out = child.wait_with_output().unwrap();
-    assert!(out.status.success());
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn hook_argument_errors_with_stderr_closed_exit_0() {
+    let h = home("stderrclosed");
+    for args in [&["hook"][..], &["hook", "prompt"]] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_dotonce"));
+        cmd.args(args)
+            .env("DOTONCE_HOME", h.join("dotonce"))
+            .env("HOME", &h);
+        for v in AGENT_VARS {
+            cmd.env_remove(v);
+        }
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Claude Code may close stderr: any write to it now fails.
+        drop(child.stderr.take());
+        let _ = child.stdin.take().unwrap().write_all(b"not json");
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{args:?}: {:?}", out.status);
+    }
     let log = std::fs::read_to_string(h.join("dotonce/errors.log")).unwrap();
+    assert!(log.contains("hook arguments"), "{log}");
     assert!(!log.contains("panic"), "{log}");
     std::fs::remove_dir_all(&h).unwrap();
 }
