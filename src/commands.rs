@@ -1,6 +1,6 @@
 //! The `dotonce rules`, `stats` and `doctor` commands.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ use crate::checks::{self, Failure};
 use crate::config;
 use crate::hook;
 use crate::retrieve::estimate_tokens;
-use crate::rules::{self, Level, RuleSet, printable};
+use crate::rules::{self, FileError, Level, Loaded, RuleSet, printable};
 use crate::session::{self, Event, State, Trigger};
 use crate::tools;
 
@@ -52,28 +52,69 @@ pub fn rules_new(id: &str, whole: Option<bool>, input: &mut dyn BufRead) -> Resu
     Ok(path)
 }
 
+/// The ids to hide in this folder: the private sets, unless it is inside
+/// one of the config's private paths.
+fn hidden_ids(sets: &[RuleSet], errors: &[FileError]) -> Result<BTreeSet<String>> {
+    if private_here()? {
+        return Ok(BTreeSet::new());
+    }
+    Ok(hook::private_ids(sets, errors))
+}
+
+/// The line that stands for the private sets left out.
+fn hidden_line(n: usize) -> String {
+    if n == 1 {
+        "1 private rule set hidden; run this inside a private folder to see it".to_string()
+    } else {
+        format!("{n} private rule sets hidden; run this inside a private folder to see them")
+    }
+}
+
+/// Each line of the text made printable, keeping the line breaks.
+fn printable_lines(s: &str) -> String {
+    s.lines().map(printable).collect::<Vec<_>>().join("\n")
+}
+
 /// Prints one line per rule file and fails when any file has an error.
+/// Outside the private paths a private set is only counted.
 pub fn rules_check() -> Result<()> {
     let loaded = rules::load_checked()?;
     if loaded.sets.is_empty() && loaded.errors.is_empty() {
         println!("no rule sets in {}", rules::rules_dir()?.display());
         return Ok(());
     }
+    let hide = hidden_ids(&loaded.sets, &loaded.errors)?;
+    let mut hidden = 0;
     for s in &loaded.sets {
-        println!("ok     {} ({} checks)", s.id, s.checks.len());
+        if hide.contains(&s.id) {
+            hidden += 1;
+            continue;
+        }
+        let id = printable(&s.id);
+        println!("ok     {id} ({} checks)", s.checks.len());
         if let Some(r) = &s.remind {
             // The cost the hooks count for it: `[id]`, the text, two newlines.
             let tokens = estimate_tokens(&format!("[{}]\n{}\n", s.id, r.text.trim()));
             if tokens > LONG_REMINDER {
                 println!(
-                    "warn   {}: its reminder is about {tokens} tokens, over 1,800, so it may not fit under the hooks' 2,000-token cap",
-                    s.id
+                    "warn   {id}: its reminder is about {tokens} tokens, over 1,800, so it may not fit under the hooks' 2,000-token cap"
                 );
             }
         }
     }
     for e in &loaded.errors {
-        println!("error  {}: {}", e.file.display(), e.error);
+        if hide.contains(&e.stem()) {
+            hidden += 1;
+            continue;
+        }
+        println!(
+            "error  {}: {}",
+            printable(&e.file.to_string_lossy()),
+            printable_lines(&e.error)
+        );
+    }
+    if hidden > 0 {
+        println!("{}", hidden_line(hidden));
     }
     if !loaded.errors.is_empty() {
         bail!(
@@ -84,25 +125,28 @@ pub fn rules_check() -> Result<()> {
     Ok(())
 }
 
-/// The set with this id. A file with an error is named with its error, so
-/// the user sees why the set is missing.
+/// The set with this id, every pattern compiled. A file with an error is
+/// named with its error, so the user sees why the set is missing.
 fn find_set(id: &str) -> Result<RuleSet> {
-    let mut loaded = rules::load_checked()?;
+    find_in(rules::load_checked()?, id)
+}
+
+fn find_in(mut loaded: Loaded, id: &str) -> Result<RuleSet> {
     if let Some(i) = loaded.sets.iter().position(|s| s.id == id) {
         return Ok(loaded.sets.swap_remove(i));
     }
-    if let Some(e) = loaded
-        .errors
-        .iter()
-        .find(|e| e.file.file_stem().is_some_and(|s| s == id))
-    {
+    if let Some(e) = loaded.errors.iter().find(|e| e.stem() == id) {
         bail!(
             "{} has an error, fix it first: {}",
-            e.file.display(),
-            e.error
+            printable(&e.file.to_string_lossy()),
+            printable_lines(&e.error)
         );
     }
-    bail!("no rule set {id} in {}", rules::rules_dir()?.display())
+    bail!(
+        "no rule set {} in {}",
+        printable(id),
+        rules::rules_dir()?.display()
+    )
 }
 
 #[derive(Serialize)]
@@ -116,7 +160,12 @@ fn print_failures(fails: &[Failure]) {
         println!("passes: no check fails");
     }
     for f in fails {
-        println!("{}: \"{}\"\n  {}", f.check, f.line, f.why);
+        println!(
+            "{}: \"{}\"\n  {}",
+            printable(&f.check),
+            printable(&f.line),
+            printable(&f.why)
+        );
     }
 }
 
@@ -129,7 +178,14 @@ pub fn rules_test(
     tool: Option<&str>,
     path: Option<&str>,
 ) -> Result<()> {
-    let set = find_set(id)?;
+    let loaded = rules::load_checked()?;
+    if hidden_ids(&loaded.sets, &loaded.errors)?.contains(id) {
+        bail!(
+            "{} is a private rule set: run this inside a private folder to test it",
+            printable(id)
+        );
+    }
+    let set = find_in(loaded, id)?;
     let text = fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
     let (drafts, fails) = match tool {
         Some(t) => (1, tools::run_tool(&set, t, path, &text)),
@@ -153,8 +209,10 @@ pub fn rules_test(
             .map(|d| d.fence.join(", "))
             .unwrap_or_default();
         println!(
-            "no drafts in {}: {id} checks fenced blocks marked {fences}",
-            file.display()
+            "no drafts in {}: {} checks fenced blocks marked {}",
+            file.display(),
+            printable(id),
+            printable(&fences)
         );
         return Ok(());
     }
@@ -230,6 +288,7 @@ pub fn rules_list() -> Result<()> {
         println!("no rule sets in {}", rules::rules_dir()?.display());
         return Ok(());
     }
+    let hide = hidden_ids(&loaded.sets, &loaded.errors)?;
     // The last time a check caught something: fixes and re-checks don't
     // count, and neither does a line whose time doesn't parse.
     let mut last: BTreeMap<String, String> = BTreeMap::new();
@@ -244,7 +303,7 @@ pub fn rules_list() -> Result<()> {
     }
     let mut hidden = 0;
     for s in &loaded.sets {
-        if s.private && !private_ok {
+        if hide.contains(&s.id) {
             hidden += 1;
             continue;
         }
@@ -266,21 +325,35 @@ pub fn rules_list() -> Result<()> {
         );
     }
     for e in &loaded.errors {
-        let stem = e
-            .file
-            .file_stem()
-            .map(|s| printable(&s.to_string_lossy()))
-            .unwrap_or_default();
+        if hide.contains(&e.stem()) {
+            hidden += 1;
+            continue;
+        }
+        let stem = printable(&e.stem());
         println!("{stem:<24} {:<24} {}", "error", printable(&e.line()));
     }
     if hidden > 0 {
-        println!("{hidden} private set(s) hidden outside private_paths");
+        println!("{}", hidden_line(hidden));
     }
     Ok(())
 }
 
+/// The logged catches to show here. Outside the private paths that is the
+/// public log without the sets that count as private now, since a set can
+/// turn private after its catches were logged.
+fn shown_catches() -> Result<Vec<catches::Catch>> {
+    let private_ok = private_here()?;
+    let all = catches::read(private_ok)?;
+    if private_ok {
+        return Ok(all);
+    }
+    let loaded = rules::load_checked()?;
+    let hide = hook::private_ids(&loaded.sets, &loaded.errors);
+    Ok(all.into_iter().filter(|c| !hide.contains(&c.set)).collect())
+}
+
 pub fn rules_log(limit: usize) -> Result<()> {
-    let all = catches::read(private_here()?)?;
+    let all = shown_catches()?;
     if all.is_empty() {
         println!("no catches yet");
         return Ok(());
@@ -304,7 +377,7 @@ pub fn rules_log(limit: usize) -> Result<()> {
 }
 
 pub fn stats() -> Result<()> {
-    let all = catches::read(private_here()?)?;
+    let all = shown_catches()?;
     let rows = catches::stats(&all, chrono::Utc::now().timestamp());
     if rows.is_empty() {
         println!("no catches in the last 30 days");
@@ -347,7 +420,12 @@ pub fn rules_why(session_id: Option<&str>) -> Result<()> {
     let cfg = config::load()?;
     let cwd = std::env::current_dir().unwrap_or_default();
     let private_ok = cfg.private_allowed(&cwd);
-    let (live, _) = approvals::load_live()?;
+    let (live, errors) = approvals::load_live()?;
+    let hide = if private_ok {
+        BTreeSet::new()
+    } else {
+        hook::private_ids(live.iter().map(|l| &l.set), &errors)
+    };
     let dir = session::dir()?;
     let sid = pick_session(&dir, session_id)?;
     let mut state = match &sid {
@@ -364,7 +442,7 @@ pub fn rules_why(session_id: Option<&str>) -> Result<()> {
         let Some(l) = live.iter().find(|l| l.set.id == a.id) else {
             continue;
         };
-        if l.set.private && !private_ok {
+        if hide.contains(&l.set.id) {
             continue;
         }
         let by = match a.by {
@@ -391,10 +469,7 @@ pub fn rules_why(session_id: Option<&str>) -> Result<()> {
     for p in &state.paused {
         // A paused id that no longer matches a live set could be a private
         // set's, so it shows only where private sets do.
-        let private = live
-            .iter()
-            .find(|l| l.set.id == *p)
-            .is_none_or(|l| l.set.private);
+        let private = !live.iter().any(|l| l.set.id == *p) || hide.contains(p);
         if private && !private_ok {
             continue;
         }

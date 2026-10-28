@@ -6,7 +6,7 @@
 //! draft on screen (see display.rs).
 //! PreToolUse runs tool checks and the rules guard (see tools.rs).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -19,7 +19,7 @@ use crate::approvals::{self, Approvals, State};
 use crate::config::{self, Config, MAX_BUDGET};
 use crate::facts;
 use crate::retrieve::estimate_tokens;
-use crate::rules::{self, Level, Loaded};
+use crate::rules::{self, FileError, Level, Loaded, RuleSet};
 use crate::session::{self, Event};
 
 const PROMPT_TITLE: &str = "Facts from your memory that match this prompt, with the date each was last checked and its file. Open the file for the full entry.";
@@ -228,14 +228,68 @@ fn save_last_live(record: &LastLive) -> Result<()> {
 }
 
 /// Whether a rule file's text has a `private` key set to anything but
-/// `false`. It works on lines, so it also reads a file that doesn't parse.
+/// `false`, bare or quoted, or a dotted key under `private`. It works on
+/// lines, so it also reads a file that doesn't parse.
 fn says_private(src: &str) -> bool {
     src.lines().any(|l| {
-        l.trim_start()
-            .strip_prefix("private")
-            .and_then(|rest| rest.trim_start().strip_prefix('='))
-            .is_some_and(|value| value.trim() != "false")
+        let l = l.trim_start();
+        ["\"private\"", "'private'", "private"]
+            .iter()
+            .find_map(|k| l.strip_prefix(k))
+            .map(str::trim_start)
+            .is_some_and(|rest| {
+                rest.starts_with('.')
+                    || rest
+                        .strip_prefix('=')
+                        .is_some_and(|value| value.trim() != "false")
+            })
     })
+}
+
+/// The last session's record, if it can be read.
+fn read_last_live() -> Option<LastLive> {
+    last_live_path()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+/// The text of each broken rule file that can be read. A link could point
+/// outside the rules folder, so it counts as unreadable.
+fn broken_texts(errors: &[FileError]) -> BTreeMap<PathBuf, String> {
+    errors
+        .iter()
+        .filter(|e| std::fs::symlink_metadata(&e.file).is_ok_and(|m| m.is_file()))
+        .filter_map(|e| Some((e.file.clone(), std::fs::read_to_string(&e.file).ok()?)))
+        .collect()
+}
+
+/// The set ids that stay hidden outside the private paths, by the
+/// SessionStart notice's rule: any source saying private hides a set. A
+/// loaded file says so with `private = true`, a broken file with a
+/// `private` line or by not being readable, and the last session's record
+/// with its own flag.
+pub fn private_ids<'a>(
+    sets: impl IntoIterator<Item = &'a RuleSet>,
+    errors: &[FileError],
+) -> BTreeSet<String> {
+    let mut ids: BTreeSet<String> = read_last_live()
+        .map(|r| {
+            r.private
+                .into_iter()
+                .filter(|(_, p)| *p)
+                .map(|(id, _)| id)
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.extend(sets.into_iter().filter(|s| s.private).map(|s| s.id.clone()));
+    let raw = broken_texts(errors);
+    for e in errors {
+        if raw.get(&e.file).is_none_or(|src| says_private(src)) {
+            ids.insert(e.stem());
+        }
+    }
+    ids
 }
 
 /// "1 private rule set file has errors", or the plural.
@@ -418,17 +472,8 @@ fn approval_lines(
     cwd: &Path,
     paused: &[String],
 ) -> Vec<String> {
-    let prev: Option<LastLive> = last_live_path()
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok());
-    // A link could point outside the rules folder, so it counts as unreadable.
-    let raw = loaded
-        .errors
-        .iter()
-        .filter(|e| std::fs::symlink_metadata(&e.file).is_ok_and(|m| m.is_file()))
-        .filter_map(|e| Some((e.file.clone(), std::fs::read_to_string(&e.file).ok()?)))
-        .collect();
+    let prev = read_last_live();
+    let raw = broken_texts(&loaded.errors);
     let (lines, next) = compare(
         prev.as_ref(),
         loaded,
@@ -604,7 +649,7 @@ pub fn log_error(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules::{FileError, parse};
+    use crate::rules::parse;
 
     const BODY: &str = "[remind]\ntext = \"Keep it short.\"\n";
 
@@ -653,6 +698,12 @@ mod tests {
         assert!(!says_private("private = false\n"));
         assert!(!says_private("privately = true\nid = \"a\""));
         assert!(!says_private("[[check]]\n"));
+        assert!(says_private("\"private\" = true\n"));
+        assert!(says_private("  'private'=true"));
+        assert!(says_private("private.x = 1"));
+        assert!(says_private("\"private\" . x = 1"));
+        assert!(!says_private("\"private\" = false"));
+        assert!(!says_private("\"privately\" = true"));
     }
 
     #[test]

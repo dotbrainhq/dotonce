@@ -207,6 +207,14 @@ impl FileError {
         format!("{}: {}", self.name(), self.reason())
     }
 
+    /// The file's name without `.toml`: the id the set would have.
+    pub fn stem(&self) -> String {
+        self.file
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
     /// The file's name, such as `notes.toml`.
     pub fn name(&self) -> String {
         self.file

@@ -841,7 +841,10 @@ fn rules_list_hides_private_sets_outside_private_paths() {
     let (out, _) = run(&h, &["rules", "list"], None);
     assert!(out.contains("acme-replies"), "{out}");
     assert!(!out.contains("secret-notes"), "{out}");
-    assert!(out.contains("1 private set(s) hidden"), "{out}");
+    assert!(
+        out.contains("1 private rule set hidden; run this inside a private folder to see it"),
+        "{out}"
+    );
     let (out, _) = run_in(&h, &proj, &["rules", "list"], None);
     assert!(out.contains("secret-notes"), "{out}");
     std::fs::remove_dir_all(&h).unwrap();
@@ -3825,7 +3828,7 @@ fn printed_ids_and_times_lose_terminal_control_characters() {
     std::fs::create_dir_all(h.join("dotonce/sessions")).unwrap();
     std::fs::write(
         h.join("dotonce/sessions/s1.json"),
-        serde_json::json!({"active": [{"id": "acme-replies", "by": "skill", "what": "writing\u{1b}[2K-support"}], "paused": ["gone\u{1b}[2K"]}).to_string(),
+        serde_json::json!({"active": [{"id": "acme-replies", "by": "skill", "what": "acme\u{1b}[2K-writer"}], "paused": ["gone\u{1b}[2K"]}).to_string(),
     )
     .unwrap();
     for args in [
@@ -4052,5 +4055,205 @@ fn rules_log_with_a_zero_limit_says_nothing_is_shown() {
     let (out, ok) = run(&h, &["rules", "log", "--limit", "0"], None);
     assert!(ok, "{out}");
     assert_eq!(out.trim(), "no catches shown (limit 0)");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+/// A home with one public set and five sets that count as private outside
+/// `private_paths`, each by a different source: the loaded file, a broken
+/// file saying `private = true`, `"private" = true` or `private.x`, and the
+/// last session's record. Every private one names "launch".
+fn home_with_quiet_sets(name: &str) -> (PathBuf, PathBuf) {
+    let (h, proj) = home_with_private_path(name);
+    add_set(
+        &h,
+        "acme-replies",
+        "[[check]]\nid = \"inline-links\"\nkind = \"bare-url\"\nwhy = \"Links go inline.\"\n",
+    );
+    add_set(
+        &h,
+        "quiet-launch",
+        "private = true\n[[check]]\nid = \"no-launch\"\nforbid = [\"launch day\"]\nwhy = \"Keep the launch quiet.\"\n",
+    );
+    add_set(
+        &h,
+        "quiet-broken",
+        "private = true\ncolour = \"launch day\"\n",
+    );
+    add_set(
+        &h,
+        "quoted-launch",
+        "\"private\" = true\ncolour = \"launch day\"\n",
+    );
+    add_set(&h, "dotted-launch", "private.x = \"launch day\"\n");
+    add_set(
+        &h,
+        "was-launch",
+        "[[check]]\nid = \"launch\"\nforbid = [\"x\"]\nwhy = \"w\"\n",
+    );
+    for id in ["acme-replies", "quiet-launch", "was-launch"] {
+        approve(&h, id, "warn");
+    }
+    std::fs::write(
+        h.join("dotonce/last-live.json"),
+        serde_json::json!({"live": {}, "private": {"was-launch": true, "acme-replies": false}})
+            .to_string(),
+    )
+    .unwrap();
+    (h, proj)
+}
+
+const QUIET_IDS: [&str; 5] = [
+    "quiet-launch",
+    "quiet-broken",
+    "quoted-launch",
+    "dotted-launch",
+    "was-launch",
+];
+
+#[test]
+fn rules_check_hides_private_sets_outside_private_paths() {
+    let (h, proj) = home_with_quiet_sets("checkquiet");
+    let (out, err, ok) = run_full(&h, &h, &["rules", "check"], None);
+    assert!(!ok, "the broken files still fail the check: {out}");
+    assert!(out.contains("ok     acme-replies (1 checks)"), "{out}");
+    assert!(!out.contains("launch"), "{out}");
+    assert!(
+        out.contains("5 private rule sets hidden; run this inside a private folder to see them"),
+        "{out}"
+    );
+    assert!(!err.contains("launch"), "{err}");
+    let (out, _, _) = run_full(&h, &proj, &["rules", "check"], None);
+    for id in QUIET_IDS {
+        assert!(out.contains(id), "{id} is missing inside: {out}");
+    }
+    assert!(out.contains("launch day"), "{out}");
+    assert!(!out.contains("hidden"), "{out}");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn rules_list_hides_broken_and_recorded_private_sets() {
+    let (h, proj) = home_with_quiet_sets("listquiet");
+    let (out, ok) = run(&h, &["rules", "list"], None);
+    assert!(ok, "{out}");
+    assert!(out.contains("acme-replies"), "{out}");
+    assert!(!out.contains("launch"), "{out}");
+    assert!(
+        out.contains("5 private rule sets hidden; run this inside a private folder to see them"),
+        "{out}"
+    );
+    let (out, _) = run_in(&h, &proj, &["rules", "list"], None);
+    for id in QUIET_IDS {
+        assert!(out.contains(id), "{id} is missing inside: {out}");
+    }
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn rules_test_refuses_a_private_set_outside_private_paths() {
+    let (h, proj) = home_with_quiet_sets("testquiet");
+    let f = h.join("reply.md");
+    std::fs::write(&f, "The launch day is set.\n").unwrap();
+    let f = f.to_string_lossy().to_string();
+    for id in QUIET_IDS {
+        let (out, err, ok) = run_full(&h, &h, &["rules", "test", id, &f], None);
+        assert!(!ok, "{id}: {out}");
+        assert!(
+            err.contains("private") && err.contains("inside a private folder"),
+            "{id}: {err}"
+        );
+        assert!(
+            !out.contains("launch") && !err.contains("launch day"),
+            "{id}: {out} {err}"
+        );
+    }
+    let (out, _, ok) = run_full(&h, &proj, &["rules", "test", "quiet-launch", &f], None);
+    assert!(ok, "{out}");
+    assert!(out.contains("no-launch"), "{out}");
+    let (_, err, ok) = run_full(&h, &proj, &["rules", "test", "quiet-broken", &f], None);
+    assert!(!ok);
+    assert!(err.contains("has an error"), "{err}");
+    let (out, _, ok) = run_full(&h, &h, &["rules", "test", "acme-replies", &f], None);
+    assert!(ok, "{out}");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn rules_why_log_and_stats_hide_sets_any_source_calls_private() {
+    let (h, proj) = home_with_quiet_sets("whyquiet");
+    write_session(
+        &h,
+        "s1",
+        serde_json::json!({
+            "active": [
+                {"id": "acme-replies", "by": "skill", "what": "acme-writer"},
+                {"id": "was-launch", "by": "skill", "what": "acme-writer"}
+            ],
+            "paused": ["quiet-launch"]
+        }),
+    );
+    // Caught while each set was public, so the lines are in the public log.
+    write_catches(
+        &h,
+        "catches.jsonl",
+        &[
+            (1, "acme-replies", "inline-links", "caught"),
+            (1, "quiet-launch", "no-launch", "caught"),
+            (1, "was-launch", "launch", "caught"),
+            (1, "quoted-launch", "launch", "caught"),
+        ],
+    );
+    for args in [&["rules", "why"][..], &["rules", "log"], &["stats"]] {
+        let (out, ok) = run_in(&h, &h, args, None);
+        assert!(ok, "{args:?}: {out}");
+        assert!(out.contains("acme-replies"), "{args:?}: {out}");
+        assert!(!out.contains("launch"), "{args:?}: {out}");
+        let (out, ok) = run_in(&h, &proj, args, None);
+        assert!(ok, "{args:?}: {out}");
+        assert!(out.contains("was-launch"), "{args:?} inside: {out}");
+    }
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn rules_check_and_test_print_no_control_characters() {
+    let h = home("ctrlcheck");
+    add_set(
+        &h,
+        "acme-replies",
+        "[[check]]\nid = \"st\\u001b[2Kock\"\nforbid = [\"sorry\"]\nwhy = \"Open\\u001b[2K plainly.\"\n",
+    );
+    add_set(
+        &h,
+        "acme-notes",
+        "[[check]]\nid = \"a\"\nwhy = \"b\"\nkind = \"bare\\u001b[2K-link\"\n",
+    );
+    std::fs::write(h.join("dotonce/rules/odd\u{1b}[2K.toml"), "id = \"odd\"\n").unwrap();
+    let (out, err, ok) = run_full(&h, &h, &["rules", "check"], None);
+    assert!(!ok);
+    assert!(
+        !out.contains('\u{1b}') && !err.contains('\u{1b}'),
+        "{out:?} {err:?}"
+    );
+    assert!(
+        out.contains("bare[2K-link") && out.contains("odd[2K.toml"),
+        "{out:?}"
+    );
+    let f = h.join("reply.md");
+    std::fs::write(&f, "Sorry\u{1b}[2K about that.\n").unwrap();
+    let f = f.to_string_lossy().to_string();
+    let (out, err, ok) = run_full(&h, &h, &["rules", "test", "acme-replies", &f], None);
+    assert!(ok, "{err}");
+    assert!(!out.contains('\u{1b}'), "{out:?}");
+    assert!(
+        out.contains("st[2Kock: \"Sorry[2K about that.\"") && out.contains("Open[2K plainly."),
+        "{out:?}"
+    );
+    let (_, err, ok) = run_full(&h, &h, &["rules", "test", "acme-notes", &f], None);
+    assert!(!ok);
+    assert!(
+        !err.contains('\u{1b}') && err.contains("bare[2K-link"),
+        "{err:?}"
+    );
     std::fs::remove_dir_all(&h).unwrap();
 }
