@@ -1382,16 +1382,12 @@ fn session_start_names_approved_sets_that_stopped_running() {
     let mut src = std::fs::read_to_string(&f).unwrap();
     src.push_str("# edited\n");
     std::fs::write(&f, &src).unwrap();
-    let msg = start_message(&h, "s5", tmp);
-    assert!(
-        msg.contains("acme-replies") && msg.contains("changed since approval"),
-        "{msg}"
-    );
-    assert_eq!(msg.lines().count(), 1, "{msg}");
-    let msg = start_message(&h, "s6", tmp);
-    assert!(
-        msg.contains("changed since approval"),
-        "reported every session: {msg}"
+    let changed = "Changed since approval, run `dotonce rules approve <id>`: acme-replies.";
+    assert_eq!(start_message(&h, "s5", tmp), changed);
+    assert_eq!(
+        start_message(&h, "s6", tmp),
+        changed,
+        "reported every session"
     );
     approve(&h, "acme-replies", "fix");
     let path = h.join("dotonce/approvals.json");
@@ -1399,20 +1395,13 @@ fn session_start_names_approved_sets_that_stopped_running() {
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     v["sets"]["acme-replies"]["off"] = serde_json::json!(true);
     std::fs::write(&path, v.to_string()).unwrap();
-    let msg = start_message(&h, "s7", tmp);
-    assert!(msg.contains("acme-replies") && msg.contains("off"), "{msg}");
+    assert_eq!(start_message(&h, "s7", tmp), "Off: acme-replies.");
     std::fs::remove_file(&f).unwrap();
-    let msg = start_message(&h, "s8", tmp);
-    assert!(
-        msg.contains("acme-replies") && msg.contains("missing"),
-        "{msg}"
-    );
+    assert_eq!(start_message(&h, "s8", tmp), "Missing: acme-replies.");
     std::fs::write(&f, "id = \"acme-replies\"\n[[check]]\n").unwrap();
     let msg = start_message(&h, "s9", tmp);
-    assert!(
-        msg.contains("acme-replies: not running, its file has errors"),
-        "{msg}"
-    );
+    assert!(msg.starts_with("File errors: acme-replies.toml ("), "{msg}");
+    assert_eq!(msg.matches("acme-replies").count(), 1, "{msg}");
     std::fs::remove_dir_all(&h).unwrap();
 }
 
@@ -1431,20 +1420,181 @@ fn session_start_hides_private_set_ids_outside_private_paths() {
     let mut src = std::fs::read_to_string(&f).unwrap();
     src.push_str("# edited\n");
     std::fs::write(&f, &src).unwrap();
-    let msg = start_message(&h, "s2", tmp);
-    assert!(
-        msg.contains("A private rule set") && msg.contains("changed since approval"),
-        "{msg}"
-    );
-    assert!(!msg.contains("secret-notes"), "{msg}");
+    assert_eq!(start_message(&h, "s2", tmp), "Not running and private: 1.");
     let msg = start_message(&h, "s3", &proj);
-    assert!(msg.contains("secret-notes"), "{msg}");
-    std::fs::remove_file(&f).unwrap();
-    let msg = start_message(&h, "s4", tmp);
     assert!(
-        msg.contains("A private rule set") && msg.contains("missing"),
+        msg.contains("Changed since approval") && msg.contains("secret-notes"),
         "{msg}"
     );
-    assert!(!msg.contains("secret-notes"), "{msg}");
+    std::fs::remove_file(&f).unwrap();
+    assert_eq!(start_message(&h, "s4", tmp), "Not running and private: 1.");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+/// Turns an approved set off the way `dotonce rules off` does.
+fn turn_off(h: &Path, id: &str) {
+    let path = h.join("dotonce/approvals.json");
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    v["sets"][id]["off"] = serde_json::json!(true);
+    std::fs::write(&path, v.to_string()).unwrap();
+}
+
+fn edit_set(h: &Path, id: &str) {
+    let f = h.join(format!("dotonce/rules/{id}.toml"));
+    let mut src = std::fs::read_to_string(&f).unwrap();
+    src.push_str("# edited\n");
+    std::fs::write(&f, src).unwrap();
+}
+
+#[test]
+fn session_start_groups_the_notice_by_reason() {
+    let (h, proj) = home_with_private_path("grouped");
+    let tmp = Path::new("/tmp");
+    let body = "[remind]\ntext = \"Keep it short.\"\n";
+    let private = "private = true\n[remind]\ntext = \"Keep it short.\"\n";
+    let public = [
+        "off-one",
+        "off-two",
+        "edited",
+        "gone",
+        "broken-approved",
+        "paused-one",
+        "level-up",
+        "steady",
+    ];
+    for id in public {
+        add_set(&h, id, body);
+        approve(&h, id, "warn");
+    }
+    for id in ["quiet-off", "quiet-edited", "quiet-broken"] {
+        add_set(&h, id, private);
+        approve(&h, id, "warn");
+    }
+    assert_eq!(start_message(&h, "s0", tmp), "");
+    for id in ["off-one", "off-two", "quiet-off"] {
+        turn_off(&h, id);
+    }
+    edit_set(&h, "edited");
+    edit_set(&h, "quiet-edited");
+    std::fs::remove_file(h.join("dotonce/rules/gone.toml")).unwrap();
+    add_set(&h, "broken-approved", "[[check]]\n");
+    add_set(&h, "quiet-broken", "private = true\n[[check]]\n");
+    add_set(&h, "broken-new", "[[check]]\n");
+    approve(&h, "level-up", "fix");
+    std::fs::create_dir_all(h.join("dotonce/sessions")).unwrap();
+    std::fs::write(
+        h.join("dotonce/sessions/s1.json"),
+        r#"{"paused":["paused-one"]}"#,
+    )
+    .unwrap();
+    let msg = start_message(&h, "s1", tmp);
+    println!("SAMPLE (12 sets, outside private_paths):\n{msg}");
+    let lines: Vec<&str> = msg.lines().collect();
+    assert_eq!(
+        lines[..6],
+        [
+            "Rule set level-up: level changed from warn to fix since the last session.",
+            "Off: off-one, off-two.",
+            "Changed since approval, run `dotonce rules approve <id>`: edited.",
+            "Missing: gone.",
+            "Paused in this session: paused-one.",
+            "Not running and private: 2.",
+        ],
+        "{msg}"
+    );
+    assert_eq!(lines.len(), 7, "{msg}");
+    let files = lines[6];
+    assert!(
+        files.starts_with("File errors: broken-approved.toml (")
+            && files.contains("; broken-new.toml (")
+            && files.contains(
+                ". 1 private rule set file has errors. Run `dotonce rules check` for details."
+            ),
+        "{files}"
+    );
+    assert_eq!(msg.matches("broken-approved").count(), 1, "{msg}");
+    assert!(!msg.contains("quiet") && !msg.contains("steady"), "{msg}");
+    let msg = start_message(&h, "s2", &proj);
+    assert!(
+        msg.contains("Off: off-one, off-two, quiet-off.")
+            && msg.contains(": edited, quiet-edited.")
+            && msg.contains("quiet-broken.toml (")
+            && !msg.contains("private"),
+        "inside private_paths every set is named: {msg}"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn broken_private_files_are_only_named_inside_private_paths() {
+    let (h, proj) = home_with_private_path("brokenpriv");
+    let tmp = Path::new("/tmp");
+    add_set(
+        &h,
+        "secret-notes",
+        "[remind]\ntext = \"Keep the launch quiet.\"\n",
+    );
+    approve(&h, "secret-notes", "warn");
+    assert_eq!(start_message(&h, "s1", tmp), "");
+    // The record says public, but the broken file now says private.
+    add_set(
+        &h,
+        "secret-notes",
+        "private = true\n[[check]]\nid = \"x\"\nforbid = [\"launch day\"]\n",
+    );
+    let msg = start_message(&h, "s2", tmp);
+    assert_eq!(
+        msg,
+        "1 private rule set file has errors. Run `dotonce rules check` for details.",
+    );
+    let msg = start_message(&h, "s3", &proj);
+    assert!(msg.contains("secret-notes.toml ("), "{msg}");
+    // The record now says private, so a fix to the flag alone doesn't name it.
+    add_set(&h, "secret-notes", "[[check]]\n");
+    assert!(!start_message(&h, "s4", tmp).contains("secret-notes"));
+    // A file that can't be read is hidden, whatever the record says.
+    std::fs::remove_file(h.join("dotonce/rules/secret-notes.toml")).unwrap();
+    add_set(&h, "open-notes", "[remind]\ntext = \"Keep it short.\"\n");
+    approve(&h, "open-notes", "warn");
+    start_message(&h, "s5", tmp);
+    add_set(&h, "open-notes", "[[check]]\n");
+    assert!(start_message(&h, "s6", tmp).contains("File errors: open-notes.toml ("));
+    let f = h.join("dotonce/rules/open-notes.toml");
+    let mut perm = std::fs::metadata(&f).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o000);
+    std::fs::set_permissions(&f, perm.clone()).unwrap();
+    let msg = start_message(&h, "s7", tmp);
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o644);
+    std::fs::set_permissions(&f, perm).unwrap();
+    assert!(
+        !msg.contains("open-notes") && msg.contains("1 private rule set file has errors"),
+        "{msg}"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn a_changed_file_cannot_make_a_private_set_public() {
+    let (h, proj) = home_with_private_path("changedpriv");
+    let tmp = Path::new("/tmp");
+    add_set(
+        &h,
+        "secret-notes",
+        "private = true\n[remind]\ntext = \"Keep the launch quiet.\"\n",
+    );
+    approve(&h, "secret-notes", "warn");
+    assert_eq!(start_message(&h, "s1", &proj), "");
+    add_set(
+        &h,
+        "secret-notes",
+        "private = false\n[remind]\ntext = \"Keep the launch quiet.\"\n",
+    );
+    assert_eq!(start_message(&h, "s2", tmp), "Not running and private: 1.");
+    assert_eq!(
+        start_message(&h, "s3", tmp),
+        "Not running and private: 1.",
+        "the changed file doesn't overwrite the record"
+    );
     std::fs::remove_dir_all(&h).unwrap();
 }

@@ -137,23 +137,30 @@ impl FileError {
     /// One line for a status message: the file name, and the error's first
     /// and last lines, since a TOML error puts its reason last.
     pub fn line(&self) -> String {
-        let name = self
-            .file
+        format!("{}: {}", self.name(), self.reason())
+    }
+
+    /// The file's name, such as `notes.toml`.
+    pub fn name(&self) -> String {
+        self.file
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    /// The error's first and last lines, since a TOML error puts its reason last.
+    pub fn reason(&self) -> String {
         let lines: Vec<&str> = self
             .error
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
             .collect();
-        let msg = match lines.as_slice() {
+        match lines.as_slice() {
             [] => String::new(),
             [one] => one.to_string(),
             [first, .., last] => format!("{first}: {last}"),
-        };
-        format!("{name}: {msg}")
+        }
     }
 }
 
