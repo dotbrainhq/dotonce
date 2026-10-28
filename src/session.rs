@@ -162,6 +162,17 @@ pub fn display_file(dir: &Path, session_id: &str) -> Result<PathBuf> {
     Ok(dir.join(format!("{}.display.json", safe_name(session_id)?)))
 }
 
+/// The safe name of a session that has a state file. Fails for an id with no
+/// file, so a command naming a session by hand never makes one up.
+pub fn existing(dir: &Path, session_id: &str) -> Result<String> {
+    let name = safe_name(session_id).ok();
+    match name {
+        Some(n) if dir.join(format!("{n}.json")).is_file() => Ok(n),
+        Some(n) => bail!("no session {n}"),
+        None => bail!("no session {session_id}"),
+    }
+}
+
 /// The id of the most recently written session file.
 pub fn newest(dir: &Path) -> Option<String> {
     fs::read_dir(dir)

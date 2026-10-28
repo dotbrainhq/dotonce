@@ -230,9 +230,17 @@ pub fn rules_list() -> Result<()> {
         println!("no rule sets in {}", rules::rules_dir()?.display());
         return Ok(());
     }
+    // The last time a check caught something: fixes and re-checks don't
+    // count, and neither does a line whose time doesn't parse.
     let mut last: BTreeMap<String, String> = BTreeMap::new();
     for c in catches::read(private_ok)? {
-        last.insert(c.set, c.time);
+        let counts = matches!(
+            c.outcome,
+            catches::Outcome::Caught | catches::Outcome::Denied
+        );
+        if counts && chrono::DateTime::parse_from_rfc3339(&c.time).is_ok() {
+            last.insert(c.set, c.time);
+        }
     }
     let mut hidden = 0;
     for s in &loaded.sets {
@@ -277,6 +285,10 @@ pub fn rules_log(limit: usize) -> Result<()> {
         println!("no catches yet");
         return Ok(());
     }
+    if limit == 0 {
+        println!("no catches shown (limit 0)");
+        return Ok(());
+    }
     let skip = all.len().saturating_sub(limit);
     for c in &all[skip..] {
         println!(
@@ -318,10 +330,14 @@ pub fn stats() -> Result<()> {
     Ok(())
 }
 
-fn pick_session(dir: &Path, session_id: Option<&str>) -> Option<String> {
+/// The session named with `--session`, which must have a state file, or the
+/// newest one.
+fn pick_session(dir: &Path, session_id: Option<&str>) -> Result<Option<String>> {
     match session_id {
-        Some(s) => Some(s.to_string()),
-        None => session::newest(dir),
+        Some(s) => session::existing(dir, s)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!(printable(&e.to_string()))),
+        None => Ok(session::newest(dir)),
     }
 }
 
@@ -333,7 +349,7 @@ pub fn rules_why(session_id: Option<&str>) -> Result<()> {
     let private_ok = cfg.private_allowed(&cwd);
     let (live, _) = approvals::load_live()?;
     let dir = session::dir()?;
-    let sid = pick_session(&dir, session_id);
+    let sid = pick_session(&dir, session_id)?;
     let mut state = match &sid {
         Some(s) => session::load(&dir, s)?,
         None => State::default(),
@@ -373,6 +389,15 @@ pub fn rules_why(session_id: Option<&str>) -> Result<()> {
         println!("no rule sets are on here");
     }
     for p in &state.paused {
+        // A paused id that no longer matches a live set could be a private
+        // set's, so it shows only where private sets do.
+        let private = live
+            .iter()
+            .find(|l| l.set.id == *p)
+            .is_none_or(|l| l.set.private);
+        if private && !private_ok {
+            continue;
+        }
         println!("{:<24} paused for this session", printable(p));
     }
     Ok(())
@@ -384,7 +409,7 @@ pub fn rules_pause(id: &str, session_id: Option<&str>) -> Result<()> {
     approvals::refuse_agent()?;
     find_set(id)?;
     let dir = session::dir()?;
-    let sid = pick_session(&dir, session_id).context("no session yet: start Claude Code first")?;
+    let sid = pick_session(&dir, session_id)?.context("no session yet: start Claude Code first")?;
     confirmed(id, &format!("pause {id} for session {}", printable(&sid)))?;
     // Read after the prompt, so hook changes made while it waited are kept.
     let mut state = session::load(&dir, &sid)?;
@@ -455,34 +480,13 @@ fn home_overrides(files: &[PathBuf]) -> Vec<String> {
     out
 }
 
-/// Reads ~/.claude/settings.json (never writes it) and lists the dotonce
-/// hooks that are there and missing.
+/// Reads the settings files Claude Code merges hooks from (never writes
+/// them) and lists the dotonce hooks that are there and missing.
 pub fn doctor() -> Result<()> {
-    let file = config::expand("~/.claude/settings.json");
-    let src = fs::read_to_string(&file).unwrap_or_default();
-    let v: Value = if src.trim().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_str(&src).with_context(|| format!("parse {}", file.display()))?
-    };
-    let mut missing = 0;
-    for &(event, arg, matcher) in hook::HOOKS {
-        let ok = has_hook(&v, event, arg, matcher);
-        if !ok {
-            missing += 1;
-        }
-        let label = if ok { "ok" } else { "missing" };
-        println!("{label:<8} {event} (dotonce hook {arg})");
-    }
-    if missing > 0 {
-        println!(
-            "{missing} hook(s) missing from {}. Run dotonce hook-config and add them; dotonce never edits that file.",
-            file.display()
-        );
-    }
+    let user = config::expand("~/.claude/settings.json");
     let cwd = std::env::current_dir().unwrap_or_default();
     let mut files = vec![
-        file.clone(),
+        user.clone(),
         cwd.join(".claude/settings.json"),
         cwd.join(".claude/settings.local.json"),
     ];
@@ -493,6 +497,44 @@ pub fn doctor() -> Result<()> {
         seen.push(real);
         new
     });
+    let mut parsed: Vec<(&PathBuf, Value)> = Vec::new();
+    for f in &files {
+        let src = fs::read_to_string(f).unwrap_or_default();
+        if src.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(&src) {
+            Ok(v) => parsed.push((f, v)),
+            Err(e) => println!(
+                "warning  {} isn't valid JSON, so doctor skipped it: {}",
+                printable(&f.to_string_lossy()),
+                printable(&e.to_string())
+            ),
+        }
+    }
+    let mut missing = 0;
+    for &(event, arg, matcher) in hook::HOOKS {
+        match parsed
+            .iter()
+            .find(|(_, v)| has_hook(v, event, arg, matcher))
+        {
+            Some((f, _)) => println!(
+                "{:<8} {event} (dotonce hook {arg}) in {}",
+                "ok",
+                printable(&f.to_string_lossy())
+            ),
+            None => {
+                missing += 1;
+                println!("{:<8} {event} (dotonce hook {arg})", "missing");
+            }
+        }
+    }
+    if missing > 0 {
+        println!(
+            "{missing} hook(s) missing from every settings file doctor read. Run dotonce hook-config and add them to {}; dotonce never edits that file.",
+            user.display()
+        );
+    }
     for line in home_overrides(&files) {
         println!("{line}");
     }

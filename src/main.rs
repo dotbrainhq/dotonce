@@ -67,7 +67,7 @@ enum Cmd {
         #[arg(long)]
         rebuild: bool,
     },
-    /// Run as a Claude Code hook (prompt, session-start, skill, expansion, stop or pre-tool). Reads the hook's JSON on stdin and never fails.
+    /// Run as a Claude Code hook (prompt, session-start, skill, expansion, stop, pre-tool or display). Reads the hook's JSON on stdin and never fails.
     Hook { event: String },
     /// Print the hooks block to add to Claude Code's settings.json: every hook dotonce needs.
     HookConfig,

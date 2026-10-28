@@ -3797,3 +3797,213 @@ fn printed_ids_and_times_lose_terminal_control_characters() {
     }
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+/// Writes a session state file straight into the sessions folder.
+fn write_session(h: &Path, sid: &str, state: serde_json::Value) {
+    let dir = h.join("dotonce/sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{sid}.json")), state.to_string()).unwrap();
+}
+
+#[test]
+fn rules_why_hides_private_sets_outside_private_paths() {
+    let (h, proj) = home_with_private_path("whyprivate");
+    add_set(&h, "acme-replies", "");
+    add_set(&h, "quiet-active", "private = true\n");
+    add_set(&h, "quiet-paused", "private = true\n");
+    for id in ["acme-replies", "quiet-active", "quiet-paused"] {
+        approve(&h, id, "warn");
+    }
+    write_session(
+        &h,
+        "s1",
+        serde_json::json!({
+            "active": [{"id": "quiet-active", "by": "skill", "what": "writing-support"}],
+            "paused": ["acme-replies", "quiet-paused", "removed-set"]
+        }),
+    );
+    let (out, ok) = run_in(&h, &h, &["rules", "why"], None);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("acme-replies") && out.contains("paused for this session"),
+        "{out}"
+    );
+    for hidden in ["quiet-active", "quiet-paused", "removed-set"] {
+        assert!(!out.contains(hidden), "{hidden} shows outside: {out}");
+    }
+    let (out, ok) = run_in(&h, &proj, &["rules", "why"], None);
+    assert!(ok, "{out}");
+    for shown in [
+        "quiet-active",
+        "quiet-paused",
+        "removed-set",
+        "acme-replies",
+    ] {
+        assert!(out.contains(shown), "{shown} is missing inside: {out}");
+    }
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn rules_pause_and_why_need_a_session_that_exists() {
+    let h = home("nosession");
+    add_set(&h, "acme-replies", REPLIES);
+    approve(&h, "acme-replies", "warn");
+    write_session(&h, "s1", serde_json::json!({}));
+    let sessions = h.join("dotonce/sessions");
+    let list = || {
+        let mut names: Vec<String> = std::fs::read_dir(&sessions)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = list();
+    for (given, shown) in [("nope", "nope"), ("../x", "x")] {
+        let (_, err, ok) = run_full(
+            &h,
+            &h,
+            &["rules", "pause", "acme-replies", "--session", given],
+            Some("acme-replies\n"),
+        );
+        assert!(!ok, "{given}");
+        assert!(err.contains(&format!("no session {shown}")), "{err}");
+        let (out, err, ok) = run_full(&h, &h, &["rules", "why", "--session", given], None);
+        assert!(!ok, "{given}: {out}");
+        assert!(err.contains(&format!("no session {shown}")), "{err}");
+        assert!(!out.contains("session "), "{out}");
+    }
+    assert_eq!(list(), before);
+    assert!(!h.join("dotonce/x.json").exists());
+    let (out, ok) = run_in(&h, &h, &["rules", "why", "--session", "s1"], None);
+    assert!(ok && out.contains("session s1"), "{out}");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+/// A settings file holding one dotonce hook per event.
+fn settings_with_hooks(name: &str) -> String {
+    let h = home(name);
+    let (out, ok) = run(&h, &["hook-config"], None);
+    assert!(ok);
+    std::fs::remove_dir_all(&h).unwrap();
+    out
+}
+
+#[test]
+fn doctor_finds_hooks_in_project_settings_and_names_the_file() {
+    let h = home("doctorproj");
+    let proj = h.join("proj");
+    std::fs::create_dir_all(proj.join(".claude")).unwrap();
+    std::fs::create_dir_all(h.join(".claude")).unwrap();
+    let all = settings_with_hooks("hookcfgsrc1");
+    let project = proj.join(".claude/settings.json");
+    std::fs::write(&project, &all).unwrap();
+    let (out, ok) = run_in(&h, &proj, &["doctor"], None);
+    assert!(ok, "{out}");
+    assert!(!out.contains("missing"), "{out}");
+    for line in out.lines().filter(|l| l.starts_with("ok ")) {
+        assert!(line.contains(&*project.to_string_lossy()), "{line}");
+    }
+    assert_eq!(
+        out.lines().filter(|l| l.starts_with("ok ")).count(),
+        7,
+        "{out}"
+    );
+    // Some hooks in the user file, the rest in the local file.
+    let mut v: serde_json::Value = serde_json::from_str(&all).unwrap();
+    let mut local = serde_json::json!({"hooks": {}});
+    for event in ["Stop", "PreToolUse", "MessageDisplay"] {
+        local["hooks"][event] = v["hooks"].as_object_mut().unwrap().remove(event).unwrap();
+    }
+    std::fs::write(h.join(".claude/settings.json"), v.to_string()).unwrap();
+    std::fs::write(proj.join(".claude/settings.local.json"), local.to_string()).unwrap();
+    std::fs::remove_file(&project).unwrap();
+    let (out, _) = run_in(&h, &proj, &["doctor"], None);
+    assert!(!out.contains("missing"), "{out}");
+    let stop = out.lines().find(|l| l.contains("Stop")).expect(&out);
+    assert!(stop.contains("settings.local.json"), "{stop}");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn doctor_warns_about_a_broken_settings_file_and_goes_on() {
+    let h = home("doctorbroken");
+    let proj = h.join("proj");
+    std::fs::create_dir_all(proj.join(".claude")).unwrap();
+    std::fs::create_dir_all(h.join(".claude")).unwrap();
+    let user = h.join(".claude/settings.json");
+    std::fs::write(&user, "{ not json").unwrap();
+    std::fs::write(
+        proj.join(".claude/settings.json"),
+        settings_with_hooks("hookcfgsrc2"),
+    )
+    .unwrap();
+    let (out, ok) = run_in(&h, &proj, &["doctor"], None);
+    assert!(ok, "{out}");
+    let warn = out
+        .lines()
+        .find(|l| l.starts_with("warning") && l.contains(&*user.to_string_lossy()))
+        .unwrap_or_else(|| panic!("no warning for the broken file: {out}"));
+    assert!(warn.contains("JSON"), "{warn}");
+    assert!(!out.contains("missing"), "{out}");
+    assert!(out.contains("rule sets: 0 loaded"), "{out}");
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), "{ not json");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn rules_list_last_catch_counts_only_caught_and_denied_with_real_times() {
+    let h = home("lastcatch");
+    add_set(&h, "acme-replies", "");
+    add_set(&h, "acme-notes", "");
+    add_set(&h, "acme-docs", "");
+    let now = chrono::Utc::now().timestamp();
+    let line = |time: &str, set: &str, outcome: &str| {
+        serde_json::json!({"time": time, "session": "s1", "set": set, "check": "c", "level": "fix", "outcome": outcome}).to_string()
+    };
+    let day = |n: i64| dotonce::catches::timestamp(now - n * 86_400);
+    let lines = [
+        line(&day(5), "acme-replies", "caught"),
+        line(&day(1), "acme-replies", "fixed"),
+        line(&day(2), "acme-replies", "still_broken"),
+        line("yesterday", "acme-replies", "denied"),
+        line(&day(3), "acme-notes", "unverified"),
+        line(&day(4), "acme-docs", "denied"),
+    ];
+    std::fs::write(h.join("dotonce/catches.jsonl"), lines.join("\n") + "\n").unwrap();
+    let (out, ok) = run(&h, &["rules", "list"], None);
+    assert!(ok, "{out}");
+    let row = |id: &str| {
+        out.lines()
+            .find(|l| l.starts_with(id))
+            .expect(&out)
+            .to_string()
+    };
+    let date = |n: i64| {
+        (chrono::Utc::now() - chrono::Duration::days(n))
+            .format("%Y-%m-%d")
+            .to_string()
+    };
+    assert!(
+        row("acme-replies").contains(&format!("last catch: {}", date(5))),
+        "{out}"
+    );
+    assert!(row("acme-notes").contains("last catch: none"), "{out}");
+    assert!(
+        row("acme-docs").contains(&format!("last catch: {}", date(4))),
+        "{out}"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn rules_log_with_a_zero_limit_says_nothing_is_shown() {
+    let h = home("loglimit0");
+    write_catches(&h, "catches.jsonl", &[(1, "acme-replies", "c", "caught")]);
+    let (out, ok) = run(&h, &["rules", "log", "--limit", "0"], None);
+    assert!(ok, "{out}");
+    assert_eq!(out.trim(), "no catches shown (limit 0)");
+    std::fs::remove_dir_all(&h).unwrap();
+}

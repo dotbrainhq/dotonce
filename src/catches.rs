@@ -79,6 +79,12 @@ impl Outcome {
     }
 }
 
+/// The catches in one log file's text, skipping empty and garbled lines.
+fn parse_lines(src: &str) -> impl Iterator<Item = Catch> + '_ {
+    src.lines()
+        .filter_map(|l| serde_json::from_str::<Catch>(l).ok())
+}
+
 /// Every logged catch, oldest first. The private log is only read when
 /// `private_ok`. Lines that don't parse are skipped.
 pub fn read(private_ok: bool) -> Result<Vec<Catch>> {
@@ -93,10 +99,7 @@ pub fn read(private_ok: bool) -> Result<Vec<Catch>> {
         let Ok(src) = fs::read_to_string(home.join(name)) else {
             continue;
         };
-        out.extend(
-            src.lines()
-                .filter_map(|l| serde_json::from_str::<Catch>(l).ok()),
-        );
+        out.extend(parse_lines(&src));
     }
     out.sort_by(|a, b| a.time.cmp(&b.time));
     Ok(out)
@@ -178,6 +181,17 @@ mod tests {
             r#"{"time":"2025-10-28T00:00:00Z","session":"s1","set":"acme-replies","check":"inline-links","level":"fix","outcome":"still_broken"}"#
         );
         assert_eq!(serde_json::from_str::<Catch>(&json).unwrap(), c);
+    }
+
+    #[test]
+    fn reading_skips_garbage_and_empty_lines() {
+        let good = r#"{"time":"2025-10-28T00:00:00Z","session":"s1","set":"acme","check":"c","level":"fix","outcome":"caught"}"#;
+        let src = format!("{good}\nnot json at all\n\n{{\"time\":1}}\n{good}\n");
+        let all: Vec<Catch> = parse_lines(&src).collect();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().all(|c| c.set == "acme"));
+        assert_eq!(parse_lines("").count(), 0);
+        assert_eq!(parse_lines("\n\n").count(), 0);
     }
 
     #[test]
