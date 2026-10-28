@@ -11,7 +11,6 @@ use serde_json::{Value, json};
 use crate::approvals::{self, Live};
 use crate::checks::{self, fence_closes, fence_open};
 use crate::hook::{log_error, prompt_id, session_id, str_field};
-use crate::rules::Level;
 use crate::session;
 
 pub const HELD_NOTE: &str =
@@ -112,31 +111,6 @@ fn load_held(path: &Path) -> Held {
         .unwrap_or_default()
 }
 
-/// The session's checking fix sets. None once the turn was sent back: Stop
-/// sends a turn back once, so a draft held after that would never be
-/// followed by a corrected one.
-fn fix_sets(
-    live: Result<Vec<Live>>,
-    dir: &Path,
-    sid: &str,
-    turn: Option<&str>,
-) -> Result<Vec<Live>> {
-    let live = live?;
-    if live.is_empty() {
-        return Ok(live);
-    }
-    let state = session::load(dir, sid)?;
-    let turn = turn.or(state.prompt_id.as_deref()).unwrap_or("unknown");
-    if state.sent_back(turn) {
-        return Ok(Vec::new());
-    }
-    Ok(session::checking(&state, &live)
-        .into_iter()
-        .filter(|l| l.level == Level::Fix)
-        .cloned()
-        .collect())
-}
-
 /// Everything held, then the batch as it is.
 fn release_all(held: &mut Held, delta: &str) -> String {
     let mut shown = held.lines.concat();
@@ -149,12 +123,11 @@ fn release_all(held: &mut Held, delta: &str) -> String {
 /// Hidden lines only reach the screen through a later batch's output, so
 /// anything that goes wrong after a hold shows the held lines at once and
 /// lets the rest of the message through as it is.
-pub fn display(v: &Value) -> Result<Option<String>> {
-    let live = approvals::load_live().map(|(l, _)| l);
-    let no_sets = live.as_ref().is_ok_and(Vec::is_empty);
+pub fn display(v: &Value, cwd: &Path) -> Result<Option<String>> {
     let sid = match session_id(v) {
-        Err(_) if no_sets => return Ok(None),
-        sid => sid?,
+        Ok(sid) => sid,
+        Err(_) if approvals::load_live().is_ok_and(|(l, _)| l.is_empty()) => return Ok(None),
+        Err(e) => return Err(e),
     };
     let dir = session::dir()?;
     let path = session::display_file(&dir, sid)?;
@@ -179,7 +152,10 @@ pub fn display(v: &Value) -> Result<Option<String>> {
     let delta = str_field(v, "delta");
     // Without a final flag, nothing is held past this batch.
     let last = v.get("final").and_then(Value::as_bool).unwrap_or(true);
-    let mut shown = match fix_sets(live, &dir, sid, prompt_id(v)) {
+    let fix = session::load(&dir, sid)
+        .and_then(|state| session::checks_now(&state, cwd, prompt_id(v)))
+        .map(|now| now.fix().into_iter().cloned().collect::<Vec<_>>());
+    let mut shown = match fix {
         Ok(fix) if fix.is_empty() && held.lines.is_empty() && stale.is_empty() => {
             return Ok(None);
         }

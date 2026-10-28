@@ -2308,3 +2308,130 @@ fn a_warn_catch_is_logged_once_per_turn() {
     );
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+/// Registers `dotonce hook stop` as a Stop hook in the test home's Claude
+/// Code user settings, so the display hook may hold drafts back.
+fn register_stop(h: &Path) {
+    let dir = h.join(".claude");
+    std::fs::create_dir_all(&dir).unwrap();
+    let settings = serde_json::json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/opt/acme/bin/dotonce hook stop", "timeout": 5}]}]}});
+    std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+}
+
+const HELD_DRAFT: &str = "Draft:\n```markdown\nHi Sam,\nSorry for the wait.\n```\n";
+
+/// Shows `HELD_DRAFT` as one whole message and returns what went on screen,
+/// or None when it showed as it is.
+fn show_draft(h: &Path, cwd: &Path, sid: &str, pid: &str, mid: &str) -> Option<String> {
+    display_out(
+        h,
+        serde_json::json!({"session_id": sid, "prompt_id": pid, "message_id": mid, "index": 0, "final": true, "delta": HELD_DRAFT, "cwd": cwd}),
+    )
+}
+
+/// What the screen shows when `HELD_DRAFT` is held back.
+fn held_back() -> Option<String> {
+    Some(format!("Draft:\n{}\n", dotonce::display::HELD_NOTE))
+}
+
+#[test]
+fn a_broken_config_never_holds_a_draft() {
+    let h = ticket_home("displaycfg", "fix");
+    register_stop(&h);
+    use_skill(&h, "s1", "p1");
+    use_skill(&h, "s2", "p1");
+    assert_eq!(show_draft(&h, &h, "s2", "p1", "m1"), held_back(), "setup");
+    std::fs::write(h.join("dotonce/config.toml"), "not = [toml").unwrap();
+    assert_eq!(
+        show_draft(&h, &h, "s1", "p1", "m1"),
+        None,
+        "Stop can't load the config, so it won't send back: the draft shows"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+const STOCK_CHECK: &str = "[draft]\nfence = [\"markdown\"]\n[[check]]\nid = \"no-stock-wait-opener\"\nforbid = [\"sorry for the wait\"]\nwhy = \"Open with a line from the thread.\"\n";
+
+#[test]
+fn a_folder_set_is_not_held_once_the_cwd_left_the_folder() {
+    let check = STOCK_CHECK;
+    let h = home("displayfolder");
+    register_stop(&h);
+    let work = h.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    add_set(
+        &h,
+        "folder-reply",
+        &format!("[when]\nfolders = [{:?}]\n{check}", work.to_string_lossy()),
+    );
+    approve(&h, "folder-reply", "fix");
+    for sid in ["s1", "s2"] {
+        hook(
+            &h,
+            "prompt",
+            serde_json::json!({"session_id": sid, "prompt_id": "p1", "prompt": "hello", "cwd": work}),
+        );
+    }
+    assert_eq!(
+        show_draft(&h, &work, "s2", "p1", "m1"),
+        held_back(),
+        "setup"
+    );
+    assert_eq!(
+        show_draft(&h, &h, "s1", "p1", "m1"),
+        None,
+        "outside the folder Stop drops the set"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn a_private_set_is_not_held_outside_the_private_paths() {
+    let check = STOCK_CHECK;
+    let (h, proj) = home_with_private_path("displayprivate");
+    register_stop(&h);
+    add_set(
+        &h,
+        "secret-reply",
+        &format!("private = true\n[when]\nskills = [\"writing-support\"]\n{check}"),
+    );
+    approve(&h, "secret-reply", "fix");
+    for sid in ["s1", "s2"] {
+        hook(
+            &h,
+            "skill",
+            serde_json::json!({"session_id": sid, "prompt_id": "p1", "tool_name": "Skill", "tool_input": {"skill": "writing-support"}, "cwd": proj}),
+        );
+    }
+    assert_eq!(
+        show_draft(&h, &proj, "s2", "p1", "m1"),
+        held_back(),
+        "setup"
+    );
+    assert_eq!(
+        show_draft(&h, &h, "s1", "p1", "m1"),
+        None,
+        "outside the private paths Stop drops the set"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn a_paused_set_is_not_held() {
+    let h = ticket_home("displaypaused", "fix");
+    register_stop(&h);
+    use_skill(&h, "s1", "p1");
+    use_skill(&h, "s2", "p1");
+    assert_eq!(show_draft(&h, &h, "s2", "p1", "m1"), held_back(), "setup");
+    let file = h.join("dotonce/sessions/s1.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    state["paused"] = serde_json::json!(["ticket-reply"]);
+    std::fs::write(&file, state.to_string()).unwrap();
+    assert_eq!(
+        show_draft(&h, &h, "s1", "p1", "m1"),
+        None,
+        "Stop drops a paused set"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}

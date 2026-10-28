@@ -8,9 +8,9 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::approvals::Live;
+use crate::approvals::{self, Live};
 use crate::checks::{fence_closes, fence_open};
-use crate::config::{Config, home_dir, path_inside};
+use crate::config::{self, Config, home_dir, path_inside};
 use crate::facts::word_match;
 use crate::rules::Level;
 
@@ -457,6 +457,54 @@ pub fn checking<'a>(state: &State, live: &'a [Live]) -> Vec<&'a Live> {
             })
         })
         .collect()
+}
+
+/// The turn a hook call belongs to: the input's prompt_id, else the
+/// session's, else `unknown`. Display and Stop key a turn the same way.
+pub fn turn_key(state: &State, prompt_id: Option<&str>) -> String {
+    prompt_id
+        .or(state.prompt_id.as_deref())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// The live sets and the session state as Stop sees them for one hook call.
+pub struct Now {
+    pub live: Vec<Live>,
+    /// A refreshed copy of the session state. Only Stop saves it.
+    pub state: State,
+    pub turn: String,
+}
+
+impl Now {
+    /// The fix sets that check drafts right now. None once the turn was sent
+    /// back: Stop sends a turn back once, so a draft held after that would
+    /// never be followed by a corrected one.
+    pub fn fix(&self) -> Vec<&Live> {
+        if self.state.sent_back(&self.turn) {
+            return Vec::new();
+        }
+        checking(&self.state, &self.live)
+            .into_iter()
+            .filter(|l| l.level == Level::Fix)
+            .collect()
+    }
+}
+
+/// Which sets check drafts right now, worked out the way Stop does: the live
+/// sets, the config, and `refresh` with the hook's cwd and turn on a copy of
+/// `state`. Display and Stop both use it, so display never holds a draft
+/// for a set Stop would drop. An error means no sets: display then shows
+/// the text as it is, and Stop sends nothing back.
+pub fn checks_now(state: &State, cwd: &Path, prompt_id: Option<&str>) -> Result<Now> {
+    let (live, _) = approvals::load_live()?;
+    let mut state = state.clone();
+    if !live.is_empty() {
+        let cfg = config::load_file()?.unwrap_or_default();
+        refresh(&mut state, &live, &cfg, cwd, prompt_id, Event::Other);
+    }
+    let turn = turn_key(&state, prompt_id);
+    Ok(Now { live, state, turn })
 }
 
 #[cfg(test)]

@@ -52,7 +52,7 @@ pub fn handle(event: &str, input: &str, now: i64) -> Result<Option<String>> {
         "session-start" => session_start(&v, &cwd, now),
         "skill" => skill(&v, &cwd),
         "stop" => crate::reply::stop(&v, &cwd, now),
-        "display" => crate::display::display(&v),
+        "display" => crate::display::display(&v, &cwd),
         _ => expansion(&v, &cwd),
     }
 }

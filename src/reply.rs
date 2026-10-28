@@ -11,10 +11,8 @@ use serde_json::{Value, json};
 use crate::approvals::{self, Live};
 use crate::catches::{self, Catch, Outcome};
 use crate::checks::{self, Failure};
-use crate::config;
 use crate::hook::{prompt_id, session_id};
-use crate::rules::Level;
-use crate::session::{self, Event, Pending};
+use crate::session::{self, Pending};
 
 pub const SEND_BACK_END: &str =
     "Write the draft again with these fixed. Add one line saying what you fixed.";
@@ -205,19 +203,18 @@ fn recheck(p: &Pending, live: &[Live], turn: &Turn, log: &dyn Fn(&Live, &str, Ou
 }
 
 pub fn stop(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
-    let (live, _) = approvals::load_live()?;
-    if live.is_empty() {
-        return Ok(None);
-    }
-    let cfg = config::load_file()?.unwrap_or_default();
     let sid = session_id(v)?;
     let dir = session::dir()?;
-    let mut state = session::load(&dir, sid)?;
-    session::refresh(&mut state, &live, &cfg, cwd, prompt_id(v), Event::Other);
-    let turn = state
-        .prompt_id
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
+    let checks = session::checks_now(&session::load(&dir, sid)?, cwd, prompt_id(v))?;
+    if checks.live.is_empty() {
+        return Ok(None);
+    }
+    let fix: Vec<String> = checks.fix().iter().map(|l| l.set.id.clone()).collect();
+    let session::Now {
+        live,
+        mut state,
+        turn,
+    } = checks;
     let checking = session::checking(&state, &live);
     let again = state.sent_back(&turn);
     let turn_read = if checking.is_empty() && !again {
@@ -260,7 +257,7 @@ pub fn stop(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
                 if state.first_log(&turn, &l.set.id, &f.check) {
                     log(l, &f.check, Outcome::Caught);
                 }
-                if l.level == Level::Fix {
+                if fix.contains(&l.set.id) {
                     send.push(f);
                 }
             }
