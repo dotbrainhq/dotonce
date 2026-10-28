@@ -2269,3 +2269,29 @@ fn the_recheck_cuts_at_the_continuation_or_is_unverified() {
         std::fs::remove_dir_all(&h).unwrap();
     }
 }
+
+#[test]
+fn a_warn_catch_is_logged_once_per_turn() {
+    let h = ticket_home("stopwarnonce", "warn");
+    use_skill(&h, "s1", "p1");
+    assert!(stop(&h, "s1", "p1", BROKEN, false).trim().is_empty());
+    assert!(
+        stop(&h, "s1", "p1", BROKEN, true).trim().is_empty(),
+        "another Stop hook continued the turn"
+    );
+    assert_eq!(
+        outcomes(&h, "catches.jsonl"),
+        pairs(&[
+            ("no-stock-wait-opener", "caught"),
+            ("inline-links", "caught")
+        ])
+    );
+    use_skill(&h, "s1", "p2");
+    assert!(stop(&h, "s1", "p2", BROKEN, false).trim().is_empty());
+    assert_eq!(
+        outcomes(&h, "catches.jsonl").len(),
+        4,
+        "the next turn logs again"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}

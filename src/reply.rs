@@ -260,7 +260,9 @@ pub fn stop(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
         let mut send = Vec::new();
         for &l in &checking {
             for f in checks::run_reply(&l.set, &text) {
-                log(l, &f.check, Outcome::Caught);
+                if state.first_log(&turn, &l.set.id, &f.check) {
+                    log(l, &f.check, Outcome::Caught);
+                }
                 if l.level == Level::Fix {
                     send.push(f);
                 }

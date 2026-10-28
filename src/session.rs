@@ -18,6 +18,7 @@ use crate::rules::Level;
 pub const SKILL_FIELD: &str = "skill";
 const KEEP: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_SENT_BACK: usize = 50;
+const MAX_LOGGED: usize = 200;
 const PASTE_OPEN: &str = "<pasted_content";
 const PASTE_CLOSE: &str = "</pasted_content";
 
@@ -62,6 +63,10 @@ pub struct State {
     pub sent_back: Vec<String>,
     #[serde(default)]
     pub pending: Vec<Pending>,
+    /// (turn, set id, check id) of each catch already logged, so a turn that
+    /// another Stop hook continues doesn't log the same catch again.
+    #[serde(default)]
+    pub logged: Vec<(String, String, String)>,
     #[serde(default)]
     pub prompt_id: Option<String>,
 }
@@ -82,6 +87,19 @@ impl State {
         while self.pending.len() > MAX_SENT_BACK {
             self.pending.remove(0);
         }
+    }
+
+    /// True the first time a turn's catch is seen, and remembers it.
+    pub fn first_log(&mut self, turn: &str, set: &str, check: &str) -> bool {
+        let key = (turn.to_string(), set.to_string(), check.to_string());
+        if self.logged.contains(&key) {
+            return false;
+        }
+        self.logged.push(key);
+        while self.logged.len() > MAX_LOGGED {
+            self.logged.remove(0);
+        }
+        true
     }
 
     pub fn take_pending(&mut self, turn: &str) -> Option<Pending> {
@@ -949,6 +967,19 @@ mod tests {
         }
         assert_eq!(st.sent_back.len(), 50);
         assert!(st.sent_back("t59") && !st.sent_back("p1"));
+    }
+
+    #[test]
+    fn a_catch_is_logged_once_per_turn_and_the_list_is_capped() {
+        let mut st = State::default();
+        assert!(st.first_log("p1", "s", "c"));
+        assert!(!st.first_log("p1", "s", "c"));
+        assert!(st.first_log("p2", "s", "c") && st.first_log("p1", "s", "d"));
+        for i in 0..300 {
+            st.first_log(&format!("t{i}"), "s", "c");
+        }
+        assert_eq!(st.logged.len(), 200);
+        assert!(st.first_log("p1", "s", "c"), "the oldest keys are dropped");
     }
 
     #[test]
