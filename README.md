@@ -21,13 +21,14 @@ dotonce is free and open source. It's in early development, and there's no relea
 
 ## What works today
 
-- **Search engine:** stores conversation turns exactly as written in one SQLite file per user, and finds the ones a question needs by keyword, typo-tolerant matching, names, and dates. Results are merged, grouped by conversation, and fitted into a token budget, with each conversation's weekday and how many days before the question it happened.
-- **Speed:** with 100,000 stored turns, a search takes about 26 ms, and 95% finish within 31 ms on an Apple M3 Pro.
+- **Your facts, as plain files:** every fact is a markdown file with its source and date. Point dotonce at a folder you already keep notes in, and it reads those files as they are.
+- **Context before each prompt:** a Claude Code hook finds the few facts that match what you just asked and adds them, with their dates and files, before Claude answers. Pinned facts are added at the start of every session and again after the context is compacted.
+- **Private facts stay private:** a fact marked private only shows when Claude Code runs inside a folder you list as private. Facts you save from inside one of those folders are private by default.
+- **Search engine:** keyword search, typo-tolerant matching, names, and dates, merged and fitted into a token budget. With 100,000 stored turns a search takes about 26 ms, and 95% finish within 31 ms on an Apple M3 Pro. The prompt hook runs in about 20 ms on a store of 550 facts.
 - **Benchmark adapter:** runs dotonce on LongMemEval and LoCoMo, two of the most used tests for AI agent memory, through the open [agent-memory-benchmark](https://github.com/vectorize-io/agent-memory-benchmark) runner. That puts it side by side with other memory tools, with the same answering model and the same judge.
 
 ## What's coming
 
-- **Claude Code hooks:** the right facts and rules arrive before each prompt, and again after the context is compacted.
 - **Rules that block:** a rule can stop a tool call, or send a reply back with the exact line that broke it.
 - **Your yes first:** a correction becomes a proposed rule, and it only takes effect after you approve it.
 - **A repeat-mistake rate:** every catch is logged, so you can see which rules earn their place.
@@ -56,6 +57,50 @@ The speed check is skipped by default. Run it in release mode:
 ```
 cargo test --release --test speed -- --ignored --nocapture
 ```
+
+## Use it with Claude Code
+
+Install the binary, then create the config and a notes folder in `~/.dotonce`:
+
+```
+cargo install --path .
+dotonce init
+```
+
+Save a fact and find it again:
+
+```
+dotonce save "The staging site is staging.example.com" --source "team wiki"
+dotonce search "staging site"
+```
+
+Print the hooks block, then add its two entries to the `hooks` section of `~/.claude/settings.json`:
+
+```
+dotonce hook-config
+```
+
+From then on, each prompt gets the facts that match it. The hooks never stop Claude Code: if something goes wrong, they add nothing and write the error to `~/.dotonce/errors.log`.
+
+### Use a folder you already have
+
+Any folder of markdown files with frontmatter works as a store. Add a `[[stores]]` block at the end of `~/.dotonce/config.toml`:
+
+```
+[[stores]]
+name = "kb"
+path = "~/notes"
+```
+
+dotonce reads the files in place and never changes them. Facts with `privacy: private` in their frontmatter only show when Claude Code runs inside a folder listed in `private_paths`. Edit the `private_paths = []` line near the top of the file:
+
+```
+private_paths = ["~/projects/personal"]
+```
+
+Keep `private_paths` above the first `[[stores]]` block. Below it, TOML reads the line as part of that store, and dotonce refuses the config with an error that names the key.
+
+Run `dotonce index` to check the store. It prints how many facts were added, updated, and removed.
 
 ## Run the benchmark
 

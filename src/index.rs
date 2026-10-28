@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params, params_from_iter, types::Value};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, params, params_from_iter, types::Value};
 
 use crate::model::SessionDoc;
 use crate::names::extract_names;
@@ -62,6 +63,10 @@ pub struct SessionRow {
     pub turns: Vec<(i64, String, String)>,
 }
 
+/// Two Claude Code hooks may open and sync one index at once; the second
+/// waits this long for the first to finish writing.
+pub const BUSY_WAIT: Duration = Duration::from_millis(2_000);
+
 pub struct Index {
     pub conn: Connection,
 }
@@ -75,10 +80,29 @@ fn marks(n: usize) -> String {
     vec!["?"; n].join(",")
 }
 
+/// Switching a new file to WAL needs an exclusive lock, and SQLite returns
+/// SQLITE_BUSY for it at once instead of calling the busy handler. So when
+/// two processes open a new index together, the loser retries here.
+fn set_wal(conn: &Connection) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        match conn.execute_batch("PRAGMA journal_mode=WAL;") {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == ErrorCode::DatabaseBusy && start.elapsed() < BUSY_WAIT =>
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            r => return Ok(r?),
+        }
+    }
+}
+
 impl Index {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("open index at {path}"))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        conn.busy_timeout(BUSY_WAIT)?;
+        set_wal(&conn)?;
+        conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self { conn })
     }
@@ -92,8 +116,36 @@ impl Index {
         Ok(())
     }
 
+    /// Runs `f` so that all of its writes land or none do. Savepoints nest,
+    /// so `f` may call `add_sessions` and `remove_session`. Outside any
+    /// transaction it takes the write lock first, so waiting for another
+    /// writer happens before `f` reads and can't end on a stale snapshot.
+    pub fn atomic<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let (begin, done, undo) = if self.conn.is_autocommit() {
+            ("BEGIN IMMEDIATE", "COMMIT", "ROLLBACK")
+        } else {
+            (
+                "SAVEPOINT atomic",
+                "RELEASE atomic",
+                "ROLLBACK TO atomic; RELEASE atomic",
+            )
+        };
+        self.conn.execute_batch(begin)?;
+        let res = f(self).and_then(|v| {
+            self.conn.execute_batch(done)?;
+            Ok(v)
+        });
+        match res {
+            Ok(v) => Ok(v),
+            Err(e) => match self.conn.execute_batch(undo) {
+                Ok(()) => Err(e),
+                Err(re) => Err(e.context(format!("rollback failed: {re}"))),
+            },
+        }
+    }
+
     pub fn add_sessions(&mut self, docs: &[SessionDoc]) -> Result<usize> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let mut added = 0;
         {
             let mut ins_session = tx.prepare_cached(
@@ -301,6 +353,43 @@ impl Index {
             turns,
         })
     }
+
+    /// Removes one session and all its turns from the tables and both full-text
+    /// indexes. The full-text tables use external content, so each row is
+    /// deleted with FTS5's 'delete' command and its original values.
+    pub fn remove_session(&mut self, user: &str, doc_id: &str) -> Result<bool> {
+        let tx = self.conn.savepoint()?;
+        let sid: Option<i64> = tx
+            .query_row(
+                "SELECT sid FROM sessions WHERE user_id = ?1 AND doc_id = ?2",
+                params![user, doc_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(sid) = sid else {
+            return Ok(false);
+        };
+        let rows: Vec<(i64, String, String)> = {
+            let mut st = tx.prepare("SELECT id, speaker, text FROM turns WHERE sid = ?1")?;
+            st.query_map(params![sid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (id, speaker, text) in rows {
+            tx.execute(
+                "INSERT INTO turns_fts(turns_fts, rowid, speaker, text) VALUES ('delete', ?1, ?2, ?3)",
+                params![id, speaker, text],
+            )?;
+            tx.execute(
+                "INSERT INTO turns_tri(turns_tri, rowid, text) VALUES ('delete', ?1, ?2)",
+                params![id, text],
+            )?;
+            tx.execute("DELETE FROM names WHERE turn_id = ?1", params![id])?;
+        }
+        tx.execute("DELETE FROM turns WHERE sid = ?1", params![sid])?;
+        tx.execute("DELETE FROM sessions WHERE sid = ?1", params![sid])?;
+        tx.commit()?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -445,6 +534,75 @@ mod tests {
         assert_eq!(
             s.turns.iter().map(|t| t.2.as_str()).collect::<Vec<_>>(),
             vec!["first", "second"]
+        );
+    }
+
+    #[test]
+    fn atomic_reports_a_failed_rollback() {
+        let mut ix = Index::open(":memory:").unwrap();
+        let err = ix
+            .atomic(|ix| -> Result<()> {
+                ix.conn.execute_batch("COMMIT")?;
+                anyhow::bail!("boom")
+            })
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("rollback failed"), "{msg}");
+        assert!(msg.contains("boom"), "{msg}");
+    }
+
+    #[test]
+    fn remove_session_takes_a_session_out_of_every_search() {
+        let mut ix = Index::open(":memory:").unwrap();
+        ix.add_sessions(&[
+            doc(
+                "s1",
+                "u1",
+                "2023-01-01T10:00:00+00:00",
+                &["We compared Hindsight with other tools"],
+            ),
+            doc(
+                "s2",
+                "u1",
+                "2023-01-02T10:00:00+00:00",
+                &["Lunch was pasta"],
+            ),
+        ])
+        .unwrap();
+        assert!(ix.remove_session("u1", "s1").unwrap());
+        assert!(!ix.remove_session("u1", "s1").unwrap());
+        assert!(
+            ix.match_turns(Fts::Stem, "\"compared\"", "u1", None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            ix.match_turns(Fts::Trigram, "\"hin\"", "u1", None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            ix.name_turns(&["hindsight".to_string()], "u1", 10)
+                .unwrap()
+                .is_empty()
+        );
+        let n: i64 = ix
+            .conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        ix.add_sessions(&[doc(
+            "s1",
+            "u1",
+            "2023-01-03T10:00:00+00:00",
+            &["Hindsight again"],
+        )])
+        .unwrap();
+        assert_eq!(
+            ix.match_turns(Fts::Stem, "\"hindsight\"", "u1", None, 10)
+                .unwrap()
+                .len(),
+            1
         );
     }
 }

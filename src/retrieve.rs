@@ -15,6 +15,8 @@ pub struct Options {
     pub arm_limit: usize,
     /// Fill budget left after the matched sessions with other sessions, newest first.
     pub fill: bool,
+    /// Add the arm that matches capitalized words and ids in the question.
+    pub names: bool,
 }
 
 impl Default for Options {
@@ -25,6 +27,7 @@ impl Default for Options {
             rrf_k: 60.0,
             arm_limit: 200,
             fill: true,
+            names: true,
         }
     }
 }
@@ -135,13 +138,14 @@ pub fn unknown_terms(ix: &Index, terms: &[String], user: &str) -> Result<Vec<Str
     Ok(out)
 }
 
-pub fn retrieve(
+/// Sessions that match the question, best first, with their matched turn numbers best first.
+pub fn rank(
     ix: &Index,
     q: &str,
     user: &str,
     anchor: Option<i64>,
     opt: &Options,
-) -> Result<Vec<SessionHit>> {
+) -> Result<Vec<(i64, f64, Vec<i64>)>> {
     let all = query::terms(q);
     let speakers = ix.speaker_terms(&all, user)?;
     let terms: Vec<String> = all.into_iter().filter(|t| !speakers.contains(t)).collect();
@@ -157,7 +161,9 @@ pub fn retrieve(
     if let Some(m) = query::trigram_or(&unknown_terms(ix, &terms, user)?) {
         lists.push(ix.match_turns(Fts::Trigram, &m, user, None, opt.arm_limit)?);
     }
-    lists.push(ix.name_turns(&terms, user, opt.arm_limit)?);
+    if opt.names {
+        lists.push(ix.name_turns(&terms, user, opt.arm_limit)?);
+    }
     if let Some(w) = timeq::window(q, anchor) {
         lists.push(match &stem_match {
             Some(m) => ix.match_turns(Fts::Stem, m, user, Some(w), opt.arm_limit)?,
@@ -202,6 +208,17 @@ pub fn retrieve(
         .collect();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
 
+    Ok(ranked)
+}
+
+pub fn retrieve(
+    ix: &Index,
+    q: &str,
+    user: &str,
+    anchor: Option<i64>,
+    opt: &Options,
+) -> Result<Vec<SessionHit>> {
+    let ranked = rank(ix, q, user, anchor, opt)?;
     Ok(pack(ix, ranked, user, anchor, opt)?
         .into_iter()
         .map(|(_, h)| h)

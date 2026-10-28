@@ -1,4 +1,8 @@
+pub mod config;
+pub mod fact;
+pub mod facts;
 pub mod fuse;
+pub mod hook;
 pub mod index;
 pub mod model;
 pub mod names;

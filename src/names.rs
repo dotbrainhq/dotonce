@@ -54,8 +54,8 @@ mod tests {
     #[test]
     fn ids_and_versions_split_into_parts() {
         assert_eq!(
-            extract_names("see ticket WOOSUBS-226 and the v2 release"),
-            vec!["woosubs", "226", "v2"]
+            extract_names("see ticket ACME-226 and the v2 release"),
+            vec!["acme", "226", "v2"]
         );
     }
 }
