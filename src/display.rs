@@ -32,11 +32,28 @@ pub struct Held {
     pub pass: bool,
 }
 
+/// A set marks fenced blocks with this info string as its drafts.
+fn marks_drafts(l: &Live, info: &str) -> bool {
+    l.set
+        .draft
+        .as_ref()
+        .is_some_and(|d| d.fence.iter().any(|f| f == info))
+}
+
+/// The held block, or the note when a set that holds its fence fails it. A
+/// whole-reply set checks the full reply at Stop, never one block of it.
 fn release(held: &mut Held, sets: &[&Live]) -> String {
     let text = held.lines.concat();
     held.lines.clear();
+    let info = text
+        .lines()
+        .next()
+        .and_then(fence_open)
+        .map(|(_, _, info)| info)
+        .unwrap_or_default();
     let broken = sets
         .iter()
+        .filter(|l| marks_drafts(l, &info))
         .any(|l| !checks::run_reply(&l.set, &text).is_empty());
     if broken {
         format!("{HELD_NOTE}\n")
@@ -67,12 +84,7 @@ pub fn step(held: &mut Held, delta: &str, last: bool, sets: &[&Live]) -> String 
             }
             None => {
                 if let Some((ch, len, info)) = fence_open(bare) {
-                    let hold = sets.iter().any(|l| {
-                        l.set
-                            .draft
-                            .as_ref()
-                            .is_some_and(|d| d.fence.contains(&info))
-                    });
+                    let hold = sets.iter().any(|l| marks_drafts(l, &info));
                     held.fence = Some((ch, len, hold));
                     if hold {
                         held.lines.push(line.to_string());
@@ -242,6 +254,30 @@ mod tests {
         assert_eq!(
             step(&mut held, "Thanks for the details.\n```\n", false, &sets),
             "```markdown\nHi Sam,\nThanks for the details.\n```\n"
+        );
+    }
+
+    #[test]
+    fn a_whole_reply_set_never_hides_a_passing_draft() {
+        let l = live();
+        let whole = Live {
+            set: parse(
+                "id = \"chat\"\n[[check]]\nid = \"signoff\"\nrequire = [\"cheers\"]\nwhy = \"w\"\n",
+                Path::new("/r/chat.toml"),
+            )
+            .unwrap(),
+            level: Level::Fix,
+        };
+        let sets = vec![&l, &whole];
+        let mut held = Held::default();
+        assert_eq!(
+            step(
+                &mut held,
+                "Here:\n```markdown\nHi Sam,\nThanks for the details.\n```\nCheers\n",
+                true,
+                &sets
+            ),
+            "Here:\n```markdown\nHi Sam,\nThanks for the details.\n```\nCheers\n"
         );
     }
 
