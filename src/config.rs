@@ -239,6 +239,38 @@ mod tests {
         assert_eq!(expand("/abs/path"), PathBuf::from("/abs/path"));
     }
 
+    #[test]
+    fn path_inside_does_not_match_a_prefix_look_alike() {
+        assert!(path_inside(Path::new("/a/work"), "/a/work"));
+        assert!(path_inside(Path::new("/a/work/app"), "/a/work"));
+        assert!(!path_inside(Path::new("/a/workshop"), "/a/work"));
+        assert!(!path_inside(Path::new("/a/workshop/app"), "/a/work"));
+    }
+
+    #[test]
+    fn path_inside_resolves_dot_dot() {
+        assert!(!path_inside(Path::new("/a/work/../other"), "/a/work"));
+        assert!(path_inside(Path::new("/a/other/../work/app"), "/a/work"));
+        assert!(path_inside(Path::new("/a/work/./app"), "/a/work/../work"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_inside_follows_a_symlinked_folder() {
+        let base = std::env::temp_dir().join(format!("dotonce-inside-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let real = base.join("real/app");
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(base.join("other")).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        let entry = base.join("real").to_string_lossy().into_owned();
+        assert!(path_inside(&base.join("link/app"), &entry));
+        let link_entry = base.join("link").to_string_lossy().into_owned();
+        assert!(path_inside(&real, &link_entry));
+        assert!(!path_inside(&base.join("other"), &entry));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
     fn cfg_with_private(entries: &[&str]) -> Config {
         let list: Vec<String> = entries.iter().map(|e| format!("{e:?}")).collect();
         Config::parse(&format!("private_paths = [{}]\n", list.join(", "))).unwrap()

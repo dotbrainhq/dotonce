@@ -19,7 +19,7 @@ pub const SKILL_FIELD: &str = "skill";
 const KEEP: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_SENT_BACK: usize = 50;
 const PASTE_OPEN: &str = "<pasted_content";
-const PASTE_CLOSE: &str = "</pasted_content>";
+const PASTE_CLOSE: &str = "</pasted_content";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -79,6 +79,9 @@ impl State {
         }
         self.pending.retain(|x| x.turn != p.turn);
         self.pending.push(p);
+        while self.pending.len() > MAX_SENT_BACK {
+            self.pending.remove(0);
+        }
     }
 
     pub fn take_pending(&mut self, turn: &str) -> Option<Pending> {
@@ -114,6 +117,10 @@ fn safe_name(session_id: &str) -> Result<String> {
 
 /// The session's state. A missing or unreadable file is a fresh state, so a
 /// broken file heals on the next save.
+///
+/// Load, change and save is not locked. Two hooks running at once can each
+/// save over the other's change. The worst case is a reminder shown again or
+/// a second send-back, and Claude Code's own continuation cap bounds that.
 pub fn load(dir: &Path, session_id: &str) -> Result<State> {
     let path = dir.join(format!("{}.json", safe_name(session_id)?));
     Ok(fs::read_to_string(path)
@@ -172,15 +179,34 @@ pub fn clean_old(dir: &Path, now: SystemTime) -> usize {
     n
 }
 
+/// Where a pasted block's closing tag starts and ends in `s`. Claude Code
+/// repeats the opening tag's attributes in it (`</pasted_content id="1">`),
+/// so anything from `</pasted_content` up to the next `>` counts, as long as
+/// the tag name ends there (not `</pasted_contents>`).
+fn find_paste_close(s: &str) -> Option<(usize, usize)> {
+    let mut from = 0;
+    while let Some(i) = s[from..].find(PASTE_CLOSE) {
+        let start = from + i;
+        let after = start + PASTE_CLOSE.len();
+        let rest = &s[after..];
+        if rest.starts_with('>') || rest.starts_with(char::is_whitespace) {
+            let end = rest.find('>')?;
+            return Some((start, after + end + 1));
+        }
+        from = after;
+    }
+    None
+}
+
 /// Adds the part of `line` outside pasted blocks to `out`, and tracks
 /// whether a pasted block is still open at the end of the line.
 fn strip_pasted(line: &str, pasted: &mut bool, out: &mut String) {
     let mut rest = line;
     loop {
         if *pasted {
-            match rest.find(PASTE_CLOSE) {
-                Some(i) => {
-                    rest = &rest[i + PASTE_CLOSE.len()..];
+            match find_paste_close(rest) {
+                Some((_, end)) => {
+                    rest = &rest[end..];
                     *pasted = false;
                 }
                 None => return,
@@ -434,6 +460,45 @@ mod tests {
                 && !t.contains("inline"),
             "{t}"
         );
+    }
+
+    #[test]
+    fn a_paste_closed_with_the_same_id_ends_at_its_closing_tag() {
+        let entries = vec!["draft".to_string(), "later".to_string()];
+        let p = "<pasted_content id=\"1\">draft this\nmore</pasted_content id=\"1\"> later please";
+        assert_eq!(prompt_match(&entries, p).as_deref(), Some("later"));
+        let inside = "<pasted_content id=\"1\">draft this</pasted_content id=\"1\"> thanks";
+        assert_eq!(prompt_match(&entries, inside), None);
+        let multi = "<pasted_content id=\"1\">\ndraft\n</pasted_content id=\"1\">\nthen later";
+        assert_eq!(prompt_match(&entries, multi).as_deref(), Some("later"));
+    }
+
+    #[test]
+    fn the_bare_paste_closing_tag_still_works() {
+        let entries = vec!["draft".to_string(), "later".to_string()];
+        let p = "<pasted_content>draft</pasted_content> later";
+        assert_eq!(prompt_match(&entries, p).as_deref(), Some("later"));
+        let inside = "<pasted_content>draft</pasted_content> thanks";
+        assert_eq!(prompt_match(&entries, inside), None);
+    }
+
+    #[test]
+    fn two_pastes_keep_the_typed_text_between_them() {
+        let entries = ["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        let p = "<pasted_content id=\"1\">alpha</pasted_content id=\"1\"> beta <pasted_content id=\"2\">gamma</pasted_content id=\"2\"> end";
+        let t = typed_text(p);
+        assert!(t.contains("beta") && t.contains("end"), "{t}");
+        assert!(!t.contains("alpha") && !t.contains("gamma"), "{t}");
+        assert_eq!(prompt_match(&entries[1..2], p).as_deref(), Some("beta"));
+        assert_eq!(prompt_match(&entries[0..1], p), None);
+        assert_eq!(prompt_match(&entries[2..3], p), None);
+    }
+
+    #[test]
+    fn a_look_alike_tag_does_not_close_a_paste() {
+        let entries = vec!["later".to_string()];
+        let p = "<pasted_content id=\"1\">x</pasted_contents> later";
+        assert_eq!(prompt_match(&entries, p), None);
     }
 
     #[test]
@@ -812,6 +877,20 @@ mod tests {
         assert!(st.sent_back("t59") && !st.sent_back("p1"));
     }
 
+    #[test]
+    fn pending_is_capped_like_sent_back() {
+        let mut st = State::default();
+        for i in 0..60 {
+            st.mark_sent_back(Pending {
+                turn: format!("t{i}"),
+                after: String::new(),
+                checks: Vec::new(),
+            });
+        }
+        assert_eq!(st.pending.len(), 50);
+        assert!(st.take_pending("t59").is_some() && st.take_pending("t0").is_none());
+    }
+
     fn temp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("dotonce-session-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
@@ -849,6 +928,22 @@ mod tests {
             .filter(|e| e.path().extension().is_some_and(|x| x == "tmp"))
             .collect();
         assert!(left.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clean_old_removes_old_tmp_files_and_leaves_other_files() {
+        let dir = temp("clean-tmp");
+        for name in ["s.123.tmp", "fresh.456.tmp", "notes.log", "data.bak"] {
+            fs::write(dir.join(name), "x").unwrap();
+        }
+        age(&dir.join("s.123.tmp"), 8 * 86_400);
+        age(&dir.join("notes.log"), 8 * 86_400);
+        age(&dir.join("data.bak"), 8 * 86_400);
+        assert_eq!(clean_old(&dir, SystemTime::now()), 1);
+        assert!(!dir.join("s.123.tmp").exists());
+        assert!(dir.join("fresh.456.tmp").exists());
+        assert!(dir.join("notes.log").exists() && dir.join("data.bak").exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 
