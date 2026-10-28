@@ -2249,7 +2249,7 @@ fn a_draft_split_across_batches_is_checked_whole() {
     assert_eq!(
         display_out(&h, at(2, true, "Thanks.\n```\n\nLet me know.\n")).as_deref(),
         Some(
-            "Thanks.\n```\n\ndotonce: the draft above breaks your no-stock-wait-opener, inline-links rule. A corrected one follows.\n\n\nLet me know.\n"
+            "Thanks.\n```\n\ndotonce: the draft above breaks your no-stock-wait-opener and inline-links rules. A corrected one follows.\n\n\nLet me know.\n"
         ),
         "lines from all three batches are checked at the close"
     );
@@ -2703,7 +2703,7 @@ fn the_label_names_every_failing_check() {
             serde_json::json!({"session_id": "s1", "prompt_id": "p1", "message_id": "m1", "index": 0, "final": true, "delta": draft, "cwd": h}),
         ),
         Some(format!(
-            "{draft}\ndotonce: the draft above breaks your no-stock-wait-opener, inline-links rule. A corrected one follows.\n\n"
+            "{draft}\ndotonce: the draft above breaks your no-stock-wait-opener and inline-links rules. A corrected one follows.\n\n"
         ))
     );
     std::fs::remove_dir_all(&h).unwrap();

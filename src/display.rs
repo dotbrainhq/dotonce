@@ -18,10 +18,12 @@ use crate::session;
 
 /// The line shown below a draft that breaks the checks with these ids.
 pub fn label(ids: &[String]) -> String {
-    format!(
-        "dotonce: the draft above breaks your {} rule. A corrected one follows.",
-        ids.join(", ")
-    )
+    let named = match ids {
+        [] => String::new(),
+        [one] => format!("{one} rule"),
+        [rest @ .., last] => format!("{} and {last} rules", rest.join(", ")),
+    };
+    format!("dotonce: the draft above breaks your {named}. A corrected one follows.")
 }
 
 /// What display keeps of a message between batches to check a draft once
@@ -338,9 +340,18 @@ mod tests {
 
     #[test]
     fn the_label_says_the_corrected_draft_follows() {
+        let ids = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
-            label(&["stock".to_string(), "links".to_string()]),
-            "dotonce: the draft above breaks your stock, links rule. A corrected one follows."
+            label(&ids(&["stock"])),
+            "dotonce: the draft above breaks your stock rule. A corrected one follows."
+        );
+        assert_eq!(
+            label(&ids(&["stock", "links"])),
+            "dotonce: the draft above breaks your stock and links rules. A corrected one follows."
+        );
+        assert_eq!(
+            label(&ids(&["stock", "links", "short"])),
+            "dotonce: the draft above breaks your stock, links and short rules. A corrected one follows."
         );
     }
 
