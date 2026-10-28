@@ -123,8 +123,6 @@ dotonce: the draft above breaks your inline-links rule. A corrected one follows.
 
 Claude then writes the corrected draft, with one line saying what it fixed. Copy the second one.
 
-An earlier build hid the broken draft instead, and that was dropped because it could lose text. Hiding depends on timing Claude Code doesn't promise: an interrupt, an ended session, or a draft right before a tool call could leave a hidden draft with nothing after it. A label never loses a word, and it still tells you which draft to skip.
-
 A tool call that breaks a `fix` set's tool check is denied. Claude sees which rule and why, and tries another way.
 
 ### Levels
