@@ -13,5 +13,6 @@ pub mod query;
 pub mod retrieve;
 pub mod rules;
 pub mod serve;
+pub mod session;
 pub mod store;
 pub mod timeq;

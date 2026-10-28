@@ -85,7 +85,7 @@ pub fn expand(p: &str) -> PathBuf {
 }
 
 /// Resolves `.` and `..` without touching the disk.
-fn lexical_normalize(p: &Path) -> PathBuf {
+pub fn lexical_normalize(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in p.components() {
         match c {
@@ -102,8 +102,19 @@ fn lexical_normalize(p: &Path) -> PathBuf {
 }
 
 /// The real path when it exists, the lexically cleaned path otherwise.
-fn resolve(p: &Path) -> PathBuf {
+pub fn resolve(p: &Path) -> PathBuf {
     fs::canonicalize(p).unwrap_or_else(|_| lexical_normalize(p))
+}
+
+/// True when `cwd` is `entry` or inside it, by real path. `entry` may start
+/// with `~/`; an empty or relative entry matches nothing.
+pub fn path_inside(cwd: &Path, entry: &str) -> bool {
+    let p = entry.trim();
+    if p.is_empty() {
+        return false;
+    }
+    let e = expand(p);
+    e.is_absolute() && resolve(cwd).starts_with(resolve(&e))
 }
 
 impl Config {
@@ -119,15 +130,7 @@ impl Config {
     }
 
     pub fn private_allowed(&self, cwd: &Path) -> bool {
-        let cwd = resolve(cwd);
-        self.private_paths.iter().any(|p| {
-            let p = p.trim();
-            if p.is_empty() {
-                return false;
-            }
-            let entry = expand(p);
-            entry.is_absolute() && cwd.starts_with(resolve(&entry))
-        })
+        self.private_paths.iter().any(|p| path_inside(cwd, p))
     }
 }
 
