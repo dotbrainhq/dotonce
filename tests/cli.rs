@@ -3406,7 +3406,7 @@ fn rules_test_takes_only_the_five_tool_names() {
             None,
         );
         assert!(!ok, "{tool}");
-        assert!(err.contains("invalid value"), "{tool}: {err}");
+        assert!(err.contains("possible values"), "{tool}: {err}");
     }
     for tool in ["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"] {
         let (out, err, ok) = run_full(
