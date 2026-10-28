@@ -97,9 +97,6 @@ fn scan(src: &str) -> (Vec<String>, Option<usize>) {
     let mut parts = Vec::new();
     let mut after_continue = None;
     for line in src.lines().rev() {
-        if !line.contains("\"type\"") {
-            continue;
-        }
         let Ok(e) = serde_json::from_str::<Value>(line) else {
             continue;
         };

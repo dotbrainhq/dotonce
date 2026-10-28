@@ -15,7 +15,7 @@ use crate::rules::Level;
 use crate::session;
 
 pub const HELD_NOTE: &str =
-    "(dotonce held back a draft that breaks your rules. The corrected draft follows.)";
+    "(dotonce held back a draft that breaks one of your rules. Claude is writing a corrected one.)";
 pub const INTERRUPTED_NOTE: &str =
     "(dotonce: an earlier draft, not checked because the reply was interrupted)";
 
@@ -217,9 +217,13 @@ pub fn display(v: &Value) -> Result<Option<String>> {
     ))
 }
 
+/// Written to a temp file and renamed, like `session::save`, so a hook that
+/// stops halfway never leaves a broken file.
 fn save_held(dir: &Path, path: &Path, held: &Held) -> Result<()> {
     fs::create_dir_all(dir)?;
-    fs::write(path, serde_json::to_string(held)?)?;
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    fs::write(&tmp, serde_json::to_string(held)?)?;
+    fs::rename(&tmp, path)?;
     Ok(())
 }
 

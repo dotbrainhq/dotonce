@@ -2065,8 +2065,12 @@ fn display_hook_holds_a_broken_draft_back() {
         shown(&batch("m1", 0, false, "Draft:\n```markdown\nHi Sam,\n")).as_deref(),
         Some("Draft:\n")
     );
-    let out = shown(&batch("m1", 1, true, "Sorry for the wait.\n```\n")).unwrap();
-    assert!(out.starts_with("(dotonce held back a draft"), "{out}");
+    assert_eq!(
+        shown(&batch("m1", 1, true, "Sorry for the wait.\n```\n")).as_deref(),
+        Some(
+            "(dotonce held back a draft that breaks one of your rules. Claude is writing a corrected one.)\n"
+        )
+    );
     assert_eq!(batch("m2", 0, true, "Plain reply.\n"), "");
     std::fs::remove_dir_all(&h).unwrap();
 }
@@ -2198,6 +2202,15 @@ fn an_interrupted_draft_shows_with_the_next_message() {
         )
         .as_deref(),
         Some("Draft:\n")
+    );
+    let files: Vec<String> = std::fs::read_dir(h.join("dotonce/sessions"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        files.contains(&"s1.display.json".to_string())
+            && !files.iter().any(|f| f.ends_with(".tmp")),
+        "the held lines are saved through a renamed temp file: {files:?}"
     );
     assert_eq!(
         display_out(
