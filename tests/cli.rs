@@ -2692,8 +2692,31 @@ fn display_labels_only_when_dotonce_runs_at_stop() {
     register_stop(&h);
     assert_eq!(
         show_draft(&h, &h, "s1", "p1", "m2"),
-        None,
-        "the first answer is kept for the session"
+        labeled(),
+        "the settings are read again at each call"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn display_never_writes_the_session_state() {
+    let h = ticket_home("displaystate", "fix");
+    register_stop(&h);
+    use_skill(&h, "s1", "p1");
+    let file = h.join("dotonce/sessions/s1.json");
+    let before = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(show_draft(&h, &h, "s1", "p1", "m1"), labeled());
+    assert_eq!(
+        display_out(
+            &h,
+            serde_json::json!({"session_id": "s1", "prompt_id": "p2", "message_id": "m2", "index": 0, "final": false, "delta": "```markdown\nHi Sam,\n"})
+        ),
+        None
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        before,
+        "the session state Stop keeps is left byte for byte as it was"
     );
     std::fs::remove_dir_all(&h).unwrap();
 }

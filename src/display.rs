@@ -194,7 +194,7 @@ pub fn display(v: &Value, cwd: &Path) -> Result<Option<String>> {
     let fix = session::checks_now(&state, cwd, prompt_id(v))
         .map(|now| now.fix().into_iter().cloned().collect::<Vec<_>>())
         .map(|fix| {
-            if fix.is_empty() || stop_registered(&dir, sid, &state, cwd) {
+            if fix.is_empty() || settings_run_stop(cwd) {
                 fix
             } else {
                 Vec::new()
@@ -243,26 +243,11 @@ pub fn display(v: &Value, cwd: &Path) -> Result<Option<String>> {
 }
 
 /// Whether Claude Code runs `dotonce hook stop` at Stop. Without it no
-/// corrected draft follows, so display never labels. Read once per session
-/// and kept in the session state.
-fn stop_registered(dir: &Path, sid: &str, state: &session::State, cwd: &Path) -> bool {
-    if let Some(found) = state.stop_hook {
-        return found;
-    }
-    let found = settings_run_stop(cwd);
-    let saved = session::load(dir, sid).and_then(|mut fresh| {
-        fresh.stop_hook = Some(found);
-        session::save(dir, sid, &fresh)
-    });
-    if let Err(e) = saved {
-        log_error(&format!("display: {e:#}"));
-    }
-    found
-}
-
-/// Reads Claude Code's user settings and the project's settings under
-/// `cwd`, without changing them. A file that exists but can't be read or
-/// parsed counts as no Stop hook.
+/// corrected draft follows, so display never labels. Read at every call
+/// that has a fix set, so display never writes the session state Stop
+/// keeps. Reads Claude Code's user settings and the project's settings
+/// under `cwd`, without changing them. A file that exists but can't be read
+/// or parsed counts as no Stop hook.
 fn settings_run_stop(cwd: &Path) -> bool {
     let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
         return false;
