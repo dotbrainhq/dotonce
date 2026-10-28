@@ -37,6 +37,22 @@ const EVENTS: &[&str] = &[
     "pre-tool",
 ];
 
+/// Every hook dotonce needs: the Claude Code event, the `dotonce hook`
+/// argument, and the matcher.
+pub const HOOKS: &[(&str, &str, Option<&str>)] = &[
+    ("UserPromptSubmit", "prompt", None),
+    ("SessionStart", "session-start", None),
+    ("Stop", "stop", None),
+    ("PostToolUse", "skill", Some("Skill")),
+    ("UserPromptExpansion", "expansion", None),
+    (
+        "PreToolUse",
+        "pre-tool",
+        Some("Bash|Write|Edit|MultiEdit|NotebookEdit"),
+    ),
+    ("MessageDisplay", "display", None),
+];
+
 /// Handles one Claude Code hook call. Returns the JSON to print, or None when
 /// there is nothing to add.
 pub fn handle(event: &str, input: &str, now: i64) -> Result<Option<String>> {

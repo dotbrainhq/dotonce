@@ -137,13 +137,19 @@ pub fn summary(set: &RuleSet, a: &Approvals) -> String {
     let level = prev.map_or(set.level, |p| p.level);
     let mut s = format!(
         "{}: level {}, {} checks, file {}\n",
-        set.id,
+        rules::printable(&set.id),
         level.as_str(),
         set.checks.len(),
-        set.file.display()
+        rules::printable(&set.file.to_string_lossy())
     );
     for c in &set.checks {
-        let _ = writeln!(s, "  {} ({}): {}", c.id, c.kind.name(), c.why);
+        let _ = writeln!(
+            s,
+            "  {} ({}): {}",
+            rules::printable(&c.id),
+            c.kind.name(),
+            rules::printable(&c.why)
+        );
     }
     if let Some(p) = prev {
         if p.hash != hash(&set.src) {
@@ -356,6 +362,20 @@ mod tests {
         assert!(
             off.contains("off now, and approving it turns it back on"),
             "{off}"
+        );
+    }
+
+    #[test]
+    fn summary_drops_control_characters_from_a_why() {
+        let s = set(
+            "id = \"acme\"\n[[check]]\nid = \"no-x\"\nwhy = \"x reads badly\\u001b[2K\"\nforbid = [\"x\"]\n",
+        );
+        assert!(s.checks[0].why.contains('\u{1b}'));
+        let out = summary(&s, &Approvals::default());
+        assert!(!out.contains('\u{1b}'), "{out:?}");
+        assert!(
+            out.contains("  no-x (forbid): x reads badly[2K\n"),
+            "{out:?}"
         );
     }
 

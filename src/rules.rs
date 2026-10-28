@@ -210,6 +210,16 @@ pub fn rules_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join("rules"))
 }
 
+/// The text without control characters other than tab, for printing to a
+/// terminal: a TOML escape in a rule file could otherwise move the cursor or
+/// erase a line, and hide the "changed" or "off" lines. C1 controls go too,
+/// since some terminals read U+009B as an escape.
+pub fn printable(s: &str) -> String {
+    s.chars()
+        .filter(|&c| c == '\t' || !c.is_control())
+        .collect()
+}
+
 pub fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
@@ -840,5 +850,15 @@ why = "No TODOs in Rust files."
             assert_eq!(Level::parse(l.as_str()).unwrap(), l);
         }
         assert!(Level::parse("block").is_err());
+    }
+
+    #[test]
+    fn printable_drops_terminal_control_characters_but_keeps_tabs() {
+        assert_eq!(
+            printable("keep\u{1b}[2K it\tshort\r\n\u{7f}\u{7}"),
+            "keep[2K it\tshort"
+        );
+        assert_eq!(printable("a\u{9b}2Kb"), "a2Kb");
+        assert_eq!(printable("Links go inline."), "Links go inline.");
     }
 }

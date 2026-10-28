@@ -1,5 +1,6 @@
 //! The `dotonce rules`, `stats` and `doctor` commands.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -7,12 +8,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use chrono::SecondsFormat;
 use serde::Serialize;
+use serde_json::{Value, json};
 
 use crate::approvals;
+use crate::catches;
 use crate::checks::{self, Failure};
 use crate::config;
+use crate::hook;
 use crate::retrieve::estimate_tokens;
-use crate::rules::{self, Level, RuleSet};
+use crate::rules::{self, Level, RuleSet, printable};
+use crate::session::{self, Event, State, Trigger};
 use crate::tools;
 
 /// A reminder this long leaves little room under the hooks' 2,000-token cap.
@@ -225,6 +230,10 @@ pub fn rules_list() -> Result<()> {
         println!("no rule sets in {}", rules::rules_dir()?.display());
         return Ok(());
     }
+    let mut last: BTreeMap<String, String> = BTreeMap::new();
+    for c in catches::read(private_ok)? {
+        last.insert(c.set, c.time);
+    }
     let mut hidden = 0;
     for s in &loaded.sets {
         if s.private && !private_ok {
@@ -235,11 +244,15 @@ pub fn rules_list() -> Result<()> {
             .sets
             .get(&s.id)
             .filter(|x| !x.changed.is_empty())
-            .map(|x| format!("  changed {}", x.changed))
+            .map(|x| format!("  changed {}", printable(&x.changed)))
             .unwrap_or_default();
+        let caught = last
+            .get(&s.id)
+            .map(|t| printable(&t.chars().take(10).collect::<String>()))
+            .unwrap_or_else(|| "none".to_string());
         println!(
-            "{:<24} {:<24} checks: {}{changed}",
-            s.id,
+            "{:<24} {:<24} checks: {}  last catch: {caught}{changed}",
+            printable(&s.id),
             a.state(s).label(),
             s.checks.len()
         );
@@ -248,12 +261,273 @@ pub fn rules_list() -> Result<()> {
         let stem = e
             .file
             .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
+            .map(|s| printable(&s.to_string_lossy()))
             .unwrap_or_default();
-        println!("{stem:<24} {:<24} {}", "error", e.line());
+        println!("{stem:<24} {:<24} {}", "error", printable(&e.line()));
     }
     if hidden > 0 {
         println!("{hidden} private set(s) hidden outside private_paths");
     }
+    Ok(())
+}
+
+pub fn rules_log(limit: usize) -> Result<()> {
+    let all = catches::read(private_here()?)?;
+    if all.is_empty() {
+        println!("no catches yet");
+        return Ok(());
+    }
+    let skip = all.len().saturating_sub(limit);
+    for c in &all[skip..] {
+        println!(
+            "{}  {}/{}  {}  {}",
+            printable(&c.time),
+            printable(&c.set),
+            printable(&c.check),
+            c.level.as_str(),
+            c.outcome.as_str()
+        );
+    }
+    Ok(())
+}
+
+pub fn stats() -> Result<()> {
+    let all = catches::read(private_here()?)?;
+    let rows = catches::stats(&all, chrono::Utc::now().timestamp());
+    if rows.is_empty() {
+        println!("no catches in the last 30 days");
+        return Ok(());
+    }
+    println!(
+        "{:<40} {:>4} {:>5} {:>6} {:>13} {:>11} {:>7} {:>9}",
+        "set/check", "7d", "30d", "fixed", "still broken", "unverified", "denied", "per week"
+    );
+    for r in rows {
+        println!(
+            "{:<40} {:>4} {:>5} {:>6} {:>13} {:>11} {:>7} {:>9.1}",
+            printable(&format!("{}/{}", r.set, r.check)),
+            r.week,
+            r.month,
+            r.fixed,
+            r.still_broken,
+            r.unverified,
+            r.denied,
+            r.per_week()
+        );
+    }
+    Ok(())
+}
+
+fn pick_session(dir: &Path, session_id: Option<&str>) -> Option<String> {
+    match session_id {
+        Some(s) => Some(s.to_string()),
+        None => session::newest(dir),
+    }
+}
+
+/// For this folder and the newest session (or `--session`), the sets that
+/// are on and what turned each one on.
+pub fn rules_why(session_id: Option<&str>) -> Result<()> {
+    let cfg = config::load()?;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let private_ok = cfg.private_allowed(&cwd);
+    let (live, _) = approvals::load_live()?;
+    let dir = session::dir()?;
+    let sid = pick_session(&dir, session_id);
+    let mut state = match &sid {
+        Some(s) => session::load(&dir, s)?,
+        None => State::default(),
+    };
+    session::refresh(&mut state, &live, &cfg, &cwd, None, Event::Other);
+    match &sid {
+        Some(s) => println!("session {}", printable(s)),
+        None => println!("no session yet"),
+    }
+    let mut shown = 0;
+    for a in &state.active {
+        let Some(l) = live.iter().find(|l| l.set.id == a.id) else {
+            continue;
+        };
+        if l.set.private && !private_ok {
+            continue;
+        }
+        let by = match a.by {
+            Trigger::Skill => "skill",
+            Trigger::Folder => "folder",
+            Trigger::Prompt => "prompt",
+        };
+        let what = printable(a.what.as_deref().unwrap_or(""));
+        let note = if a.by == Trigger::Prompt && !l.set.when.check_on_prompt {
+            "  (reminder only)"
+        } else {
+            ""
+        };
+        println!(
+            "{:<24} {:<7} {by} {what}{note}",
+            printable(&a.id),
+            l.level.as_str()
+        );
+        shown += 1;
+    }
+    if shown == 0 {
+        println!("no rule sets are on here");
+    }
+    for p in &state.paused {
+        println!("{:<24} paused for this session", printable(p));
+    }
+    Ok(())
+}
+
+/// Turns a set off for one session. Guarded like `rules off`, so Claude
+/// can't switch a set off for its own session through Bash.
+pub fn rules_pause(id: &str, session_id: Option<&str>) -> Result<()> {
+    approvals::refuse_agent()?;
+    find_set(id)?;
+    let dir = session::dir()?;
+    let sid = pick_session(&dir, session_id).context("no session yet: start Claude Code first")?;
+    confirmed(id, &format!("pause {id} for session {}", printable(&sid)))?;
+    // Read after the prompt, so hook changes made while it waited are kept.
+    let mut state = session::load(&dir, &sid)?;
+    if !state.paused.iter().any(|p| p == id) {
+        state.paused.push(id.to_string());
+    }
+    state.active.retain(|a| a.id != id);
+    session::save(&dir, &sid, &state)?;
+    println!("paused {id} for session {}", printable(&sid));
+    Ok(())
+}
+
+/// True when some hook group for `event` runs `dotonce hook <arg>` and its
+/// matcher covers every tool in `matcher`.
+fn has_hook(v: &Value, event: &str, arg: &str, matcher: Option<&str>) -> bool {
+    let want = format!("hook {arg}");
+    let Some(groups) = v
+        .pointer(&format!("/hooks/{event}"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    groups.iter().any(|g| {
+        let covers = match matcher {
+            None => true,
+            Some(m) => {
+                let gm = g.get("matcher").and_then(Value::as_str).unwrap_or("");
+                gm.is_empty()
+                    || gm == "*"
+                    || m.split('|').all(|t| gm.split('|').any(|x| x.trim() == t))
+            }
+        };
+        covers
+            && g.get("hooks").and_then(Value::as_array).is_some_and(|hs| {
+                hs.iter().any(|h| {
+                    h.get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(|c| c.contains("dotonce") && c.contains(&want))
+                })
+            })
+    })
+}
+
+/// A warning line for each settings file that sets DOTONCE_HOME in its
+/// `env` block: Claude Code passes it to the hooks, so they would read
+/// another folder's approvals.json.
+fn home_overrides(files: &[PathBuf]) -> Vec<String> {
+    let mut out = Vec::new();
+    for f in files {
+        let Some(v) = fs::read_to_string(f)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        else {
+            continue;
+        };
+        if let Some(home) = v.pointer("/env/DOTONCE_HOME") {
+            let value = match home.as_str() {
+                Some(s) => s.to_string(),
+                None => home.to_string(),
+            };
+            out.push(format!(
+                "warning  {} sets DOTONCE_HOME to {}: the hooks then read rule approvals from there, not from your dotonce home. Remove it unless you set it yourself.",
+                printable(&f.to_string_lossy()),
+                printable(&value)
+            ));
+        }
+    }
+    out
+}
+
+/// Reads ~/.claude/settings.json (never writes it) and lists the dotonce
+/// hooks that are there and missing.
+pub fn doctor() -> Result<()> {
+    let file = config::expand("~/.claude/settings.json");
+    let src = fs::read_to_string(&file).unwrap_or_default();
+    let v: Value = if src.trim().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(&src).with_context(|| format!("parse {}", file.display()))?
+    };
+    let mut missing = 0;
+    for &(event, arg, matcher) in hook::HOOKS {
+        let ok = has_hook(&v, event, arg, matcher);
+        if !ok {
+            missing += 1;
+        }
+        let label = if ok { "ok" } else { "missing" };
+        println!("{label:<8} {event} (dotonce hook {arg})");
+    }
+    if missing > 0 {
+        println!(
+            "{missing} hook(s) missing from {}. Run dotonce hook-config and add them; dotonce never edits that file.",
+            file.display()
+        );
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut files = vec![
+        file.clone(),
+        cwd.join(".claude/settings.json"),
+        cwd.join(".claude/settings.local.json"),
+    ];
+    let mut seen = Vec::new();
+    files.retain(|f| {
+        let real = fs::canonicalize(f).unwrap_or_else(|_| f.clone());
+        let new = !seen.contains(&real);
+        seen.push(real);
+        new
+    });
+    for line in home_overrides(&files) {
+        println!("{line}");
+    }
+    let loaded = rules::load()?;
+    let a = approvals::load()?;
+    let waiting = loaded
+        .sets
+        .iter()
+        .filter(|s| !matches!(a.state(s), approvals::State::On(_) | approvals::State::Off))
+        .count();
+    println!(
+        "rule sets: {} loaded, {} with errors, {} waiting for approval",
+        loaded.sets.len(),
+        loaded.errors.len(),
+        waiting
+    );
+    Ok(())
+}
+
+/// Prints the hooks block for Claude Code's settings.json, with this
+/// binary's absolute path.
+pub fn hook_config() -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let bin = hook::shell_word(&exe.to_string_lossy());
+    let mut hooks = serde_json::Map::new();
+    for &(event, arg, matcher) in hook::HOOKS {
+        let mut group = json!({"hooks": [{"type": "command", "command": format!("{bin} hook {arg}"), "timeout": 5}]});
+        if let Some(m) = matcher {
+            group["matcher"] = json!(m);
+        }
+        hooks.insert(event.to_string(), json!([group]));
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({"hooks": hooks}))?
+    );
     Ok(())
 }

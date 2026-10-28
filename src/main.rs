@@ -11,7 +11,6 @@ use dotonce::facts;
 use dotonce::hook;
 use dotonce::serve::serve;
 use dotonce::store::Store;
-use serde_json::json;
 
 #[derive(Parser)]
 #[command(
@@ -70,13 +69,17 @@ enum Cmd {
     },
     /// Run as a Claude Code hook (prompt, session-start, skill, expansion, stop or pre-tool). Reads the hook's JSON on stdin and never fails.
     Hook { event: String },
-    /// Print the hooks block to add to Claude Code's settings.json.
+    /// Print the hooks block to add to Claude Code's settings.json: every hook dotonce needs.
     HookConfig,
     /// Rule sets in ~/.dotonce/rules: create, check, test, approve and manage them.
     Rules {
         #[command(subcommand)]
         cmd: RulesCmd,
     },
+    /// Catches per check over 7 and 30 days, fixes, denials and the repeat-mistake rate.
+    Stats,
+    /// Check that Claude Code's settings have every hook dotonce needs. Reads only.
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -115,6 +118,24 @@ enum RulesCmd {
     Off { id: String },
     /// List every set with its level and approval state.
     List,
+    /// Show which sets are on here and what turned each one on.
+    Why {
+        /// The session to show. The newest one when left out.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Turn a set off for one session only. Needs a terminal and the typed id.
+    Pause {
+        id: String,
+        /// The session to pause it in. The newest one when left out.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Print the most recent catches.
+    Log {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
 }
 
 fn rules_cmd(cmd: RulesCmd) -> Result<()> {
@@ -147,6 +168,9 @@ fn rules_cmd(cmd: RulesCmd) -> Result<()> {
         RulesCmd::Level { id, level } => commands::rules_level(&id, &level),
         RulesCmd::Off { id } => commands::rules_off(&id),
         RulesCmd::List => commands::rules_list(),
+        RulesCmd::Why { session } => commands::rules_why(session.as_deref()),
+        RulesCmd::Pause { id, session } => commands::rules_pause(&id, session.as_deref()),
+        RulesCmd::Log { limit } => commands::rules_log(limit),
     }
 }
 
@@ -273,14 +297,9 @@ fn run(cmd: Cmd) -> Result<()> {
             run_hook(&event);
             Ok(())
         }
-        Cmd::HookConfig => {
-            let exe = std::env::current_exe()?;
-            let bin = hook::shell_word(&exe.to_string_lossy());
-            let entry = |event: &str| json!([{"hooks": [{"type": "command", "command": format!("{bin} hook {event}"), "timeout": 5}]}]);
-            let out = json!({"hooks": {"UserPromptSubmit": entry("prompt"), "SessionStart": entry("session-start")}});
-            println!("{}", serde_json::to_string_pretty(&out)?);
-            Ok(())
-        }
+        Cmd::HookConfig => commands::hook_config(),
         Cmd::Rules { cmd } => rules_cmd(cmd),
+        Cmd::Stats => commands::stats(),
+        Cmd::Doctor => commands::doctor(),
     }
 }
