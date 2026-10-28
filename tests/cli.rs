@@ -996,7 +996,23 @@ fn run_pty(
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(typed.as_bytes()).unwrap();
     drop(stdin);
-    let status = child.wait().unwrap();
+    // A binary that stops reading would hold the pty open, so the wait has
+    // a deadline too.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "{args:?} still running 20 s after the typed line: {}",
+                String::from_utf8_lossy(&seen)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     reader.join().unwrap();
     seen.extend(rx.try_iter().flatten());
     Some((String::from_utf8_lossy(&seen).to_string(), status.success()))
@@ -1485,7 +1501,6 @@ fn session_start_groups_the_notice_by_reason() {
     )
     .unwrap();
     let msg = start_message(&h, "s1", tmp);
-    println!("SAMPLE (12 sets, outside private_paths):\n{msg}");
     let lines: Vec<&str> = msg.lines().collect();
     assert_eq!(
         lines[..6],
