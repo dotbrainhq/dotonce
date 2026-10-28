@@ -3330,3 +3330,38 @@ fn guard_lets_searches_and_other_rule_commands_through() {
     }
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+#[test]
+fn guard_catches_plain_text_changes_to_the_home() {
+    let h = home("guardplain");
+    let proj = h.join("proj");
+    std::fs::create_dir_all(h.join("dotonce/rules")).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+    let bash = |cmd: &str| serde_json::json!({"command": cmd});
+    for cmd in [
+        "rm ~/dotonce/*.json",
+        "rm -rf ~/dotonce/r*",
+        "find ~/dotonce -name '*.json' -delete",
+        "rm -rf ~/dotonce",
+        "mv ~/dotonce ~/old",
+        "rm ~/\"dotonce\"/approvals.json",
+        "rm ~/dotonce/approval\\s.json",
+        "sed -i s/a/b/ ~/dotonce/rules/x.toml",
+        "cd ~/dotonce && echo '{}' > approvals.json",
+    ] {
+        assert_eq!(
+            pre(&h, &proj, "Bash", bash(cmd)).as_deref(),
+            Some(GUARD),
+            "{cmd}"
+        );
+    }
+    for cmd in [
+        "ls ~/dotonce",
+        "cat ~/dotonce/config.toml",
+        "du -sh ~/dotonce",
+        "cat ~/dotonce/config.toml | grep rules",
+    ] {
+        assert_eq!(pre(&h, &proj, "Bash", bash(cmd)), None, "{cmd}");
+    }
+    std::fs::remove_dir_all(&h).unwrap();
+}

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::str::Chars;
 
 use anyhow::Result;
+use globset::Glob;
 use serde_json::{Value, json};
 
 use crate::catches::{self, Catch, Outcome};
@@ -31,6 +32,28 @@ const SHELL_VALUE_OPTS: [&str; 6] = ["-o", "+o", "-O", "+O", "--rcfile", "--init
 /// How many quoted commands deep (`sh -c`, `eval`, `env -S`) the guard
 /// reads. One quoted deeper is denied when it names dotonce and rules.
 const MAX_DEPTH: usize = 3;
+/// Commands that change a file or folder named as their argument, so a
+/// command that names the dotonce home and a guarded name can write to it.
+const WRITERS: [&str; 12] = [
+    "rm", "mv", "cp", "tee", "ln", "chmod", "truncate", "dd", "install", "rsync", "tar", "unlink",
+];
+/// Commands that change the whole dotonce home when it is their argument.
+const HOME_WRITERS: [&str; 8] = ["rm", "mv", "cp", "find", "ln", "chmod", "rsync", "tar"];
+/// Interpreters that run code given with `-c` or `-e`, which can write any
+/// file. Any name starting with `python` counts too.
+const INTERPRETERS: [&str; 9] = [
+    "perl",
+    "ruby",
+    "node",
+    "nodejs",
+    "php",
+    "osascript",
+    "lua",
+    "deno",
+    "bun",
+];
+/// Redirection targets that are not files.
+const SINKS: [&str; 4] = ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"];
 /// env options that take the next word as their value.
 const ENV_VALUE_OPTS: [&str; 5] = ["-u", "--unset", "-C", "--chdir", "-P"];
 
@@ -192,7 +215,114 @@ fn guarded_path(p: &Path, home: &Path) -> bool {
         .any(|f| rules.iter().any(|r| f.starts_with(r)) || files.contains(f))
 }
 
-/// True when a shell command names the rules folder or a guarded file.
+/// True when `text` has `<base>/` followed by a name with a glob in it that
+/// matches a guarded name, such as `r*`, `*.json` or `{approvals,x}.json`.
+/// A glob that does not parse counts as a match.
+fn glob_target(text: &str, base: &str) -> bool {
+    let pre = format!("{base}/");
+    text.match_indices(&pre).any(|(at, _)| {
+        let name: String = text[at + pre.len()..]
+            .chars()
+            .take_while(|c| !"/ \t\n'\"`;|&()<>".contains(*c))
+            .collect();
+        if !name.contains(['*', '?', '[', '{']) {
+            return false;
+        }
+        match Glob::new(&name) {
+            Ok(g) => {
+                let m = g.compile_matcher();
+                ["rules", GUARDED_FILES[0], GUARDED_FILES[1]]
+                    .iter()
+                    .any(|n| m.is_match(n))
+            }
+            Err(_) => true,
+        }
+    })
+}
+
+/// True when the command gives the dotonce home itself, with or without a
+/// trailing `/`, to `rm`, `mv`, `cp`, `find`, `ln`, `chmod`, `rsync` or
+/// `tar`, here or in a quoted command it runs.
+fn names_bare_home(cmd: &str, bases: &[String], depth: usize) -> bool {
+    let bare = |w: &str| {
+        let mut w = w;
+        loop {
+            let t = w.trim_end_matches('/');
+            let t = t.strip_suffix("/.").unwrap_or(t);
+            if t == w {
+                break;
+            }
+            w = t;
+        }
+        !w.is_empty() && bases.iter().any(|b| b.trim_end_matches('/') == w)
+    };
+    simple_commands(cmd).iter().any(|c| {
+        command_positions(&c.words).into_iter().any(|i| {
+            HOME_WRITERS.contains(&base_name(&c.words[i]))
+                && c.words[i + 1..].iter().any(|w| bare(w))
+        }) || (depth < MAX_DEPTH
+            && quoted_commands(&c.words)
+                .0
+                .iter()
+                .any(|q| names_bare_home(q, bases, depth + 1)))
+    })
+}
+
+/// True when the command word `words[0]` writes files with these arguments:
+/// a writer such as `rm` or `tee`, `sed -i`, `perl -i`, or an interpreter
+/// running code from `-c` or `-e`.
+fn writes_with(words: &[String]) -> bool {
+    let name = base_name(&words[0]);
+    let args = &words[1..];
+    let flag = |letters: &str| {
+        args.iter().any(|a| {
+            a.len() > 1
+                && a.starts_with('-')
+                && !a.starts_with("--")
+                && a[1..].contains(|c| letters.contains(c))
+        })
+    };
+    WRITERS.contains(&name)
+        || (name == "sed" && (flag("i") || args.iter().any(|a| a.starts_with("--in-place"))))
+        || (name == "perl" && flag("i"))
+        || ((name.starts_with("python") || INTERPRETERS.contains(&name))
+            && (flag("ce") || args.iter().any(|a| a == "--eval")))
+}
+
+/// The words of the commands piped into `cmds[k]`, past each one's command
+/// word: the text a shell reading stdin would run.
+fn fed_words(cmds: &[Simple], k: usize) -> impl Iterator<Item = &String> {
+    cmds[k]
+        .piped_from
+        .and_then(|p| cmds.get(p..k))
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|f| f.words.iter().skip(1))
+}
+
+/// True when the command can write a file: a writing command, an output
+/// redirection to a file, or a quoted command or shell input that does.
+fn can_write(cmd: &str, depth: usize) -> bool {
+    let cmds = simple_commands(cmd);
+    let deeper = |q: &String| depth >= MAX_DEPTH || can_write(q, depth + 1);
+    cmds.iter().enumerate().any(|(k, c)| {
+        if c.writes
+            || command_positions(&c.words)
+                .into_iter()
+                .any(|i| writes_with(&c.words[i..]))
+        {
+            return true;
+        }
+        let (quoted, stdin) = quoted_commands(&c.words);
+        quoted.iter().any(deeper)
+            || (stdin && (c.stdin.iter().any(deeper) || fed_words(&cmds, k).any(deeper)))
+    })
+}
+
+/// True when a shell command names the rules folder or a guarded file, the
+/// home itself as an argument to a command that changes it, or the home and
+/// a guarded name in a command that can write. Paths are matched in the raw
+/// text and in the words with their quotes and backslashes taken off.
 pub fn mentions(cmd: &str, home: &Path, cwd: &Path, user_home: Option<&Path>) -> bool {
     let mut bases: Vec<String> = forms(home)
         .iter()
@@ -215,18 +345,29 @@ pub fn mentions(cmd: &str, home: &Path, cwd: &Path, user_home: Option<&Path>) ->
         .flat_map(|b| named.iter().map(move |n| format!("{b}/{n}")))
         .collect();
     needles.extend(named.iter().map(|n| format!(".dotonce/{n}")));
-    if needles.iter().any(|n| cmd.contains(n.as_str())) {
+    let cmds = simple_commands(cmd);
+    let texts: Vec<&str> = std::iter::once(cmd)
+        .chain(cmds.iter().flat_map(|c| &c.words).map(String::as_str))
+        .collect();
+    let names = |t: &&str| {
+        needles.iter().any(|n| t.contains(n.as_str())) || bases.iter().any(|b| glob_target(t, b))
+    };
+    if texts.iter().any(names) || names_bare_home(cmd, &bases, 0) {
         return true;
     }
-    let names_target = ["rules", "approvals", "last-live"]
-        .iter()
-        .any(|w| cmd.contains(w));
+    let names_target = texts.iter().any(|t| {
+        ["rules", "approvals", "last-live"]
+            .iter()
+            .any(|w| t.contains(w))
+    });
     let home_forms = forms(home);
-    let at_home = bases.iter().any(|b| cmd.contains(b.as_str()))
+    let at_home = texts
+        .iter()
+        .any(|t| bases.iter().any(|b| t.contains(b.as_str())))
         || forms(cwd)
             .iter()
             .any(|c| home_forms.iter().any(|h| c.starts_with(h)));
-    names_target && at_home
+    names_target && at_home && can_write(cmd, 0)
 }
 
 /// True when the call would change a rule file or approvals.json.
@@ -260,6 +401,8 @@ enum Ctx {
 struct Simple {
     words: Vec<String>,
     stdin: Vec<String>,
+    /// True when an output redirection writes to a file.
+    writes: bool,
     /// The index of the first command of the pipeline that feeds this one.
     piped_from: Option<usize>,
 }
@@ -277,6 +420,11 @@ struct Lexer {
     after_pipe: bool,
     pipe_start: usize,
     docs: Vec<Doc>,
+    /// Where the current word's last unquoted `>` ends, so the rest of the
+    /// word is the redirection target.
+    redir: Option<usize>,
+    /// The next word is a redirection target (`> file`).
+    redir_next: bool,
 }
 
 impl Lexer {
@@ -286,6 +434,18 @@ impl Lexer {
 
     fn end_word(&mut self) {
         if let Some(w) = self.word.take() {
+            let target = match self.redir.take() {
+                Some(at) if at < w.len() => Some(&w[at..]),
+                Some(_) => {
+                    self.redir_next = true;
+                    None
+                }
+                None if std::mem::take(&mut self.redir_next) => Some(w.as_str()),
+                None => None,
+            };
+            if target.is_some_and(|t| !t.starts_with('&') && !SINKS.contains(&t)) {
+                self.cur.writes = true;
+            }
             if std::mem::take(&mut self.here_string) {
                 self.cur.stdin.push(w);
             } else {
@@ -296,6 +456,7 @@ impl Lexer {
 
     fn end_cmd(&mut self) {
         self.end_word();
+        self.redir_next = false;
         if !self.cur.words.is_empty() || !self.cur.stdin.is_empty() {
             if std::mem::take(&mut self.after_pipe) {
                 self.cur.piped_from = Some(self.pipe_start);
@@ -481,6 +642,10 @@ fn lex(cmd: &str, mut stack: Vec<Ctx>) -> Vec<Simple> {
                 Some(n) => l.push(n),
             },
             '#' if l.word.is_none() => while chars.next_if(|n| *n != '\n').is_some() {},
+            '>' => {
+                l.push(c);
+                l.redir = l.word.as_ref().map(String::len);
+            }
             _ => l.push(c),
         }
     }
@@ -1091,5 +1256,77 @@ mod tests {
         ] {
             assert!(runs_rule_change(cmd), "{cmd}");
         }
+    }
+
+    #[test]
+    fn home_globs_bare_homes_and_quoted_paths_name_a_target() {
+        let home = Path::new("/fake/sam/.dotonce");
+        let user = Some(Path::new("/fake/sam"));
+        let cwd = Path::new("/fake/sam/code");
+        for cmd in [
+            "rm ~/.dotonce/*.json",
+            "rm -rf ~/.dotonce/r*",
+            "rm ~/.dotonce/[al]*",
+            "rm -rf $HOME/.dotonce/?ules",
+            "rm ~/.dotonce/{approvals,x}.json",
+            "bash -c 'rm ~/.dotonce/*.json'",
+            "find ~/.dotonce -name '*.json' -delete",
+            "rm -rf ~/.dotonce",
+            "rm -rf ~/.dotonce/",
+            "sudo rm -rf /fake/sam/.dotonce",
+            "mv ~/.dotonce ~/.old",
+            "tar -C ~/.dotonce -xf backup.tar",
+            "rm ~/\".dotonce\"/approvals.json",
+            "rm ~/'.dotonce/rules'/a.toml",
+            "rm ~/.dotonce/approval\\s.json",
+        ] {
+            assert!(mentions(cmd, home, cwd, user), "{cmd}");
+        }
+        for cmd in [
+            "ls ~/.dotonce",
+            "ls ~/.dotonce/",
+            "cat ~/.dotonce/config.toml",
+            "du -sh ~/.dotonce",
+            "ls ~/.dotonce/*.toml",
+            "ls -d ~/.dotonce/n*",
+        ] {
+            assert!(!mentions(cmd, home, cwd, user), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn the_home_and_a_target_word_only_deny_a_command_that_can_write() {
+        let home = Path::new("/fake/sam/.dotonce");
+        let user = Some(Path::new("/fake/sam"));
+        let cwd = Path::new("/fake/sam/code");
+        for cmd in [
+            "sed -i s/a/b/ ~/.dotonce/rules/x.toml",
+            "cd ~/.dotonce && sed -i s/a/b/ rules/x.toml",
+            "cd ~/.dotonce && perl -pi -e s/a/b/ approvals.json",
+            "cd ~/.dotonce && rm -rf rules",
+            "cd ~/.dotonce && echo '{}' > approvals.json",
+            "cd ~/.dotonce && echo '{}' >>last-live.json",
+            "cd ~/.dotonce && cat x | tee approvals.json",
+            "cd ~/.dotonce && truncate -s 0 approvals.json",
+            "cd ~/.dotonce && python3 -c 'import os; os.remove(\"approvals.json\")'",
+            "cd ~/.dotonce && node -e 'require(\"fs\").rmSync(\"rules\")'",
+            "bash -c 'cd ~/.dotonce && rm approvals.json'",
+            "sudo -u sam sh -c 'cd ~/.dotonce && rm -rf rules'",
+        ] {
+            assert!(mentions(cmd, home, cwd, user), "{cmd}");
+        }
+        for cmd in [
+            "cat ~/.dotonce/config.toml | grep rules",
+            "grep rules ~/.dotonce/config.toml 2>/dev/null",
+            "grep -c approvals ~/.dotonce/config.toml >&2",
+            "grep rules ~/.dotonce/config.toml > /dev/null",
+            "cd ~/.dotonce && ls rules",
+            "cd ~/.dotonce && cat rules/x.toml",
+            "bash -c 'cat ~/.dotonce/config.toml' | grep rules",
+        ] {
+            assert!(!mentions(cmd, home, cwd, user), "{cmd}");
+        }
+        assert!(mentions("rm rules/a.toml", home, home, user));
+        assert!(!mentions("cat rules/a.toml", home, home, user));
     }
 }
