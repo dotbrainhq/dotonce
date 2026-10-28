@@ -3301,3 +3301,32 @@ fn a_missing_session_id_is_logged_only_with_rule_sets() {
     assert!(errors(&h).contains("no session_id"), "{}", errors(&h));
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+#[test]
+fn guard_lets_searches_and_other_rule_commands_through() {
+    let h = home("guardsearch");
+    let proj = h.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let bash = |cmd: &str| serde_json::json!({"command": cmd});
+    for cmd in [
+        "grep -rn \"dotonce rules approve\" src | grep sh",
+        "rg \"dotonce rules approve\" -t sh",
+        "grep -rn \"dotonce rules off\" . | grep -v fish",
+        "ps aux | grep zsh",
+        "dotonce rules test x off",
+        "dotonce search rules off",
+    ] {
+        assert_eq!(pre(&h, &proj, "Bash", bash(cmd)), None, "{cmd}");
+    }
+    for cmd in [
+        "echo 'dotonce rules approve acme' | sudo -u sam bash",
+        "dotonce rules off acme",
+    ] {
+        assert_eq!(
+            pre(&h, &proj, "Bash", bash(cmd)).as_deref(),
+            Some(GUARD),
+            "{cmd}"
+        );
+    }
+    std::fs::remove_dir_all(&h).unwrap();
+}

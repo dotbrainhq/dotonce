@@ -34,6 +34,80 @@ const MAX_DEPTH: usize = 3;
 /// env options that take the next word as their value.
 const ENV_VALUE_OPTS: [&str; 5] = ["-u", "--unset", "-C", "--chdir", "-P"];
 
+/// A word that runs the next word as a command: its name, the short options
+/// that take a value, the long options that take one, and how many plain
+/// arguments come before the command (`timeout`'s duration).
+struct Runner {
+    name: &'static str,
+    short: &'static str,
+    long: &'static [&'static str],
+    args: usize,
+}
+
+const fn runner(
+    name: &'static str,
+    short: &'static str,
+    long: &'static [&'static str],
+    args: usize,
+) -> Runner {
+    Runner {
+        name,
+        short,
+        long,
+        args,
+    }
+}
+
+const RUNNERS: [Runner; 19] = [
+    runner(
+        "sudo",
+        "ugCDhprtUT",
+        &[
+            "--user",
+            "--group",
+            "--close-from",
+            "--chdir",
+            "--host",
+            "--prompt",
+            "--role",
+            "--type",
+            "--other-user",
+            "--command-timeout",
+        ],
+        0,
+    ),
+    runner("su", "csgGw", &["--command", "--shell", "--group"], 0),
+    runner("env", "uCPS", &["--unset", "--chdir", "--split-string"], 0),
+    runner("exec", "a", &[], 0),
+    runner("command", "", &[], 0),
+    runner("nohup", "", &[], 0),
+    runner("nice", "n", &["--adjustment"], 0),
+    runner("time", "fo", &["--format", "--output"], 0),
+    runner("timeout", "sk", &["--signal", "--kill-after"], 1),
+    runner(
+        "xargs",
+        "aEILnPsdJRS",
+        &[
+            "--arg-file",
+            "--delimiter",
+            "--max-args",
+            "--max-procs",
+            "--max-chars",
+            "--process-slot-var",
+        ],
+        0,
+    ),
+    runner("!", "", &[], 0),
+    runner("{", "", &[], 0),
+    runner("then", "", &[], 0),
+    runner("do", "", &[], 0),
+    runner("if", "", &[], 0),
+    runner("elif", "", &[], 0),
+    runner("else", "", &[], 0),
+    runner("while", "", &[], 0),
+    runner("until", "", &[], 0),
+];
+
 pub fn tool_text(tool: &str, input: &Value) -> Option<(Option<String>, String)> {
     let s = |k: &str| str_field(input, k).to_string();
     match tool {
@@ -427,14 +501,77 @@ fn is_dotonce(w: &str) -> bool {
     w == "dotonce" || w.ends_with("/dotonce")
 }
 
-/// True when a `dotonce` word is followed, anywhere later in the command, by
-/// `rules` and then a rule change. Wherever `dotonce` stands it can be run:
-/// by `sudo`, `xargs`, `script`, `nice`, `timeout` and the like.
+/// True when a `dotonce` word has `rules` as its first word that is not an
+/// option, and a rule change right after it. Wherever `dotonce` stands it
+/// can be run: by `sudo`, `xargs`, `script`, `nice`, `timeout` and the like.
 fn runs_change(words: &[String]) -> bool {
-    let mut rest = words.iter().skip_while(|w| !is_dotonce(w));
-    rest.next().is_some()
-        && rest.by_ref().any(|w| w == "rules")
-        && rest.any(|w| RULE_CHANGES.contains(&w.as_str()))
+    words.iter().enumerate().any(|(i, w)| {
+        let mut rest = words[i + 1..].iter().skip_while(|w| w.starts_with('-'));
+        is_dotonce(w)
+            && rest.next().is_some_and(|w| w == "rules")
+            && rest
+                .next()
+                .is_some_and(|w| RULE_CHANGES.contains(&w.as_str()))
+    })
+}
+
+fn base_name(w: &str) -> &str {
+    w.rsplit('/').next().unwrap_or(w)
+}
+
+/// Skips the options from `i` on, given the short options and long options
+/// that take a value. Returns the index of the first word after them and the
+/// short flags seen.
+fn skip_opts(words: &[String], mut i: usize, short: &str, long: &[&str]) -> (usize, String) {
+    let mut flags = String::new();
+    while let Some(w) = words.get(i).map(String::as_str) {
+        i += 1;
+        if w == "--" {
+            break;
+        } else if w.starts_with("--") {
+            i += usize::from(!w.contains('=') && long.contains(&w));
+        } else if w.len() > 1 && w.starts_with('-') {
+            let cluster = &w[1..];
+            for (k, c) in cluster.char_indices() {
+                if short.contains(c) {
+                    i += usize::from(k + c.len_utf8() == cluster.len());
+                    break;
+                }
+                flags.push(c);
+            }
+        } else {
+            i -= 1;
+            break;
+        }
+    }
+    (i, flags)
+}
+
+/// The indexes of the words that run as commands: the first word after any
+/// `NAME=value` assignments, and the word each runner (`sudo`, `env`,
+/// `xargs`, `then` and the like) runs, past its options and their values.
+fn command_positions(words: &[String]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut i = words.iter().take_while(|w| is_assignment(w)).count();
+    while let Some(w) = words.get(i) {
+        out.push(i);
+        let name = base_name(w);
+        let Some(r) = RUNNERS.iter().find(|r| r.name == name) else {
+            break;
+        };
+        let (mut next, flags) = skip_opts(words, i + 1, r.short, r.long);
+        if r.name == "command" && flags.contains(['v', 'V']) {
+            break;
+        }
+        if r.name == "env" {
+            next += words[next.min(words.len())..]
+                .iter()
+                .take_while(|w| is_assignment(w))
+                .count();
+        }
+        i = next + r.args;
+    }
+    out
 }
 
 /// What a shell's arguments run: a `-c` command, stdin, or a script file.
@@ -500,9 +637,9 @@ fn env_split(args: &[String]) -> Option<String> {
 fn quoted_commands(words: &[String]) -> (Vec<String>, bool) {
     let mut cmds = Vec::new();
     let mut stdin = false;
-    for (i, w) in words.iter().enumerate() {
+    for i in command_positions(words) {
         let rest = &words[i + 1..];
-        match w.rsplit('/').next().unwrap_or(w) {
+        match base_name(&words[i]) {
             "eval" => cmds.push(rest.join(" ")),
             "env" => cmds.extend(env_split(rest)),
             b if SHELLS.contains(&b) => match shell_runs(rest) {
@@ -895,6 +1032,64 @@ mod tests {
             "bash <<EOF\nls src\nEOF",
         ] {
             assert!(!runs_rule_change(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn shells_eval_and_env_only_count_in_command_position() {
+        for cmd in [
+            "grep -rn \"dotonce rules approve\" src | grep sh",
+            "rg \"dotonce rules approve\" -t sh",
+            "rg -t sh \"dotonce rules approve\"",
+            "grep -rn \"dotonce rules off\" . | grep -v fish",
+            "ps aux | grep zsh",
+            "echo 'dotonce rules approve x' | grep eval",
+            "echo 'dotonce rules approve x' | grep -w env",
+            "echo 'dotonce rules approve x' | command -v sh",
+            "make -C build sh <<< 'dotonce rules off x'",
+        ] {
+            assert!(!runs_rule_change(cmd), "{cmd}");
+        }
+        for cmd in [
+            "echo 'dotonce rules approve x' | sudo -u sam bash",
+            "echo 'dotonce rules approve x' | env -i PATH=/bin sh",
+            "echo 'dotonce rules approve x' | nice -n 5 sh",
+            "echo 'dotonce rules approve x' | timeout -s KILL 5 bash",
+            "echo 'dotonce rules approve x' | xargs -0 -n 1 bash -s",
+            "if true; then sh -c 'dotonce rules off x'; fi",
+            "for i in 1; do bash -c 'dotonce rules off x'; done",
+            "! bash -c 'dotonce rules off x'",
+            "{ bash -c 'dotonce rules off x'; }",
+            "time -p bash -c 'dotonce rules off x'",
+            "nohup sh -c 'dotonce rules off x'",
+            "exec -a name bash -c 'dotonce rules off x'",
+            "command bash -c 'dotonce rules off x'",
+            "X=1 Y=2 bash -c 'dotonce rules off x'",
+            "sudo -u sam env -S 'dotonce rules off x'",
+            "sudo -u sam eval 'dotonce rules off x'",
+        ] {
+            assert!(runs_rule_change(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn rules_and_the_verb_must_follow_dotonce_in_order() {
+        for cmd in [
+            "dotonce rules test x off",
+            "dotonce search rules off",
+            "dotonce rules list approve",
+            "dotonce save rules approve",
+            "dotonce rules test x off.md --tool Bash",
+        ] {
+            assert!(!runs_rule_change(cmd), "{cmd}");
+        }
+        for cmd in [
+            "dotonce rules off x",
+            "dotonce --verbose rules approve x",
+            "cargo run --bin dotonce -- rules approve x",
+            "sudo dotonce rules level x fix",
+        ] {
+            assert!(runs_rule_change(cmd), "{cmd}");
         }
     }
 }
