@@ -1121,7 +1121,7 @@ fn hook(h: &Path, event: &str, input: serde_json::Value) -> String {
     out
 }
 
-const REPLIES: &str = "[when]\nprompt = [\"draft\"]\nskills = [\"writing-support\"]\n[remind]\ntext = \"Links go inline as anchor text.\"\n";
+const REPLIES: &str = "[when]\nprompt = [\"draft\"]\nskills = [\"acme-writer\"]\n[remind]\ntext = \"Links go inline as anchor text.\"\n";
 
 #[test]
 fn prompt_hook_adds_reminders_before_facts() {
@@ -1197,21 +1197,17 @@ fn skill_and_expansion_hooks_turn_sets_on_and_compaction_reminds_again() {
     approve(&h, "acme-replies", "warn");
     let skill = |sid: &str, tool: &str, name: &str| serde_json::json!({"session_id": sid, "prompt_id": "p1", "hook_event_name": "PostToolUse", "tool_name": tool, "tool_input": {"skill": name}, "cwd": "/tmp"});
     let ctx = context(
-        &hook(
-            &h,
-            "skill",
-            skill("s1", "Skill", "acme-tools:writing-support"),
-        ),
+        &hook(&h, "skill", skill("s1", "Skill", "acme-tools:acme-writer")),
         "PostToolUse",
     );
     assert!(ctx.contains("Links go inline as anchor text."), "{ctx}");
     assert!(
-        hook(&h, "skill", skill("s1", "Skill", "writing-support"))
+        hook(&h, "skill", skill("s1", "Skill", "acme-writer"))
             .trim()
             .is_empty()
     );
     assert!(
-        hook(&h, "skill", skill("s2", "Read", "writing-support"))
+        hook(&h, "skill", skill("s2", "Read", "acme-writer"))
             .trim()
             .is_empty()
     );
@@ -1220,7 +1216,7 @@ fn skill_and_expansion_hooks_turn_sets_on_and_compaction_reminds_again() {
             .trim()
             .is_empty()
     );
-    let exp = serde_json::json!({"session_id": "s3", "prompt_id": "p1", "hook_event_name": "UserPromptExpansion", "expansion_type": "slash_command", "command_name": "writing-support", "command_args": "", "command_source": "user", "prompt": "/writing-support", "cwd": "/tmp"});
+    let exp = serde_json::json!({"session_id": "s3", "prompt_id": "p1", "hook_event_name": "UserPromptExpansion", "expansion_type": "slash_command", "command_name": "acme-writer", "command_args": "", "command_source": "user", "prompt": "/acme-writer", "cwd": "/tmp"});
     let ctx = context(&hook(&h, "expansion", exp), "UserPromptExpansion");
     assert!(ctx.contains("Links go inline"), "{ctx}");
     let out = hook(
@@ -1609,13 +1605,13 @@ fn a_reminder_left_out_at_the_cap_comes_with_the_next_prompt() {
             &h,
             id,
             &format!(
-                "[when]\nskills = [\"writing-support\"]\n[remind]\ntext = \"{}\"\n",
+                "[when]\nskills = [\"acme-writer\"]\n[remind]\ntext = \"{}\"\n",
                 long(word)
             ),
         );
         approve(&h, id, "warn");
     }
-    let skill = serde_json::json!({"session_id": "s1", "prompt_id": "p1", "tool_name": "Skill", "tool_input": {"skill": "writing-support"}, "cwd": "/tmp"});
+    let skill = serde_json::json!({"session_id": "s1", "prompt_id": "p1", "tool_name": "Skill", "tool_input": {"skill": "acme-writer"}, "cwd": "/tmp"});
     let ctx = context(&hook(&h, "skill", skill), "PostToolUse");
     assert!(
         ctx.contains("[first-set]") && !ctx.contains("[second-set]"),
@@ -1761,15 +1757,15 @@ fn an_unusable_session_id_still_gives_the_notice() {
     std::fs::remove_dir_all(&h).unwrap();
 }
 
-const TICKET: &str = "[when]\nskills = [\"writing-support\"]\n[draft]\nfence = [\"markdown\"]\n[[check]]\nid = \"no-stock-wait-opener\"\nforbid = [\"sorry for the wait\"]\nwhy = \"Open with a line from the thread.\"\n[[check]]\nid = \"inline-links\"\nkind = \"bare-url\"\nwhy = \"Links go inline as anchor text.\"\n";
+const ACME_MAIL: &str = "[when]\nskills = [\"acme-writer\"]\n[draft]\nfence = [\"markdown\"]\n[[check]]\nid = \"no-stock-wait-opener\"\nforbid = [\"sorry for the wait\"]\nwhy = \"Open with a line from the thread.\"\n[[check]]\nid = \"inline-links\"\nkind = \"bare-url\"\nwhy = \"Links go inline as anchor text.\"\n";
 const BROKEN: &str = "Here is the draft:\n\n```markdown\nHi Sam,\n\nSorry for the wait. The guide is at https://example.com/guide\n```";
 const BROKEN_AGAIN: &str = "Second try:\n\n```markdown\nHi Sam,\n\nSorry for the wait. More at https://example.com/more\n```";
 const FIXED: &str = "Fixed the opener and the link.\n\n```markdown\nHi Sam,\n\nThanks for the details. The [setup guide](https://example.com/guide) covers it.\n```";
 
-fn ticket_home(name: &str, level: &str) -> PathBuf {
+fn acme_home(name: &str, level: &str) -> PathBuf {
     let h = home(name);
-    add_set(&h, "ticket-reply", TICKET);
-    approve(&h, "ticket-reply", level);
+    add_set(&h, "acme-mail", ACME_MAIL);
+    approve(&h, "acme-mail", level);
     h
 }
 
@@ -1777,7 +1773,7 @@ fn use_skill(h: &Path, sid: &str, pid: &str) {
     hook(
         h,
         "skill",
-        serde_json::json!({"session_id": sid, "prompt_id": pid, "tool_name": "Skill", "tool_input": {"skill": "writing-support"}, "cwd": "/tmp"}),
+        serde_json::json!({"session_id": sid, "prompt_id": pid, "tool_name": "Skill", "tool_input": {"skill": "acme-writer"}, "cwd": "/tmp"}),
     );
 }
 
@@ -1827,7 +1823,7 @@ fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
 
 #[test]
 fn fix_set_sends_a_broken_draft_back_once_and_logs_the_fix() {
-    let h = ticket_home("stopfix", "fix");
+    let h = acme_home("stopfix", "fix");
     use_skill(&h, "s1", "p1");
     let msg = sent_back(&stop(&h, "s1", "p1", BROKEN, false));
     assert!(
@@ -1872,10 +1868,10 @@ fn fix_set_sends_a_broken_draft_back_once_and_logs_the_fix() {
 fn a_pattern_that_does_not_compile_skips_only_its_check_in_hooks() {
     let h = home("badpattern");
     let body = format!(
-        "{TICKET}[[check]]\nid = \"no-todo\"\nforbid_regex = '('\nwhy = \"No placeholders.\"\n"
+        "{ACME_MAIL}[[check]]\nid = \"no-todo\"\nforbid_regex = '('\nwhy = \"No placeholders.\"\n"
     );
-    add_set(&h, "ticket-reply", &body);
-    approve(&h, "ticket-reply", "fix");
+    add_set(&h, "acme-mail", &body);
+    approve(&h, "acme-mail", "fix");
     use_skill(&h, "s1", "p1");
     let msg = sent_back(&stop(&h, "s1", "p1", BROKEN, false));
     assert!(msg.contains("- no-stock-wait-opener: "), "{msg}");
@@ -1891,10 +1887,10 @@ fn a_pattern_that_does_not_compile_skips_only_its_check_in_hooks() {
     let f = h.join("reply.md");
     std::fs::write(&f, BROKEN).unwrap();
     for args in [
-        &["rules", "test", "ticket-reply", &f.to_string_lossy()][..],
-        &["rules", "approve", "ticket-reply"],
+        &["rules", "test", "acme-mail", &f.to_string_lossy()][..],
+        &["rules", "approve", "acme-mail"],
     ] {
-        let (_, err, ok) = run_full(&h, &h, args, Some("ticket-reply\n"));
+        let (_, err, ok) = run_full(&h, &h, args, Some("acme-mail\n"));
         assert!(!ok, "{args:?}");
         assert!(
             err.contains("has an error") && err.contains("forbid_regex"),
@@ -1906,7 +1902,7 @@ fn a_pattern_that_does_not_compile_skips_only_its_check_in_hooks() {
 
 #[test]
 fn a_second_broken_draft_is_let_through_and_a_missing_one_is_unverified() {
-    let h = ticket_home("stopbroken", "fix");
+    let h = acme_home("stopbroken", "fix");
     use_skill(&h, "s1", "p1");
     assert!(!stop(&h, "s1", "p1", BROKEN, false).trim().is_empty());
     assert!(stop(&h, "s1", "p1", BROKEN_AGAIN, true).trim().is_empty());
@@ -1931,7 +1927,7 @@ fn a_second_broken_draft_is_let_through_and_a_missing_one_is_unverified() {
 
 #[test]
 fn a_corrected_draft_that_breaks_another_check_logs_the_new_catch() {
-    let h = ticket_home("recheckother-check", "fix");
+    let h = acme_home("recheckother-check", "fix");
     use_skill(&h, "s1", "p1");
     let first = "Draft:\n```markdown\nHi Sam,\nSorry for the wait.\n```";
     let msg = sent_back(&stop(&h, "s1", "p1", first, false));
@@ -1961,7 +1957,7 @@ fn a_corrected_draft_that_breaks_another_check_logs_the_new_catch() {
 
 #[test]
 fn another_stop_hook_continuing_the_turn_does_not_count_as_ours() {
-    let h = ticket_home("stopother", "fix");
+    let h = acme_home("stopother", "fix");
     use_skill(&h, "s1", "p1");
     assert!(!sent_back(&stop(&h, "s1", "p1", BROKEN, true)).is_empty());
     std::fs::remove_dir_all(&h).unwrap();
@@ -1969,7 +1965,7 @@ fn another_stop_hook_continuing_the_turn_does_not_count_as_ours() {
 
 #[test]
 fn warn_sets_only_log_and_unused_sets_check_nothing() {
-    let h = ticket_home("stopwarn", "warn");
+    let h = acme_home("stopwarn", "warn");
     use_skill(&h, "s1", "p1");
     assert!(stop(&h, "s1", "p1", BROKEN, false).trim().is_empty());
     assert_eq!(
@@ -1989,7 +1985,7 @@ fn warn_sets_only_log_and_unused_sets_check_nothing() {
 
 #[test]
 fn stop_reads_earlier_drafts_of_the_turn_from_the_session_record() {
-    let h = ticket_home("stoprecord", "fix");
+    let h = acme_home("stoprecord", "fix");
     use_skill(&h, "s1", "p1");
     let lines = [
         serde_json::json!({"type": "user", "message": {"role": "user", "content": "Draft the old one"}, "promptId": "p0"}).to_string(),
@@ -2053,7 +2049,7 @@ fn private_sets_log_to_their_own_file() {
 
 #[test]
 fn stop_without_a_session_id_fails_open() {
-    let h = ticket_home("stopnosid", "fix");
+    let h = acme_home("stopnosid", "fix");
     let out = hook(
         &h,
         "stop",
@@ -2067,7 +2063,7 @@ fn stop_without_a_session_id_fails_open() {
 
 #[test]
 fn the_stop_continuation_in_the_session_record_is_not_a_new_turn() {
-    let h = ticket_home("stopcontinue", "fix");
+    let h = acme_home("stopcontinue", "fix");
     use_skill(&h, "s1", "p1");
     let user = serde_json::json!({"type": "user", "message": {"role": "user", "content": "Draft the reply"}, "promptId": "p1"}).to_string();
     let said = |t: &str| {
@@ -2105,7 +2101,7 @@ fn the_stop_continuation_in_the_session_record_is_not_a_new_turn() {
 
 #[test]
 fn display_hook_labels_a_broken_draft() {
-    let h = ticket_home("display", "fix");
+    let h = acme_home("display", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
     let input = |mid: &str, i: u32, last: bool, delta: &str| serde_json::json!({"session_id": "s1", "turn_id": "p1", "message_id": mid, "index": i, "final": last, "delta": delta});
@@ -2142,7 +2138,7 @@ fn display_hook_labels_a_broken_draft() {
 
 #[test]
 fn display_hook_never_holds_text() {
-    let h = ticket_home("displaysafe", "fix");
+    let h = acme_home("displaysafe", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
     let batch = |input: serde_json::Value| display_out(&h, input);
@@ -2202,7 +2198,7 @@ fn display_hook_never_holds_text() {
 
 #[test]
 fn a_corrupt_display_file_still_shows_the_text() {
-    let h = ticket_home("displaycorrupt", "fix");
+    let h = acme_home("displaycorrupt", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
     let at = |mid: &str, i: u32, last: bool, delta: &str| serde_json::json!({"session_id": "s1", "prompt_id": "p1", "message_id": mid, "index": i, "final": last, "delta": delta});
@@ -2234,7 +2230,7 @@ fn a_corrupt_display_file_still_shows_the_text() {
 
 #[test]
 fn a_draft_split_across_batches_is_checked_whole() {
-    let h = ticket_home("displaysplit", "fix");
+    let h = acme_home("displaysplit", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
     let at = |i: u32, last: bool, delta: &str| serde_json::json!({"session_id": "s1", "prompt_id": "p1", "message_id": "m1", "index": i, "final": last, "delta": delta});
@@ -2262,7 +2258,7 @@ fn a_draft_split_across_batches_is_checked_whole() {
 
 #[test]
 fn text_after_a_labeled_fence_stays_its_own_paragraph() {
-    let h = ticket_home("displayparagraph", "fix");
+    let h = acme_home("displayparagraph", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
     let label =
@@ -2285,7 +2281,7 @@ fn text_after_a_labeled_fence_stays_its_own_paragraph() {
 
 #[test]
 fn a_fence_split_mid_line_is_read_whole() {
-    let h = ticket_home("displaymidline", "fix");
+    let h = acme_home("displaymidline", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
     let at = |mid: &str, i: u32, last: bool, delta: &str| serde_json::json!({"session_id": "s1", "prompt_id": "p1", "message_id": mid, "index": i, "final": last, "delta": delta});
@@ -2369,7 +2365,7 @@ fn display_out(h: &Path, input: serde_json::Value) -> Option<String> {
 
 #[test]
 fn no_label_after_the_turn_was_sent_back() {
-    let h = ticket_home("displayagain", "fix");
+    let h = acme_home("displayagain", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
     assert!(!sent_back(&stop(&h, "s1", "p1", BROKEN, false)).is_empty());
@@ -2408,7 +2404,7 @@ fn no_label_after_the_turn_was_sent_back() {
 
 #[test]
 fn a_new_message_resets_the_draft_copy() {
-    let h = ticket_home("displaystop", "fix");
+    let h = acme_home("displaystop", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
     let at = |mid: &str, i: u32, last: bool, delta: &str| serde_json::json!({"session_id": "s1", "prompt_id": "p1", "message_id": mid, "index": i, "final": last, "delta": delta});
@@ -2468,7 +2464,7 @@ fn the_recheck_cuts_at_the_continuation_or_is_unverified() {
         ("recheckcut", true, "fixed"),
         ("recheckunverified", false, "unverified"),
     ] {
-        let h = ticket_home(name, "fix");
+        let h = acme_home(name, "fix");
         use_skill(&h, "s1", "p1");
         let record = h.join("session.jsonl");
         let first = [user.clone(), said(intro), said(draft)];
@@ -2501,7 +2497,7 @@ fn the_recheck_cuts_at_the_continuation_or_is_unverified() {
 
 #[test]
 fn the_recheck_prefers_the_continuation_to_a_repeated_message() {
-    let h = ticket_home("recheckrepeat", "fix");
+    let h = acme_home("recheckrepeat", "fix");
     use_skill(&h, "s1", "p1");
     let user = serde_json::json!({"type": "user", "message": {"role": "user", "content": "Draft the reply"}, "promptId": "p1"}).to_string();
     let said = |t: &str| {
@@ -2536,7 +2532,7 @@ fn the_recheck_prefers_the_continuation_to_a_repeated_message() {
 
 #[test]
 fn a_warn_catch_is_logged_once_per_turn() {
-    let h = ticket_home("stopwarnonce", "warn");
+    let h = acme_home("stopwarnonce", "warn");
     use_skill(&h, "s1", "p1");
     assert!(stop(&h, "s1", "p1", BROKEN, false).trim().is_empty());
     assert!(
@@ -2590,7 +2586,7 @@ fn labeled() -> Option<String> {
 
 #[test]
 fn a_broken_config_never_labels_a_draft() {
-    let h = ticket_home("displaycfg", "fix");
+    let h = acme_home("displaycfg", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
     use_skill(&h, "s2", "p1");
@@ -2643,14 +2639,14 @@ fn a_private_set_is_not_labeled_outside_the_private_paths() {
     add_set(
         &h,
         "secret-reply",
-        &format!("private = true\n[when]\nskills = [\"writing-support\"]\n{check}"),
+        &format!("private = true\n[when]\nskills = [\"acme-writer\"]\n{check}"),
     );
     approve(&h, "secret-reply", "fix");
     for sid in ["s1", "s2"] {
         hook(
             &h,
             "skill",
-            serde_json::json!({"session_id": sid, "prompt_id": "p1", "tool_name": "Skill", "tool_input": {"skill": "writing-support"}, "cwd": proj}),
+            serde_json::json!({"session_id": sid, "prompt_id": "p1", "tool_name": "Skill", "tool_input": {"skill": "acme-writer"}, "cwd": proj}),
         );
     }
     assert_eq!(show_draft(&h, &proj, "s2", "p1", "m1"), labeled(), "setup");
@@ -2664,7 +2660,7 @@ fn a_private_set_is_not_labeled_outside_the_private_paths() {
 
 #[test]
 fn a_paused_set_is_not_labeled() {
-    let h = ticket_home("displaypaused", "fix");
+    let h = acme_home("displaypaused", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
     use_skill(&h, "s2", "p1");
@@ -2672,7 +2668,7 @@ fn a_paused_set_is_not_labeled() {
     let file = h.join("dotonce/sessions/s1.json");
     let mut state: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
-    state["paused"] = serde_json::json!(["ticket-reply"]);
+    state["paused"] = serde_json::json!(["acme-mail"]);
     std::fs::write(&file, state.to_string()).unwrap();
     assert_eq!(
         show_draft(&h, &h, "s1", "p1", "m1"),
@@ -2684,7 +2680,7 @@ fn a_paused_set_is_not_labeled() {
 
 #[test]
 fn a_warn_set_never_labels_a_draft() {
-    let h = ticket_home("displaywarn", "warn");
+    let h = acme_home("displaywarn", "warn");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
     assert_eq!(
@@ -2697,7 +2693,7 @@ fn a_warn_set_never_labels_a_draft() {
 
 #[test]
 fn the_label_names_every_failing_check() {
-    let h = ticket_home("displayids", "fix");
+    let h = acme_home("displayids", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
     let draft = "```markdown\nHi Sam,\nSorry for the wait. The guide is at https://example.com/guide\n```\n";
@@ -2715,7 +2711,7 @@ fn the_label_names_every_failing_check() {
 
 #[test]
 fn a_config_broken_before_stop_sends_nothing_back() {
-    let h = ticket_home("stopcfg", "fix");
+    let h = acme_home("stopcfg", "fix");
     use_skill(&h, "s1", "p1");
     std::fs::write(h.join("dotonce/config.toml"), "not = [toml").unwrap();
     let out = stop(&h, "s1", "p1", STOCK_DRAFT, false);
@@ -2726,11 +2722,11 @@ fn a_config_broken_before_stop_sends_nothing_back() {
 #[test]
 fn stop_sends_nothing_back_for_a_set_no_longer_at_fix() {
     for change in ["warn", "edited", "unapproved"] {
-        let h = ticket_home(&format!("stopleft{change}"), "fix");
+        let h = acme_home(&format!("stopleft{change}"), "fix");
         use_skill(&h, "s1", "p1");
         match change {
-            "warn" => approve(&h, "ticket-reply", "warn"),
-            "edited" => edit_set(&h, "ticket-reply"),
+            "warn" => approve(&h, "acme-mail", "warn"),
+            "edited" => edit_set(&h, "acme-mail"),
             _ => std::fs::write(h.join("dotonce/approvals.json"), "{\"sets\": {}}").unwrap(),
         }
         let out = stop(&h, "s1", "p1", STOCK_DRAFT, false);
@@ -2746,7 +2742,7 @@ fn stop_sends_nothing_back_for_a_set_no_longer_at_fix() {
 #[test]
 fn a_failed_stop_save_sends_nothing_back() {
     use std::os::unix::fs::PermissionsExt;
-    let h = ticket_home("stopsave", "fix");
+    let h = acme_home("stopsave", "fix");
     use_skill(&h, "s1", "p1");
     let sessions = h.join("dotonce/sessions");
     std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -2763,7 +2759,7 @@ fn a_failed_stop_save_sends_nothing_back() {
 
 #[test]
 fn display_labels_only_when_dotonce_runs_at_stop() {
-    let h = ticket_home("displaynostop", "fix");
+    let h = acme_home("displaynostop", "fix");
     for sid in ["s1", "s2", "s3"] {
         use_skill(&h, sid, "p1");
     }
@@ -2801,7 +2797,7 @@ fn display_labels_only_when_dotonce_runs_at_stop() {
 
 #[test]
 fn display_never_writes_the_session_state() {
-    let h = ticket_home("displaystate", "fix");
+    let h = acme_home("displaystate", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
     let file = h.join("dotonce/sessions/s1.json");
@@ -2824,7 +2820,7 @@ fn display_never_writes_the_session_state() {
 
 #[test]
 fn disabled_hooks_mean_no_label() {
-    let h = ticket_home("displaydisabled", "fix");
+    let h = acme_home("displaydisabled", "fix");
     register_stop(&h);
     for sid in ["s1", "s2", "s3"] {
         use_skill(&h, sid, "p1");
@@ -2856,7 +2852,7 @@ fn disabled_hooks_mean_no_label() {
 
 #[test]
 fn an_unreadable_settings_file_means_no_label() {
-    let h = ticket_home("displaybadsettings", "fix");
+    let h = acme_home("displaybadsettings", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
     use_skill(&h, "s2", "p1");
@@ -2880,7 +2876,7 @@ fn an_unreadable_settings_file_means_no_label() {
 
 #[test]
 fn another_hooks_added_context_is_not_the_send_back() {
-    let h = ticket_home("recheckother", "fix");
+    let h = acme_home("recheckother", "fix");
     use_skill(&h, "s1", "p1");
     let user = serde_json::json!({"type": "user", "message": {"role": "user", "content": "Draft the reply"}, "promptId": "p1"}).to_string();
     // The prompt hook's context, at the start of the turn.
@@ -3602,13 +3598,13 @@ fn rules_why_shows_what_turned_each_set_on_and_pause_needs_a_terminal() {
     hook(
         &h,
         "skill",
-        serde_json::json!({"session_id": "s1", "prompt_id": "p1", "tool_name": "Skill", "tool_input": {"skill": "writing-support"}, "cwd": proj}),
+        serde_json::json!({"session_id": "s1", "prompt_id": "p1", "tool_name": "Skill", "tool_input": {"skill": "acme-writer"}, "cwd": proj}),
     );
     let (out, ok) = run_in(&h, &proj, &["rules", "why"], None);
     assert!(ok, "{out}");
     assert!(out.contains("session s1"), "{out}");
     assert!(
-        out.contains("acme-replies") && out.contains("skill writing-support"),
+        out.contains("acme-replies") && out.contains("skill acme-writer"),
         "{out}"
     );
     assert!(
@@ -3730,7 +3726,7 @@ fn rules_pause_is_refused_under_an_ai_agent() {
     hook(
         &h,
         "skill",
-        serde_json::json!({"session_id": "s1", "tool_name": "Skill", "tool_input": {"skill": "writing-support"}, "cwd": h}),
+        serde_json::json!({"session_id": "s1", "tool_name": "Skill", "tool_input": {"skill": "acme-writer"}, "cwd": h}),
     );
     let file = h.join("dotonce/sessions/s1.json");
     let before = std::fs::read(&file).unwrap();
@@ -3759,7 +3755,7 @@ fn rules_pause_from_a_terminal_pauses_the_newest_session() {
         hook(
             &h,
             "skill",
-            serde_json::json!({"session_id": sid, "tool_name": "Skill", "tool_input": {"skill": "writing-support"}, "cwd": h}),
+            serde_json::json!({"session_id": sid, "tool_name": "Skill", "tool_input": {"skill": "acme-writer"}, "cwd": h}),
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -3854,7 +3850,7 @@ fn rules_why_hides_private_sets_outside_private_paths() {
         &h,
         "s1",
         serde_json::json!({
-            "active": [{"id": "quiet-active", "by": "skill", "what": "writing-support"}],
+            "active": [{"id": "quiet-active", "by": "skill", "what": "acme-writer"}],
             "paused": ["acme-replies", "quiet-paused", "removed-set"]
         }),
     );

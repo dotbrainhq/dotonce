@@ -639,14 +639,14 @@ mod tests {
 
     #[test]
     fn skill_names_match_with_or_without_a_plugin_prefix() {
-        let names = vec!["writing-support".to_string(), "acme:review".to_string()];
+        let names = vec!["acme-writer".to_string(), "acme:review".to_string()];
         assert_eq!(
-            skill_match(&names, "writing-support").as_deref(),
-            Some("writing-support")
+            skill_match(&names, "acme-writer").as_deref(),
+            Some("acme-writer")
         );
-        assert!(skill_match(&names, "acme-tools:writing-support").is_some());
-        assert!(skill_match(&names, "/writing-support").is_some());
-        assert!(skill_match(&names, "Writing-Support").is_some());
+        assert!(skill_match(&names, "acme-tools:acme-writer").is_some());
+        assert!(skill_match(&names, "/acme-writer").is_some());
+        assert!(skill_match(&names, "Acme-Writer").is_some());
         assert!(skill_match(&names, "acme:review").is_some());
         assert!(skill_match(&names, "review").is_none());
         assert!(skill_match(&names, "other:review").is_none());
@@ -658,7 +658,7 @@ mod tests {
         let sets = vec![
             live(
                 "by-skill",
-                &format!("[when]\nskills = [\"writing-support\"]\n{REMIND}"),
+                &format!("[when]\nskills = [\"acme-writer\"]\n{REMIND}"),
                 Level::Fix,
             ),
             live(
@@ -696,7 +696,7 @@ mod tests {
             &cfg(),
             cwd,
             Some("p1"),
-            Event::Skill("acme:writing-support"),
+            Event::Skill("acme:acme-writer"),
         );
         let r = take(&mut st, &sets);
         assert_eq!(
@@ -713,7 +713,7 @@ mod tests {
         );
         assert_eq!(ids(&st), ["by-skill"]);
         assert_eq!(st.active[0].by, Trigger::Skill);
-        assert_eq!(st.active[0].what.as_deref(), Some("writing-support"));
+        assert_eq!(st.active[0].what.as_deref(), Some("acme-writer"));
         let on: Vec<&str> = checking(&st, &sets)
             .iter()
             .map(|l| l.set.id.as_str())
@@ -725,7 +725,7 @@ mod tests {
     fn a_skill_upgrades_a_prompt_set_so_it_lasts_and_checks() {
         let sets = vec![live(
             "both",
-            "[when]\nprompt = [\"draft\"]\nskills = [\"writing-support\"]\n",
+            "[when]\nprompt = [\"draft\"]\nskills = [\"acme-writer\"]\n",
             Level::Warn,
         )];
         let mut st = State::default();
@@ -744,7 +744,7 @@ mod tests {
             &cfg(),
             Path::new("/x"),
             Some("p1"),
-            Event::Skill("writing-support"),
+            Event::Skill("acme-writer"),
         );
         assert_eq!(st.active.len(), 1);
         assert_eq!(st.active[0].by, Trigger::Skill);
@@ -867,7 +867,7 @@ mod tests {
     fn private_sets_stay_off_outside_private_paths_and_store_no_words() {
         let sets = vec![live(
             "secret",
-            "private = true\n[when]\nfolders = [\"/work/private\"]\nprompt = [\"draft\"]\nskills = [\"writing-support\"]\n",
+            "private = true\n[when]\nfolders = [\"/work/private\"]\nprompt = [\"draft\"]\nskills = [\"acme-writer\"]\n",
             Level::Fix,
         )];
         let mut st = State::default();
@@ -885,7 +885,7 @@ mod tests {
             &cfg(),
             Path::new("/work/public"),
             Some("p1"),
-            Event::Skill("writing-support"),
+            Event::Skill("acme-writer"),
         );
         assert!(st.active.is_empty());
         refresh(

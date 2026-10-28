@@ -646,19 +646,19 @@ mod tests {
     use super::*;
 
     fn p(src: &str) -> Result<RuleSet> {
-        parse(src, Path::new("/rules/ticket-reply.toml"))
+        parse(src, Path::new("/rules/acme-mail.toml"))
     }
 
     fn err(src: &str) -> String {
         format!("{:#}", p(src).unwrap_err())
     }
 
-    const FULL: &str = r#"id = "ticket-reply"
+    const FULL: &str = r#"id = "acme-mail"
 level = "fix"
 private = false
 
 [when]
-skills = ["writing-support"]
+skills = ["acme-writer"]
 folders = ["~/work/support"]
 prompt = ["draft", "reply"]
 
@@ -723,10 +723,10 @@ why = "No TODOs in Rust files."
     #[test]
     fn parses_every_check_kind() {
         let s = p(FULL).unwrap();
-        assert_eq!(s.id, "ticket-reply");
+        assert_eq!(s.id, "acme-mail");
         assert_eq!(s.level, Level::Fix);
         assert!(!s.private);
-        assert_eq!(s.when.skills, vec!["writing-support"]);
+        assert_eq!(s.when.skills, vec!["acme-writer"]);
         assert_eq!(s.when.prompt, vec!["draft", "reply"]);
         assert!(!s.when.check_on_prompt);
         assert_eq!(s.draft.as_ref().unwrap().fence, vec!["markdown", "draft"]);
@@ -752,12 +752,12 @@ why = "No TODOs in Rust files."
         assert!(globs.is_match("/code/src/main.rs"));
         assert!(!globs.is_match("/code/notes.md"));
         assert_eq!(s.src, FULL);
-        assert_eq!(s.file, PathBuf::from("/rules/ticket-reply.toml"));
+        assert_eq!(s.file, PathBuf::from("/rules/acme-mail.toml"));
     }
 
     #[test]
     fn level_defaults_to_warn_and_tables_are_optional() {
-        let s = p("id = \"ticket-reply\"\n").unwrap();
+        let s = p("id = \"acme-mail\"\n").unwrap();
         assert_eq!(s.level, Level::Warn);
         assert!(s.checks.is_empty());
         assert!(s.draft.is_none());
@@ -767,7 +767,7 @@ why = "No TODOs in Rust files."
 
     #[test]
     fn strict_parsing_rejects_bad_files() {
-        let base = "id = \"ticket-reply\"\n";
+        let base = "id = \"acme-mail\"\n";
         let check = |rest: &str| format!("{base}[[check]]\nid = \"a\"\nwhy = \"b\"\n{rest}");
         let cases = [
             (format!("{base}colour = 1\n"), "colour"),
@@ -840,8 +840,8 @@ why = "No TODOs in Rust files."
 
     #[test]
     fn patterns_compile_on_first_use_and_commands_compile_them_all() {
-        let bad = "id = \"ticket-reply\"\n[[check]]\nid = \"a\"\nwhy = \"b\"\nforbid_regex = '('\n[[check]]\nid = \"c\"\nwhy = \"d\"\nrepeat_of = 'Hi \\w+'\nmax = 0\n";
-        let file = Path::new("/rules/ticket-reply.toml");
+        let bad = "id = \"acme-mail\"\n[[check]]\nid = \"a\"\nwhy = \"b\"\nforbid_regex = '('\n[[check]]\nid = \"c\"\nwhy = \"d\"\nrepeat_of = 'Hi \\w+'\nmax = 0\n";
+        let file = Path::new("/rules/acme-mail.toml");
         let s = parse_lazy(bad, file).unwrap();
         let e = format!("{:#}", validate(&s).unwrap_err());
         assert!(e.contains("check a: forbid_regex"), "{e}");
@@ -854,7 +854,7 @@ why = "No TODOs in Rust files."
         let dir = std::env::temp_dir().join(format!("dotonce-lazy-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("ticket-reply.toml"), bad).unwrap();
+        fs::write(dir.join("acme-mail.toml"), bad).unwrap();
         fs::write(dir.join("good.toml"), "id = \"good\"\n").unwrap();
         let hooks = load_dir(&dir).unwrap();
         assert_eq!(hooks.sets.len(), 2);
@@ -887,8 +887,8 @@ why = "No TODOs in Rust files."
 
     #[test]
     fn ids_use_plain_characters() {
-        assert!(valid_id("ticket-reply_2"));
-        assert!(!valid_id("Ticket"));
+        assert!(valid_id("acme-mail_2"));
+        assert!(!valid_id("Acme"));
         assert!(!valid_id("a b"));
         assert!(!valid_id(""));
         assert!(!valid_id("../x"));
