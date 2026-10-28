@@ -4257,3 +4257,111 @@ fn rules_check_and_test_print_no_control_characters() {
     );
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+fn run_with_path(home: &Path, exe: &Path, path: Option<&std::ffi::OsStr>, args: &[&str]) -> String {
+    let mut cmd = Command::new(exe);
+    cmd.args(args)
+        .current_dir(home)
+        .env("DOTONCE_HOME", home.join("dotonce"))
+        .env("HOME", home)
+        .env_remove("CLAUDECODE")
+        .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        .stdin(Stdio::null());
+    match path {
+        Some(p) => cmd.env("PATH", p),
+        None => cmd.env_remove("PATH"),
+    };
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "{:?}", out);
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+const PATH_HINT: &str = "dotonce is not on your PATH, so the short `dotonce` command won't work in a new terminal. Add its folder once:";
+
+#[test]
+fn init_and_doctor_print_a_path_hint_when_the_binary_folder_is_off_path() {
+    let h = home("pathhint");
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_dotonce"));
+    let elsewhere = h.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let missing = h.join("no-such-folder");
+    let joined = std::env::join_paths([&missing, &elsewhere]).unwrap();
+    for (label, path) in [
+        ("other folders", Some(joined.as_os_str())),
+        ("empty PATH", Some(std::ffi::OsStr::new(""))),
+        ("no PATH", None),
+    ] {
+        for cmd in ["init", "doctor"] {
+            let out = run_with_path(&h, &exe, path, &[cmd]);
+            assert!(out.contains(PATH_HINT), "{cmd} with {label}: {out}");
+            assert!(
+                out.contains(
+                    "then open a new terminal (or run `source ~/.zshrc`). On bash, use ~/.bashrc."
+                ),
+                "{cmd} with {label}: {out}"
+            );
+            let line = out
+                .lines()
+                .find(|l| l.starts_with("echo 'export PATH=\""))
+                .unwrap_or_else(|| panic!("{cmd} with {label}: {out}"));
+            assert!(line.ends_with(":$PATH\"' >> ~/.zshrc"), "{line}");
+            assert!(
+                line.contains(exe.parent().unwrap().to_str().unwrap()),
+                "{line}"
+            );
+        }
+    }
+    assert!(!h.join(".zshrc").exists());
+    assert!(!h.join(".bashrc").exists());
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn init_and_doctor_print_no_path_hint_when_the_binary_folder_is_on_path() {
+    let h = home("pathok");
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_dotonce"));
+    let dir = exe.parent().unwrap();
+    let other = h.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let link = h.join("link");
+    std::os::unix::fs::symlink(dir, &link).unwrap();
+    for entries in [
+        vec![dir.to_path_buf()],
+        vec![other.clone(), dir.to_path_buf()],
+        vec![other.clone(), link.clone()],
+    ] {
+        let path = std::env::join_paths(&entries).unwrap();
+        for cmd in ["init", "doctor"] {
+            let out = run_with_path(&h, &exe, Some(&path), &[cmd]);
+            assert!(
+                !out.contains("not on your PATH"),
+                "{cmd} {entries:?}: {out}"
+            );
+            assert!(!out.contains("export PATH"), "{cmd} {entries:?}: {out}");
+        }
+    }
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn path_hint_writes_home_when_the_binary_is_under_home() {
+    let h = home("pathhome");
+    let bin = h.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let exe = bin.join("dotonce");
+    std::fs::copy(env!("CARGO_BIN_EXE_dotonce"), &exe).unwrap();
+    let elsewhere = h.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    for cmd in ["init", "doctor"] {
+        let out = run_with_path(&h, &exe, Some(elsewhere.as_os_str()), &[cmd]);
+        assert!(
+            out.contains("echo 'export PATH=\"$HOME/bin:$PATH\"' >> ~/.zshrc"),
+            "{cmd}: {out}"
+        );
+        let line = out.lines().find(|l| l.starts_with("echo ")).unwrap();
+        assert!(!line.contains(h.to_str().unwrap()), "{line}");
+    }
+    let on_path = run_with_path(&h, &exe, Some(bin.as_os_str()), &["doctor"]);
+    assert!(!on_path.contains("not on your PATH"), "{on_path}");
+    std::fs::remove_dir_all(&h).unwrap();
+}

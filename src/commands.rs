@@ -626,6 +626,9 @@ pub fn doctor() -> Result<()> {
         loaded.errors.len(),
         waiting
     );
+    if let Some(hint) = config::path_hint() {
+        println!("{hint}");
+    }
     Ok(())
 }
 

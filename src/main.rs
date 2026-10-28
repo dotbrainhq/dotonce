@@ -226,6 +226,9 @@ fn run(cmd: Cmd) -> Result<()> {
         }
         Cmd::Init => {
             println!("{}", config::init()?.display());
+            if let Some(hint) = config::path_hint() {
+                println!("{hint}");
+            }
             Ok(())
         }
         Cmd::Save {
