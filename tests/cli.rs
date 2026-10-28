@@ -2220,3 +2220,52 @@ fn an_interrupted_draft_shows_with_the_next_message() {
     );
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+#[test]
+fn the_recheck_cuts_at_the_continuation_or_is_unverified() {
+    let user = serde_json::json!({"type": "user", "message": {"role": "user", "content": "Draft the reply"}, "promptId": "p1"}).to_string();
+    let said = |t: &str| {
+        serde_json::json!({"type": "assistant", "message": {"content": [{"type": "text", "text": t}]}}).to_string()
+    };
+    // The record keeps the broken message as two text entries, so the last
+    // message at send-back matches no single entry.
+    let (intro, draft) = BROKEN.split_once("\n\n").unwrap();
+    let continuation = [
+        serde_json::json!({"type": "attachment", "attachment": {"type": "hook_success", "stdout": "{}"}}).to_string(),
+        serde_json::json!({"type": "attachment", "attachment": {"type": "hook_additional_context", "content": ["dotonce checked the draft"]}}).to_string(),
+        serde_json::json!({"type": "system", "subtype": "stop_hook_summary"}).to_string(),
+    ];
+    for (name, marker, want) in [
+        ("recheckcut", true, "fixed"),
+        ("recheckunverified", false, "unverified"),
+    ] {
+        let h = ticket_home(name, "fix");
+        use_skill(&h, "s1", "p1");
+        let record = h.join("session.jsonl");
+        let first = [user.clone(), said(intro), said(draft)];
+        std::fs::write(&record, first.join("\n")).unwrap();
+        assert!(!sent_back(&stop_with(&h, "s1", "p1", BROKEN, false, &record)).is_empty());
+        let mut later = first.to_vec();
+        if marker {
+            later.extend(continuation.iter().cloned());
+        }
+        later.push(said(FIXED));
+        std::fs::write(&record, later.join("\n")).unwrap();
+        assert!(
+            stop_with(&h, "s1", "p1", FIXED, true, &record)
+                .trim()
+                .is_empty()
+        );
+        assert_eq!(
+            outcomes(&h, "catches.jsonl"),
+            pairs(&[
+                ("no-stock-wait-opener", "caught"),
+                ("inline-links", "caught"),
+                ("no-stock-wait-opener", want),
+                ("inline-links", want),
+            ]),
+            "{name}"
+        );
+        std::fs::remove_dir_all(&h).unwrap();
+    }
+}

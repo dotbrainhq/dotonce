@@ -84,9 +84,18 @@ fn assistant_text(e: &Value) -> String {
     }
 }
 
-/// The assistant text of the record's last turn, oldest first.
-pub fn from_transcript(src: &str) -> Vec<String> {
+/// The record entry Claude Code writes when a Stop hook's additionalContext
+/// continues the turn (task 1, D7).
+fn continues_turn(e: &Value) -> bool {
+    e.get("type").and_then(Value::as_str) == Some("attachment")
+        && e.pointer("/attachment/type").and_then(Value::as_str) == Some("hook_additional_context")
+}
+
+/// The assistant text of the record's last turn, oldest first, and how many
+/// of those parts came before the turn's last continuation.
+fn scan(src: &str) -> (Vec<String>, Option<usize>) {
     let mut parts = Vec::new();
+    let mut after_continue = None;
     for line in src.lines().rev() {
         if !line.contains("\"type\"") {
             continue;
@@ -96,6 +105,9 @@ pub fn from_transcript(src: &str) -> Vec<String> {
         };
         if e.get("isSidechain").and_then(Value::as_bool) == Some(true) {
             continue;
+        }
+        if after_continue.is_none() && continues_turn(&e) {
+            after_continue = Some(parts.len());
         }
         match e.get("type").and_then(Value::as_str) {
             Some("assistant") => {
@@ -112,32 +124,67 @@ pub fn from_transcript(src: &str) -> Vec<String> {
         }
     }
     parts.reverse();
-    parts
+    let continued_at = after_continue.map(|n| parts.len() - n);
+    (parts, continued_at)
 }
 
-/// This turn's assistant text: the turn's messages from the session record,
-/// then `last` unless the record already ends with it.
-pub fn turn_text(transcript: Option<&Path>, last: Option<&str>) -> Vec<String> {
-    let mut parts = transcript
+/// The assistant text of the record's last turn, oldest first.
+pub fn from_transcript(src: &str) -> Vec<String> {
+    scan(src).0
+}
+
+/// One turn's assistant text, and what is known about where a send-back
+/// continued it.
+struct Turn {
+    parts: Vec<String>,
+    /// How many parts came from the session record.
+    recorded: usize,
+    /// How many parts came before the record's last continuation entry.
+    continued_at: Option<usize>,
+}
+
+fn read_turn(transcript: Option<&Path>, last: Option<&str>) -> Turn {
+    let (mut parts, continued_at) = transcript
         .and_then(read_tail)
-        .map(|s| from_transcript(&s))
+        .map(|s| scan(&s))
         .unwrap_or_default();
+    let recorded = parts.len();
     let last =
         last.filter(|l| !l.trim().is_empty() && parts.last().map(String::as_str) != Some(*l));
     if let Some(l) = last {
         parts.push(l.to_string());
     }
-    parts
+    Turn {
+        parts,
+        recorded,
+        continued_at,
+    }
+}
+
+/// This turn's assistant text: the turn's messages from the session record,
+/// then `last` unless the record already ends with it.
+pub fn turn_text(transcript: Option<&Path>, last: Option<&str>) -> Vec<String> {
+    read_turn(transcript, last).parts
+}
+
+/// Where the text written after the send-back starts: after the part it
+/// was sent back at, else after the record's continuation entry. With no
+/// record, the only part is the last message, which came after it. None
+/// when the cut can't be found, since checking the whole turn would count
+/// the old broken draft against the new one.
+fn fresh_start(p: &Pending, turn: &Turn) -> Option<usize> {
+    turn.parts
+        .iter()
+        .rposition(|t| approvals::hash(t) == p.after)
+        .map(|i| i + 1)
+        .or(turn.continued_at)
+        .or((turn.recorded == 0).then_some(0))
 }
 
 /// After a send-back, checks only the text that came after it and logs
 /// whether each sent-back check is now fixed.
-fn recheck(p: &Pending, live: &[Live], parts: &[String], log: &dyn Fn(&Live, &str, Outcome)) {
-    let start = parts
-        .iter()
-        .rposition(|t| approvals::hash(t) == p.after)
-        .map_or(0, |i| i + 1);
-    let fresh = parts[start..].join("\n\n");
+fn recheck(p: &Pending, live: &[Live], turn: &Turn, log: &dyn Fn(&Live, &str, Outcome)) {
+    let fresh = fresh_start(p, turn).map(|start| turn.parts[start..].join("\n\n"));
     for (set_id, check_id) in &p.checks {
         let Some(l) = live.iter().find(|l| &l.set.id == set_id) else {
             continue;
@@ -145,7 +192,10 @@ fn recheck(p: &Pending, live: &[Live], parts: &[String], log: &dyn Fn(&Live, &st
         let Some(c) = l.set.checks.iter().find(|c| &c.id == check_id) else {
             continue;
         };
-        let drafts = checks::drafts(&l.set, &fresh);
+        let drafts = fresh
+            .as_deref()
+            .map(|f| checks::drafts(&l.set, f))
+            .unwrap_or_default();
         let outcome = if drafts.is_empty() {
             Outcome::Unverified
         } else if drafts.iter().any(|d| checks::failing_line(c, d).is_some()) {
@@ -173,16 +223,21 @@ pub fn stop(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
         .unwrap_or_else(|| "unknown".to_string());
     let checking = session::checking(&state, &live);
     let again = state.sent_back(&turn);
-    let parts = if checking.is_empty() && !again {
-        Vec::new()
+    let turn_read = if checking.is_empty() && !again {
+        Turn {
+            parts: Vec::new(),
+            recorded: 0,
+            continued_at: None,
+        }
     } else {
-        turn_text(
+        read_turn(
             v.get("transcript_path")
                 .and_then(Value::as_str)
                 .map(Path::new),
             v.get("last_assistant_message").and_then(Value::as_str),
         )
     };
+    let parts = &turn_read.parts;
     let time = catches::timestamp(now);
     let log = |l: &Live, check: &str, outcome: Outcome| {
         let c = Catch {
@@ -197,7 +252,7 @@ pub fn stop(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
     };
     let out = if again {
         if let Some(p) = state.take_pending(&turn) {
-            recheck(&p, &live, &parts, &log);
+            recheck(&p, &live, &turn_read, &log);
         }
         None
     } else {
