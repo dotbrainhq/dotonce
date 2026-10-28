@@ -11,7 +11,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::approvals::{self, Live};
+use crate::approvals::Live;
 use crate::checks::{self, fence_closes, fence_open};
 use crate::hook::{log_error, prompt_id, session_id, str_field};
 use crate::session;
@@ -26,6 +26,11 @@ pub fn label(ids: &[String]) -> String {
 
 /// What display keeps of a message between batches to check a draft once
 /// it closes. Never used to show text: every batch shows as it streamed.
+///
+/// Saved in `sessions/<sid>.display.json`. After an interrupted message
+/// (Esc, an API error) that never sends its last batch, the draft's lines
+/// stay in that file until the next message replaces them or the 7-day
+/// sweep of old session files removes it. It is never logged.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DraftCopy {
     pub message_id: String,
@@ -38,11 +43,9 @@ pub struct DraftCopy {
     /// find fences only, never shown again.
     pub partial: String,
     /// The batch index expected next.
-    #[serde(default)]
     pub next: u64,
     /// A batch came out of order or a check failed: the copy may miss
     /// lines, so the rest of the message isn't checked.
-    #[serde(default)]
     pub pass: bool,
 }
 
@@ -169,15 +172,13 @@ fn load_copy(path: &Path) -> DraftCopy {
 /// a draft's closing fence. Anything that goes wrong skips the label, never
 /// the text.
 pub fn display(v: &Value, cwd: &Path) -> Result<Option<String>> {
-    let sid = match session_id(v) {
-        Ok(sid) => sid,
-        Err(_) if approvals::load_live().is_ok_and(|(l, _)| l.is_empty()) => return Ok(None),
-        Err(e) => return Err(e),
+    let Ok(sid) = session_id(v) else {
+        return Ok(None);
     };
     let dir = session::dir()?;
     let path = session::display_file(&dir, sid)?;
     let message = str_field(v, "message_id");
-    let state = session::load(&dir, sid).unwrap_or_default();
+    let state = session::load(&dir, sid)?;
     let mut buf = load_copy(&path);
     let same = buf.message_id == message;
     if !same {

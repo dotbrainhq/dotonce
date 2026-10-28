@@ -134,11 +134,6 @@ fn scan(src: &str) -> (Vec<String>, Option<usize>) {
     (parts, continued_at)
 }
 
-/// The assistant text of the record's last turn, oldest first.
-pub fn from_transcript(src: &str) -> Vec<String> {
-    scan(src).0
-}
-
 /// One turn's assistant text, and what is known about where a send-back
 /// continued it.
 struct Turn {
@@ -149,6 +144,8 @@ struct Turn {
     continued_at: Option<usize>,
 }
 
+/// This turn's assistant text: the turn's messages from the session record,
+/// then `last` unless the record already ends with it.
 fn read_turn(transcript: Option<&Path>, last: Option<&str>) -> Turn {
     let (mut parts, continued_at) = transcript
         .and_then(read_tail)
@@ -165,12 +162,6 @@ fn read_turn(transcript: Option<&Path>, last: Option<&str>) -> Turn {
         recorded,
         continued_at,
     }
-}
-
-/// This turn's assistant text: the turn's messages from the session record,
-/// then `last` unless the record already ends with it.
-pub fn turn_text(transcript: Option<&Path>, last: Option<&str>) -> Vec<String> {
-    read_turn(transcript, last).parts
 }
 
 /// Where the text written after the send-back starts: after the record's
@@ -343,9 +334,9 @@ mod tests {
 
     #[test]
     fn the_turn_starts_at_the_last_real_prompt() {
-        assert_eq!(from_transcript(&record()), vec!["first part", "Saved."]);
-        assert!(from_transcript("").is_empty());
-        assert!(from_transcript("{\"type\":\"assistant\"}\nnot json").is_empty());
+        assert_eq!(scan(&record()).0, vec!["first part", "Saved."]);
+        assert!(scan("").0.is_empty());
+        assert!(scan("{\"type\":\"assistant\"}\nnot json").0.is_empty());
     }
 
     #[test]
@@ -355,17 +346,17 @@ mod tests {
         let t = dir.join("record.jsonl");
         std::fs::write(&t, record()).unwrap();
         assert_eq!(
-            turn_text(Some(&t), Some("Saved.")),
+            read_turn(Some(&t), Some("Saved.")).parts,
             vec!["first part", "Saved."]
         );
         assert_eq!(
-            turn_text(Some(&t), Some("Done")),
+            read_turn(Some(&t), Some("Done")).parts,
             vec!["first part", "Saved.", "Done"]
         );
-        assert_eq!(turn_text(Some(&dir), Some("Done")), vec!["Done"]);
-        assert_eq!(turn_text(None, Some("  ")), Vec::<String>::new());
+        assert_eq!(read_turn(Some(&dir), Some("Done")).parts, vec!["Done"]);
+        assert_eq!(read_turn(None, Some("  ")).parts, Vec::<String>::new());
         assert_eq!(
-            turn_text(Some(&dir.join("missing")), None),
+            read_turn(Some(&dir.join("missing")), None).parts,
             Vec::<String>::new()
         );
         std::fs::remove_dir_all(&dir).unwrap();
