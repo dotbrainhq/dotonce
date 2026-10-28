@@ -2053,7 +2053,7 @@ fn display_hook_labels_a_broken_draft() {
     assert_eq!(
         batch("m1", 1, true, "Sorry for the wait.\n```\n").as_deref(),
         Some(
-            "Sorry for the wait.\n```\n\ndotonce: the draft above breaks your no-stock-wait-opener rule. A corrected one follows.\n"
+            "Sorry for the wait.\n```\n\ndotonce: the draft above breaks your no-stock-wait-opener rule. A corrected one follows.\n\n"
         ),
         "the label follows the closing fence"
     );
@@ -2187,14 +2187,37 @@ fn a_draft_split_across_batches_is_checked_whole() {
     assert_eq!(
         display_out(&h, at(2, true, "Thanks.\n```\n\nLet me know.\n")).as_deref(),
         Some(
-            "Thanks.\n```\n\ndotonce: the draft above breaks your no-stock-wait-opener, inline-links rule. A corrected one follows.\n\nLet me know.\n"
+            "Thanks.\n```\n\ndotonce: the draft above breaks your no-stock-wait-opener, inline-links rule. A corrected one follows.\n\n\nLet me know.\n"
         ),
         "lines from all three batches are checked at the close"
     );
     std::fs::remove_dir_all(&h).unwrap();
 }
 
-/// Where a label starts on screen.
+#[test]
+fn text_after_a_labeled_fence_stays_its_own_paragraph() {
+    let h = ticket_home("displayparagraph", "fix");
+    register_stop(&h);
+    use_skill(&h, "s1", "p1");
+    let label =
+        "dotonce: the draft above breaks your no-stock-wait-opener rule. A corrected one follows.";
+    for (mid, after) in [("m1", "Done.\n"), ("m2", "---\n"), ("m3", "===\n")] {
+        let delta = format!("```markdown\nSorry for the wait.\n```\n{after}");
+        assert_eq!(
+            display_out(
+                &h,
+                serde_json::json!({"session_id": "s1", "prompt_id": "p1", "message_id": mid, "index": 0, "final": true, "delta": delta})
+            ),
+            Some(format!(
+                "```markdown\nSorry for the wait.\n```\n\n{label}\n\n{after}"
+            )),
+            "a blank line keeps {after:?} off the label's line"
+        );
+    }
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+/// Where a label starts on screen. A blank line always follows it.
 const LABEL_START: &str = "\ndotonce: the draft above breaks your ";
 
 /// What a display hook call puts on screen, or None when the batch shows as
@@ -2211,16 +2234,28 @@ fn display_out(h: &Path, input: serde_json::Value) -> Option<String> {
         .as_str()
         .unwrap()
         .to_string();
+    let delta = input["delta"].as_str().unwrap_or_default();
     let mut bare = shown.clone();
     while let Some(i) = bare.find(LABEL_START) {
         let end = bare[i + 1..]
             .find('\n')
-            .map_or(bare.len(), |e| i + 1 + e + 1);
-        bare.replace_range(i..end, "");
+            .map(|e| i + 1 + e + 1)
+            .unwrap_or_else(|| panic!("a label ends its line: {shown:?}"));
+        assert_eq!(
+            bare.get(end..end + 1),
+            Some("\n"),
+            "a blank line follows the label: {shown:?}"
+        );
+        bare.replace_range(i..end + 1, "");
+    }
+    // At the last batch, a closing fence without a newline of its own gets
+    // one before its label.
+    if bare != delta && shown.ends_with("\n\n") && !delta.ends_with('\n') {
+        assert_eq!(bare, format!("{delta}\n"), "{shown:?}");
+        bare.pop();
     }
     assert_eq!(
-        bare,
-        input["delta"].as_str().unwrap_or_default(),
+        bare, delta,
         "the batch's own text shows unchanged: {shown:?}"
     );
     Some(shown)
@@ -2258,7 +2293,7 @@ fn no_label_after_the_turn_was_sent_back() {
     assert_eq!(
         out,
         format!(
-            "{again}\ndotonce: the draft above breaks your no-stock-wait-opener rule. A corrected one follows.\n"
+            "{again}\ndotonce: the draft above breaks your no-stock-wait-opener rule. A corrected one follows.\n\n"
         ),
         "a new turn labels again"
     );
@@ -2407,7 +2442,7 @@ fn show_draft(h: &Path, cwd: &Path, sid: &str, pid: &str, mid: &str) -> Option<S
 /// What the screen shows when `STOCK_DRAFT` is labeled.
 fn labeled() -> Option<String> {
     Some(
-        "Draft:\n```markdown\nHi Sam,\nSorry for the wait.\n```\n\ndotonce: the draft above breaks your no-stock-wait-opener rule. A corrected one follows.\n"
+        "Draft:\n```markdown\nHi Sam,\nSorry for the wait.\n```\n\ndotonce: the draft above breaks your no-stock-wait-opener rule. A corrected one follows.\n\n"
             .to_string(),
     )
 }
@@ -2531,7 +2566,7 @@ fn the_label_names_every_failing_check() {
             serde_json::json!({"session_id": "s1", "prompt_id": "p1", "message_id": "m1", "index": 0, "final": true, "delta": draft, "cwd": h}),
         ),
         Some(format!(
-            "{draft}\ndotonce: the draft above breaks your no-stock-wait-opener, inline-links rule. A corrected one follows.\n"
+            "{draft}\ndotonce: the draft above breaks your no-stock-wait-opener, inline-links rule. A corrected one follows.\n\n"
         ))
     );
     std::fs::remove_dir_all(&h).unwrap();

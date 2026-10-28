@@ -74,9 +74,11 @@ fn broken(buf: &mut DraftCopy, sets: &[&Live]) -> Vec<String> {
     ids
 }
 
-/// One batch as it streamed, with a blank line and the label after the
-/// closing fence of each draft that breaks a set in `sets`, the fix sets
-/// whose drafts get labeled. `last` is the message's final batch.
+/// One batch as it streamed, with the label after the closing fence of each
+/// draft that breaks a set in `sets`, the fix sets whose drafts get labeled.
+/// A blank line comes before and after the label, so it never joins the
+/// next line or turns a following `---` into a heading. `last` is the
+/// message's final batch.
 pub fn step(buf: &mut DraftCopy, delta: &str, last: bool, sets: &[&Live]) -> String {
     let mut shown = String::new();
     for line in delta.split_inclusive('\n') {
@@ -94,7 +96,7 @@ pub fn step(buf: &mut DraftCopy, delta: &str, last: bool, sets: &[&Live]) -> Str
                         if !line.ends_with('\n') {
                             shown.push('\n');
                         }
-                        shown.push_str(&format!("\n{}\n", label(&ids)));
+                        shown.push_str(&format!("\n{}\n\n", label(&ids)));
                     }
                 }
             }
@@ -302,7 +304,7 @@ mod tests {
     /// the checks with these ids.
     fn after(ids: &[&str]) -> String {
         let ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
-        format!("\n{}\n", label(&ids))
+        format!("\n{}\n\n", label(&ids))
     }
 
     #[test]
