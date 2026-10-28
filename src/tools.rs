@@ -582,9 +582,11 @@ pub fn pre_tool(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
     let Some((path, body)) = tool_text(tool, &input) else {
         return Ok(None);
     };
-    let sid = session_id(v)?;
     let dir = session::dir()?;
-    let before = session::load(&dir, sid)?;
+    let before = match session_id(v) {
+        Ok(sid) => session::load(&dir, sid)?,
+        Err(_) => session::State::default(),
+    };
     let session::Now {
         live,
         mut state,
@@ -593,6 +595,7 @@ pub fn pre_tool(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
     if live.is_empty() {
         return Ok(None);
     }
+    let sid = session_id(v)?;
     let abs = path
         .filter(|p| !p.is_empty())
         .map(|p| cwd.join(p).to_string_lossy().into_owned());

@@ -3284,3 +3284,20 @@ fn guard_denies_rule_commands_through_shells_wrappers_and_pipes() {
     }
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+#[test]
+fn a_missing_session_id_is_logged_only_with_rule_sets() {
+    let input = |cwd: &Path| serde_json::json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": cwd});
+    let errors =
+        |h: &Path| std::fs::read_to_string(h.join("dotonce/errors.log")).unwrap_or_default();
+    let h = home("nosidempty");
+    let proj = h.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    assert!(hook(&h, "pre-tool", input(&proj)).trim().is_empty());
+    assert_eq!(errors(&h), "", "no rule sets, nothing to log");
+    std::fs::remove_dir_all(&h).unwrap();
+    let (h, proj) = code_home("nosidset", "warn");
+    assert!(hook(&h, "pre-tool", input(&proj)).trim().is_empty());
+    assert!(errors(&h).contains("no session_id"), "{}", errors(&h));
+    std::fs::remove_dir_all(&h).unwrap();
+}
