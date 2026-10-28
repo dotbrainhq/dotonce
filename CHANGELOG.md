@@ -17,7 +17,20 @@ Every release of dotonce is listed here. Versions follow semantic versioning.
 - Markdown fact files with frontmatter, in one or more store folders. An existing folder of notes, like a knowledge base, works as a store without copying.
 - `dotonce init`, `save`, `search`, `index`, and `hook-config`, with the index kept in sync with the files on every call.
 - Claude Code hooks: `dotonce hook prompt` adds the matching facts before each prompt, and `dotonce hook session-start` adds pinned facts at the start of a session and after compaction. The hooks never stop Claude Code. Private facts only show inside the folders you list in the config, and facts saved from inside those folders are private by default.
+- Rule sets: TOML files in `~/.dotonce/rules/` that turn on by skill, folder or prompt words, add their reminder at that moment, and share the context cap with facts. Parsing is strict, and a file with an error is skipped whole and reported at the next session start.
+- Reply checks at Stop: phrases, patterns, required phrases, bare URLs, repeated names, and paragraph and word limits, on fenced drafts or whole replies. A `fix` set sends a broken draft back once with the line and the reason, and a line right after the broken draft says a corrected one follows. The draft itself is never hidden.
+- Tool checks before Bash, Write, Edit, MultiEdit and NotebookEdit calls. A `fix` set denies a failing call with the reason.
+- Approvals tied to each file's hash, with levels `remind`, `warn` and `fix`. New sets start at `warn`. Approving, changing a level, turning a set off and pausing it need a real terminal and the typed id, and refuse to run when `CLAUDECODE` or `CLAUDE_CODE_ENTRYPOINT` is set.
+- An always-on guard that stops Claude from editing rule files and approval state, and from running the approval commands. Every change shows in `dotonce rules list` and in a notice at the next session start.
+- A catch log in `~/.dotonce/catches.jsonl`, with private sets in their own file, and `dotonce stats` with catches per check, fixes, denials and the repeat-mistake rate.
+- `dotonce rules new`, `check`, `test`, `approve`, `level`, `off`, `pause`, `list`, `why` and `log`.
+- `dotonce doctor`, which checks that the user and project settings have every hook and warns about a `DOTONCE_HOME` set in them. It never edits them.
 
 ### Changed
 
+- `dotonce hook-config` prints all seven hooks dotonce needs, up from two.
 - The default budget is now 40,000 tokens with up to 60 conversations. On LongMemEval this keeps the right conversations for every question in our 102-question sample, while still sending fewer tokens than Hindsight.
+
+### Fixed
+
+- A hook could panic while writing to a stderr that Claude Code had closed. The hook path never writes to stderr now, even for bad arguments.
