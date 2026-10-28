@@ -3391,3 +3391,31 @@ fn guard_reads_su_sudo_shells_and_a_substituted_dotonce() {
     );
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+#[test]
+fn rules_test_takes_only_the_five_tool_names() {
+    let (h, _) = code_home("tooltestnames", "warn");
+    let file = h.join("cmd.txt");
+    std::fs::write(&file, "git push --force origin main").unwrap();
+    let f = file.to_string_lossy().to_string();
+    for tool in ["Read", "bash", "Grep", ""] {
+        let (_, err, ok) = run_full(
+            &h,
+            &h,
+            &["rules", "test", "code-safety", &f, "--tool", tool],
+            None,
+        );
+        assert!(!ok, "{tool}");
+        assert!(err.contains("invalid value"), "{tool}: {err}");
+    }
+    for tool in ["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"] {
+        let (out, err, ok) = run_full(
+            &h,
+            &h,
+            &["rules", "test", "code-safety", &f, "--tool", tool],
+            None,
+        );
+        assert!(ok, "{tool}: {out}{err}");
+    }
+    std::fs::remove_dir_all(&h).unwrap();
+}

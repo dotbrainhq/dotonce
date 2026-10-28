@@ -101,7 +101,7 @@ enum RulesCmd {
         #[arg(long)]
         json: bool,
         /// Run this tool's checks instead, reading the file as the tool's text.
-        #[arg(long)]
+        #[arg(long, value_parser = ["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"])]
         tool: Option<String>,
         /// The file path a Write, Edit, MultiEdit or NotebookEdit call would have.
         #[arg(long, requires = "tool")]
