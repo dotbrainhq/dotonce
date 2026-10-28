@@ -2040,6 +2040,7 @@ fn the_stop_continuation_in_the_session_record_is_not_a_new_turn() {
 #[test]
 fn display_hook_holds_a_broken_draft_back() {
     let h = ticket_home("display", "fix");
+    register_stop(&h);
     use_skill(&h, "s1", "p1");
     let shown = |out: &str| -> Option<String> {
         if out.trim().is_empty() {
@@ -2083,6 +2084,7 @@ fn display_hook_holds_a_broken_draft_back() {
 #[test]
 fn display_hook_never_loses_held_lines() {
     let h = ticket_home("displaysafe", "fix");
+    register_stop(&h);
     use_skill(&h, "s1", "p1");
     let batch = |input: serde_json::Value| -> Option<String> {
         let out = hook(&h, "display", input);
@@ -2160,6 +2162,7 @@ fn display_out(h: &Path, input: serde_json::Value) -> Option<String> {
 #[test]
 fn a_draft_after_the_send_back_always_shows() {
     let h = ticket_home("displayagain", "fix");
+    register_stop(&h);
     use_skill(&h, "s1", "p1");
     assert!(!sent_back(&stop(&h, "s1", "p1", BROKEN, false)).is_empty());
     let again = "Second try:\n```markdown\nHi Sam,\nSorry for the wait.\n```\n";
@@ -2192,6 +2195,7 @@ fn a_draft_after_the_send_back_always_shows() {
 #[test]
 fn an_interrupted_draft_shows_with_the_next_message() {
     let h = ticket_home("displaystop", "fix");
+    register_stop(&h);
     use_skill(&h, "s1", "p1");
     let at = |mid: &str, i: u32, last: bool, delta: &str| serde_json::json!({"session_id": "s1", "prompt_id": "p1", "message_id": mid, "index": i, "final": last, "delta": delta});
     let note = "(dotonce: an earlier draft, not checked because the reply was interrupted)\n";
@@ -2591,5 +2595,67 @@ fn a_sent_back_draft_is_followed_by_the_corrected_one_only() {
     );
     assert_eq!(system_message(&stop(&h, "s1", "p1", fixed, true)), None);
     assert_eq!(system_message(&prompt_in(&h, "s1", "p2")), None);
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn display_holds_only_when_dotonce_runs_at_stop() {
+    let h = ticket_home("displaynostop", "fix");
+    for sid in ["s1", "s2", "s3"] {
+        use_skill(&h, sid, "p1");
+    }
+    assert_eq!(
+        show_draft(&h, &h, "s1", "p1", "m1"),
+        None,
+        "no Stop hook: nothing would follow the note, so the draft shows"
+    );
+    let settings = |dir: &Path, file: &str, command: &str| {
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        let v = serde_json::json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": command}]}]}});
+        std::fs::write(dir.join(".claude").join(file), v.to_string()).unwrap();
+    };
+    settings(&h, "settings.json", "/opt/acme/bin/notify stop");
+    assert_eq!(
+        show_draft(&h, &h, "s2", "p1", "m1"),
+        None,
+        "another Stop hook doesn't count"
+    );
+    let proj = h.join("proj");
+    settings(&proj, "settings.local.json", "dotonce hook stop");
+    assert_eq!(
+        show_draft(&h, &proj, "s3", "p1", "m1"),
+        held_back(),
+        "the project's local settings count"
+    );
+    register_stop(&h);
+    assert_eq!(
+        show_draft(&h, &h, "s1", "p1", "m2"),
+        None,
+        "the first answer is kept for the session"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn an_unreadable_settings_file_means_no_hold() {
+    let h = ticket_home("displaybadsettings", "fix");
+    register_stop(&h);
+    use_skill(&h, "s1", "p1");
+    use_skill(&h, "s2", "p1");
+    let proj = h.join("proj");
+    std::fs::create_dir_all(proj.join(".claude")).unwrap();
+    std::fs::write(proj.join(".claude/settings.json"), "{not json").unwrap();
+    assert_eq!(
+        show_draft(&h, &proj, "s1", "p1", "m1"),
+        None,
+        "a broken file"
+    );
+    std::fs::remove_file(proj.join(".claude/settings.json")).unwrap();
+    std::fs::create_dir_all(proj.join(".claude/settings.json")).unwrap();
+    assert_eq!(
+        show_draft(&h, &proj, "s2", "p1", "m1"),
+        None,
+        "a file that can't be read"
+    );
     std::fs::remove_dir_all(&h).unwrap();
 }

@@ -2,7 +2,8 @@
 //! broken draft never shows. Display only: what Claude sees doesn't change.
 
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -239,7 +240,14 @@ pub fn display(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
     // Without a final flag, nothing is held past this batch.
     let last = v.get("final").and_then(Value::as_bool).unwrap_or(true);
     let fix = session::checks_now(&state, cwd, prompt_id(v))
-        .map(|now| now.fix().into_iter().cloned().collect::<Vec<_>>());
+        .map(|now| now.fix().into_iter().cloned().collect::<Vec<_>>())
+        .map(|fix| {
+            if fix.is_empty() || stop_registered(&dir, sid, &state, cwd) {
+                fix
+            } else {
+                Vec::new()
+            }
+        });
     let mut shown = match fix {
         Ok(fix) if fix.is_empty() && held.lines.is_empty() && early.is_empty() => {
             return Ok(None);
@@ -292,6 +300,64 @@ pub fn display(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
     ))
 }
 
+/// Whether Claude Code runs `dotonce hook stop` at Stop. Without it nothing
+/// follows a held draft, so display never holds. Read once per session and
+/// kept in the session state.
+fn stop_registered(dir: &Path, sid: &str, state: &session::State, cwd: &Path) -> bool {
+    if let Some(found) = state.stop_hook {
+        return found;
+    }
+    let found = settings_run_stop(cwd);
+    let saved = session::load(dir, sid).and_then(|mut fresh| {
+        fresh.stop_hook = Some(found);
+        session::save(dir, sid, &fresh)
+    });
+    if let Err(e) = saved {
+        log_error(&format!("display: {e:#}"));
+    }
+    found
+}
+
+/// Reads Claude Code's user settings and the project's settings under
+/// `cwd`, without changing them. A file that exists but can't be read or
+/// parsed counts as no Stop hook.
+fn settings_run_stop(cwd: &Path) -> bool {
+    let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
+        return false;
+    };
+    let files = [
+        PathBuf::from(home).join(".claude/settings.json"),
+        cwd.join(".claude/settings.json"),
+        cwd.join(".claude/settings.local.json"),
+    ];
+    let mut found = false;
+    for f in &files {
+        let src = match fs::read_to_string(f) {
+            Ok(src) => src,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return false,
+        };
+        let Ok(settings) = serde_json::from_str::<Value>(&src) else {
+            return false;
+        };
+        found |= runs_stop(&settings);
+    }
+    found
+}
+
+/// A Stop hook command that runs `dotonce hook stop`.
+fn runs_stop(settings: &Value) -> bool {
+    settings
+        .pointer("/hooks/Stop")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|h| h.get("command").and_then(Value::as_str))
+        .any(|c| c.contains("dotonce") && c.contains("hook stop"))
+}
+
 /// Written to a temp file and renamed, like `session::save`, so a hook that
 /// stops halfway never leaves a broken file.
 fn save_held(dir: &Path, path: &Path, held: &Held) -> Result<()> {
@@ -314,6 +380,20 @@ mod tests {
             set: parse(src, Path::new("/r/t.toml")).unwrap(),
             level: Level::Fix,
         }
+    }
+
+    #[test]
+    fn only_a_stop_hook_that_runs_dotonce_counts() {
+        let entry =
+            |c: &str| json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": c}]}]}});
+        assert!(runs_stop(&entry("'/opt/acme/dotonce' hook stop")));
+        assert!(!runs_stop(&entry("dotonce hook prompt")));
+        assert!(!runs_stop(&entry("/opt/acme/notify hook stop")));
+        assert!(!runs_stop(
+            &json!({"hooks": {"UserPromptSubmit": [{"hooks": [{"command": "dotonce hook stop"}]}]}})
+        ));
+        assert!(!runs_stop(&json!({"hooks": {"Stop": "dotonce hook stop"}})));
+        assert!(!runs_stop(&json!([])));
     }
 
     #[test]

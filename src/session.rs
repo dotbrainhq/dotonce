@@ -69,6 +69,10 @@ pub struct State {
     pub logged: Vec<(String, String, String)>,
     #[serde(default)]
     pub prompt_id: Option<String>,
+    /// Whether Claude Code's settings run `dotonce hook stop` at Stop, read
+    /// once per session by the display hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_hook: Option<bool>,
 }
 
 impl State {
