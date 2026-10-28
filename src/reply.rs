@@ -21,11 +21,18 @@ pub const SEND_BACK_START: &str =
 const TAIL_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PARTS: usize = 200;
 
+/// The send-back text. Two sets with the same check give the same line, so
+/// each line is listed once.
 pub fn send_back_text(fails: &[Failure]) -> String {
-    let mut s = format!("{SEND_BACK_START}\n");
+    let mut lines: Vec<String> = Vec::new();
     for f in fails {
-        s.push_str(&format!("- {}: \"{}\". {}\n", f.check, f.line, f.why));
+        let line = format!("- {}: \"{}\". {}\n", f.check, f.line, f.why);
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
     }
+    let mut s = format!("{SEND_BACK_START}\n");
+    s.extend(lines);
     s.push_str(SEND_BACK_END);
     s
 }
@@ -363,6 +370,25 @@ mod tests {
             Vec::<String>::new()
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_send_back_names_a_line_two_sets_share_once() {
+        let fail = |set: &str, why: &str| Failure {
+            set: set.to_string(),
+            check: "inline-links".to_string(),
+            line: "See https://example.com".to_string(),
+            why: why.to_string(),
+        };
+        let same = "Links go inline as anchor text.";
+        let text = send_back_text(&[
+            fail("acme-replies", same),
+            fail("acme-notes", same),
+            fail("acme-docs", "Use anchor text."),
+        ]);
+        assert_eq!(text.matches("- inline-links: ").count(), 2, "{text}");
+        assert_eq!(text.matches(same).count(), 1, "{text}");
+        assert!(text.contains("Use anchor text."), "{text}");
     }
 
     #[test]
