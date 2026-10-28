@@ -691,3 +691,43 @@ fn rules_check_lists_broken_files_and_fails() {
     assert!(err.contains("1 rule file"), "{err}");
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+#[test]
+fn rules_test_runs_a_sets_checks_on_a_file() {
+    let h = home("rulestest");
+    add_set(
+        &h,
+        "acme-replies",
+        "[draft]\nfence = [\"markdown\"]\n[[check]]\nid = \"no-stock-wait-opener\"\nforbid = [\"sorry for the wait\"]\nwhy = \"Open with a line from the thread.\"\n[[check]]\nid = \"inline-links\"\nkind = \"bare-url\"\nwhy = \"Links go inline as anchor text.\"\n",
+    );
+    let file = h.join("reply.md");
+    std::fs::write(
+        &file,
+        "Draft:\n```markdown\nHi Sam,\n\nSorry for the wait. See https://example.com/guide\n```\n",
+    )
+    .unwrap();
+    let f = file.to_string_lossy().to_string();
+    let (out, ok) = run(&h, &["rules", "test", "acme-replies", &f], None);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("no-stock-wait-opener: \"Sorry for the wait. See https://example.com/guide\""),
+        "{out}"
+    );
+    assert!(out.contains("  Links go inline as anchor text."), "{out}");
+    let (out, ok) = run(&h, &["rules", "test", "acme-replies", &f, "--json"], None);
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["drafts"], 1);
+    assert_eq!(v["failures"].as_array().unwrap().len(), 2);
+    assert_eq!(v["failures"][1]["check"], "inline-links");
+    std::fs::write(&file, "No drafts here.").unwrap();
+    let (out, _) = run(&h, &["rules", "test", "acme-replies", &f], None);
+    assert!(out.contains("no drafts in"), "{out}");
+    std::fs::write(&file, "```markdown\nHi Sam,\nThanks for the details.\n```").unwrap();
+    let (out, _) = run(&h, &["rules", "test", "acme-replies", &f], None);
+    assert!(out.contains("passes"), "{out}");
+    let (_, err, ok) = run_full(&h, &h, &["rules", "test", "missing", &f], None);
+    assert!(!ok);
+    assert!(err.contains("no rule set missing"), "{err}");
+    std::fs::remove_dir_all(&h).unwrap();
+}

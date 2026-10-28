@@ -1,5 +1,6 @@
 use std::io::{self, Read, Write};
 use std::panic::{self, AssertUnwindSafe};
+use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
@@ -92,6 +93,14 @@ enum RulesCmd {
     },
     /// Check every rule file and list the errors.
     Check,
+    /// Run a set's checks on a text file and print what would fail.
+    Test {
+        id: String,
+        file: PathBuf,
+        /// Print the result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn rules_cmd(cmd: RulesCmd) -> Result<()> {
@@ -113,6 +122,7 @@ fn rules_cmd(cmd: RulesCmd) -> Result<()> {
             Ok(())
         }
         RulesCmd::Check => commands::rules_check(),
+        RulesCmd::Test { id, file, json } => commands::rules_test(&id, &file, json),
     }
 }
 
