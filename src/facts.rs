@@ -466,7 +466,7 @@ fn tokens(s: &str) -> Vec<String> {
 }
 
 /// Crude stemming: "repros" and "reproductions", "dash" and "dashes" match.
-fn word_match(term: &str, word: &str) -> bool {
+pub fn word_match(term: &str, word: &str) -> bool {
     if term == word {
         return true;
     }

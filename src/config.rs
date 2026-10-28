@@ -85,7 +85,7 @@ pub fn expand(p: &str) -> PathBuf {
 }
 
 /// Resolves `.` and `..` without touching the disk.
-fn lexical_normalize(p: &Path) -> PathBuf {
+pub fn lexical_normalize(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in p.components() {
         match c {
@@ -102,8 +102,19 @@ fn lexical_normalize(p: &Path) -> PathBuf {
 }
 
 /// The real path when it exists, the lexically cleaned path otherwise.
-fn resolve(p: &Path) -> PathBuf {
+pub fn resolve(p: &Path) -> PathBuf {
     fs::canonicalize(p).unwrap_or_else(|_| lexical_normalize(p))
+}
+
+/// True when `cwd` is `entry` or inside it, by real path. `entry` may start
+/// with `~/`; an empty or relative entry matches nothing.
+pub fn path_inside(cwd: &Path, entry: &str) -> bool {
+    let p = entry.trim();
+    if p.is_empty() {
+        return false;
+    }
+    let e = expand(p);
+    e.is_absolute() && resolve(cwd).starts_with(resolve(&e))
 }
 
 impl Config {
@@ -119,15 +130,7 @@ impl Config {
     }
 
     pub fn private_allowed(&self, cwd: &Path) -> bool {
-        let cwd = resolve(cwd);
-        self.private_paths.iter().any(|p| {
-            let p = p.trim();
-            if p.is_empty() {
-                return false;
-            }
-            let entry = expand(p);
-            entry.is_absolute() && cwd.starts_with(resolve(&entry))
-        })
+        self.private_paths.iter().any(|p| path_inside(cwd, p))
     }
 }
 
@@ -234,6 +237,38 @@ mod tests {
         let home = std::env::var("HOME").unwrap();
         assert_eq!(expand("~/notes"), PathBuf::from(home).join("notes"));
         assert_eq!(expand("/abs/path"), PathBuf::from("/abs/path"));
+    }
+
+    #[test]
+    fn path_inside_does_not_match_a_prefix_look_alike() {
+        assert!(path_inside(Path::new("/a/work"), "/a/work"));
+        assert!(path_inside(Path::new("/a/work/app"), "/a/work"));
+        assert!(!path_inside(Path::new("/a/workshop"), "/a/work"));
+        assert!(!path_inside(Path::new("/a/workshop/app"), "/a/work"));
+    }
+
+    #[test]
+    fn path_inside_resolves_dot_dot() {
+        assert!(!path_inside(Path::new("/a/work/../other"), "/a/work"));
+        assert!(path_inside(Path::new("/a/other/../work/app"), "/a/work"));
+        assert!(path_inside(Path::new("/a/work/./app"), "/a/work/../work"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_inside_follows_a_symlinked_folder() {
+        let base = std::env::temp_dir().join(format!("dotonce-inside-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let real = base.join("real/app");
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(base.join("other")).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        let entry = base.join("real").to_string_lossy().into_owned();
+        assert!(path_inside(&base.join("link/app"), &entry));
+        let link_entry = base.join("link").to_string_lossy().into_owned();
+        assert!(path_inside(&real, &link_entry));
+        assert!(!path_inside(&base.join("other"), &entry));
+        fs::remove_dir_all(&base).unwrap();
     }
 
     fn cfg_with_private(entries: &[&str]) -> Config {
