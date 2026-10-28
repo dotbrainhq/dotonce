@@ -101,6 +101,14 @@ enum RulesCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Approve a set as its file is now. Needs a terminal and the typed id.
+    Approve { id: String },
+    /// Set an approved set's level: remind, warn or fix. Needs a terminal and the typed id.
+    Level { id: String, level: String },
+    /// Turn a set off. Needs a terminal and the typed id.
+    Off { id: String },
+    /// List every set with its level and approval state.
+    List,
 }
 
 fn rules_cmd(cmd: RulesCmd) -> Result<()> {
@@ -123,6 +131,10 @@ fn rules_cmd(cmd: RulesCmd) -> Result<()> {
         }
         RulesCmd::Check => commands::rules_check(),
         RulesCmd::Test { id, file, json } => commands::rules_test(&id, &file, json),
+        RulesCmd::Approve { id } => commands::rules_approve(&id),
+        RulesCmd::Level { id, level } => commands::rules_level(&id, &level),
+        RulesCmd::Off { id } => commands::rules_off(&id),
+        RulesCmd::List => commands::rules_list(),
     }
 }
 

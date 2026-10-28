@@ -731,3 +731,94 @@ fn rules_test_runs_a_sets_checks_on_a_file() {
     assert!(err.contains("no rule set missing"), "{err}");
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+/// Records an approval the way `dotonce rules approve` does, for a file's text.
+fn approve_src(h: &Path, id: &str, src: &str, level: &str) {
+    let path = h.join("dotonce/approvals.json");
+    let mut v: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({"sets": {}}));
+    v["sets"][id] = serde_json::json!({
+        "hash": dotonce::approvals::hash(src),
+        "level": level,
+        "off": false,
+        "approved": "2026-10-28T00:00:00Z"
+    });
+    std::fs::create_dir_all(h.join("dotonce")).unwrap();
+    std::fs::write(path, v.to_string()).unwrap();
+}
+
+/// Approves `<home>/dotonce/rules/<id>.toml` as it is now.
+fn approve(h: &Path, id: &str, level: &str) {
+    let src = std::fs::read_to_string(h.join(format!("dotonce/rules/{id}.toml"))).unwrap();
+    approve_src(h, id, &src, level);
+}
+
+#[test]
+fn approval_needs_a_terminal_and_tracks_changes() {
+    let h = home("approve");
+    add_set(
+        &h,
+        "acme-replies",
+        "[[check]]\nid = \"c\"\nwhy = \"w\"\nforbid = [\"x\"]\n",
+    );
+    let (_, err, ok) = run_full(
+        &h,
+        &h,
+        &["rules", "approve", "acme-replies"],
+        Some("acme-replies\n"),
+    );
+    assert!(!ok);
+    assert!(err.contains("terminal"), "{err}");
+    assert!(!h.join("dotonce/approvals.json").exists());
+    for args in [
+        &["rules", "level", "acme-replies", "fix"][..],
+        &["rules", "off", "acme-replies"],
+    ] {
+        let (_, err, ok) = run_full(&h, &h, args, Some("acme-replies\n"));
+        assert!(!ok, "{args:?}");
+        assert!(
+            err.contains("terminal") || err.contains("isn't approved"),
+            "{args:?}: {err}"
+        );
+    }
+    let (out, ok) = run(&h, &["rules", "list"], None);
+    assert!(ok);
+    assert!(
+        out.contains("acme-replies") && out.contains("not approved"),
+        "{out}"
+    );
+    approve(&h, "acme-replies", "warn");
+    let (out, _) = run(&h, &["rules", "list"], None);
+    assert!(out.contains("warn") && out.contains("checks: 1"), "{out}");
+    let (_, err, ok) = run_full(
+        &h,
+        &h,
+        &["rules", "level", "acme-replies", "fix"],
+        Some("acme-replies\n"),
+    );
+    assert!(!ok);
+    assert!(err.contains("terminal"), "{err}");
+    let f = h.join("dotonce/rules/acme-replies.toml");
+    let mut src = std::fs::read_to_string(&f).unwrap();
+    src.push_str("# edited\n");
+    std::fs::write(&f, src).unwrap();
+    let (out, _) = run(&h, &["rules", "list"], None);
+    assert!(out.contains("changed since approval"), "{out}");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn rules_list_hides_private_sets_outside_private_paths() {
+    let (h, proj) = home_with_private_path("listpriv");
+    add_set(&h, "secret-notes", "private = true\n");
+    add_set(&h, "acme-replies", "");
+    let (out, _) = run(&h, &["rules", "list"], None);
+    assert!(out.contains("acme-replies"), "{out}");
+    assert!(!out.contains("secret-notes"), "{out}");
+    assert!(out.contains("1 private set(s) hidden"), "{out}");
+    let (out, _) = run_in(&h, &proj, &["rules", "list"], None);
+    assert!(out.contains("secret-notes"), "{out}");
+    std::fs::remove_dir_all(&h).unwrap();
+}

@@ -1,14 +1,17 @@
 //! The `dotonce rules`, `stats` and `doctor` commands.
 
 use std::fs;
-use std::io::BufRead;
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use chrono::SecondsFormat;
 use serde::Serialize;
 
+use crate::approvals;
 use crate::checks::{self, Failure};
-use crate::rules::{self, RuleSet};
+use crate::config;
+use crate::rules::{self, Level, RuleSet};
 
 /// Writes a starter rule set. `whole` picks whole replies over fenced
 /// drafts; when it is None the user is asked on `input`, and an empty answer
@@ -124,5 +127,102 @@ pub fn rules_test(id: &str, file: &Path, json: bool) -> Result<()> {
         return Ok(());
     }
     print_failures(&fails);
+    Ok(())
+}
+
+/// The terminal check and the typed id, read from this process's stdin.
+fn confirmed(id: &str, what: &str) -> Result<()> {
+    approvals::confirm(id, what, approvals::on_terminal(), || {
+        print!("To {what}, type the set's id ({id}) and press Return: ");
+        io::stdout().flush()?;
+        let mut s = String::new();
+        io::stdin().read_line(&mut s)?;
+        Ok(s)
+    })
+}
+
+fn now_text() -> String {
+    chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+pub fn rules_approve(id: &str) -> Result<()> {
+    let set = find_set(id)?;
+    let mut a = approvals::load()?;
+    let level = a.sets.get(id).map_or(set.level, |x| x.level);
+    println!(
+        "{}: level {}, {} checks, file {}",
+        set.id,
+        level.as_str(),
+        set.checks.len(),
+        set.file.display()
+    );
+    confirmed(id, &format!("approve {id}"))?;
+    let level = a.approve(&set, &now_text());
+    approvals::save(&a)?;
+    println!("approved {id} at level {}", level.as_str());
+    Ok(())
+}
+
+pub fn rules_level(id: &str, level: &str) -> Result<()> {
+    let level = Level::parse(level)?;
+    let set = find_set(id)?;
+    let mut a = approvals::load()?;
+    confirmed(id, &format!("set {id} to {}", level.as_str()))?;
+    a.set_level(&set, level)?;
+    approvals::save(&a)?;
+    println!("{id} is now at level {}", level.as_str());
+    Ok(())
+}
+
+pub fn rules_off(id: &str) -> Result<()> {
+    let mut a = approvals::load()?;
+    if !a.sets.contains_key(id) {
+        bail!("{id} isn't approved, so it's already off");
+    }
+    confirmed(id, &format!("turn {id} off"))?;
+    a.turn_off(id)?;
+    approvals::save(&a)?;
+    println!("{id} is off. Turn it on again with dotonce rules level {id} <level>");
+    Ok(())
+}
+
+/// True when this folder is inside one of the config's private paths.
+fn private_here() -> Result<bool> {
+    let cfg = config::load()?;
+    Ok(cfg.private_allowed(&std::env::current_dir().unwrap_or_default()))
+}
+
+pub fn rules_list() -> Result<()> {
+    let private_ok = private_here()?;
+    let loaded = rules::load()?;
+    let a = approvals::load()?;
+    if loaded.sets.is_empty() && loaded.errors.is_empty() {
+        println!("no rule sets in {}", rules::rules_dir()?.display());
+        return Ok(());
+    }
+    let mut hidden = 0;
+    for s in &loaded.sets {
+        if s.private && !private_ok {
+            hidden += 1;
+            continue;
+        }
+        println!(
+            "{:<24} {:<24} checks: {}",
+            s.id,
+            a.state(s).label(),
+            s.checks.len()
+        );
+    }
+    for e in &loaded.errors {
+        let stem = e
+            .file
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        println!("{stem:<24} {:<24} {}", "error", e.line());
+    }
+    if hidden > 0 {
+        println!("{hidden} private set(s) hidden outside private_paths");
+    }
     Ok(())
 }
