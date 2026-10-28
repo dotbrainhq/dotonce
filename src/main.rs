@@ -68,7 +68,7 @@ enum Cmd {
         #[arg(long)]
         rebuild: bool,
     },
-    /// Run as a Claude Code hook (prompt or session-start). Reads the hook's JSON on stdin and never fails.
+    /// Run as a Claude Code hook (prompt, session-start, skill, expansion, stop or pre-tool). Reads the hook's JSON on stdin and never fails.
     Hook { event: String },
     /// Print the hooks block to add to Claude Code's settings.json.
     HookConfig,
@@ -145,7 +145,6 @@ fn now() -> i64 {
 /// Runs a hook and always returns normally: errors and panics go to
 /// errors.log, and Claude Code gets the hook JSON or nothing.
 fn run_hook(event: &str) {
-    panic::set_hook(Box::new(|info| hook::log_error(&format!("panic: {info}"))));
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         let mut input = String::new();
         io::stdin().read_to_string(&mut input)?;
@@ -163,7 +162,28 @@ fn run_hook(event: &str) {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().cmd {
+    if std::env::args_os().nth(1).is_some_and(|a| a == "hook") {
+        hook_main();
+        return Ok(());
+    }
+    run(Cli::parse().cmd)
+}
+
+/// The hook path writes nothing to stderr, even for bad arguments: Claude
+/// Code may have closed it, and a write to a closed stderr panics.
+fn hook_main() {
+    panic::set_hook(Box::new(|info| hook::log_error(&format!("panic: {info}"))));
+    match Cli::try_parse() {
+        Ok(Cli {
+            cmd: Cmd::Hook { event },
+        }) => run_hook(&event),
+        Ok(_) => {}
+        Err(e) => hook::log_error(&format!("hook arguments: {e}")),
+    }
+}
+
+fn run(cmd: Cmd) -> Result<()> {
+    match cmd {
         Cmd::BenchServe { dir, fresh } => {
             let mut st = Store::open(&dir, fresh)?;
             serve(&mut st, io::stdin().lock(), io::stdout().lock())

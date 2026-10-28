@@ -1113,3 +1113,37 @@ fn approve_shows_the_checks_and_that_an_off_set_turns_on() {
     }
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+#[test]
+fn hook_path_never_writes_to_stderr() {
+    let h = home("stderr");
+    for args in [
+        &["hook"][..],
+        &["hook", "prompt", "--bogus"],
+        &["hook", "bogus"],
+        &["hook", "prompt"],
+    ] {
+        let (out, err, ok) = run_full(&h, &h, args, Some("not json"));
+        assert!(ok, "{args:?}");
+        assert!(err.is_empty(), "{args:?}: {err}");
+        assert!(out.trim().is_empty(), "{args:?}: {out}");
+    }
+    let log = std::fs::read_to_string(h.join("dotonce/errors.log")).unwrap();
+    assert!(log.contains("hook arguments"), "{log}");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dotonce"))
+        .args(["hook", "prompt"])
+        .env("DOTONCE_HOME", h.join("dotonce"))
+        .env("HOME", &h)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stderr.take());
+    let _ = child.stdin.take().unwrap().write_all(b"not json");
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let log = std::fs::read_to_string(h.join("dotonce/errors.log")).unwrap();
+    assert!(!log.contains("panic"), "{log}");
+    std::fs::remove_dir_all(&h).unwrap();
+}
