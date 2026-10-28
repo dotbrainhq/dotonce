@@ -146,6 +146,7 @@ fn now_text() -> String {
 }
 
 pub fn rules_approve(id: &str) -> Result<()> {
+    approvals::refuse_agent()?;
     let set = find_set(id)?;
     let mut a = approvals::load()?;
     let level = a.sets.get(id).map_or(set.level, |x| x.level);
@@ -164,6 +165,7 @@ pub fn rules_approve(id: &str) -> Result<()> {
 }
 
 pub fn rules_level(id: &str, level: &str) -> Result<()> {
+    approvals::refuse_agent()?;
     let level = Level::parse(level)?;
     let set = find_set(id)?;
     let mut a = approvals::load()?;
@@ -175,6 +177,7 @@ pub fn rules_level(id: &str, level: &str) -> Result<()> {
 }
 
 pub fn rules_off(id: &str) -> Result<()> {
+    approvals::refuse_agent()?;
     let mut a = approvals::load()?;
     if !a.sets.contains_key(id) {
         bail!("{id} isn't approved, so it's already off");

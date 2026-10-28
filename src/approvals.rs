@@ -169,8 +169,23 @@ pub fn load_live() -> Result<(Vec<Live>, Vec<FileError>)> {
     Ok((live(loaded.sets, &a), loaded.errors))
 }
 
-/// True when stdin and stdout are both a terminal. Claude's Bash tool has
-/// neither, so it can't pass the confirmation.
+/// The variables Claude Code sets for the commands its Bash tool runs.
+const AGENT_VARS: [&str; 2] = ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"];
+
+/// Refuses approve, level and off when they run under Claude Code. An agent
+/// can unset these variables, so like the terminal check this stops the
+/// plain case, not a determined one.
+pub fn refuse_agent() -> Result<()> {
+    if AGENT_VARS.iter().any(|v| std::env::var_os(v).is_some()) {
+        bail!("Run this in your own terminal, not through an AI agent.");
+    }
+    Ok(())
+}
+
+/// True when stdin and stdout are both a terminal. This stops accidental and
+/// unattended use, such as a script, a hook or a piped command. A determined
+/// shell agent can fake a terminal (with `script` or a pty), which is why
+/// every change is recorded in approvals.json and shown by `rules list`.
 pub fn on_terminal() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
 }

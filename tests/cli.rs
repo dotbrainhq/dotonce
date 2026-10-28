@@ -19,6 +19,8 @@ fn run_in(home: &Path, cwd: &Path, args: &[&str], stdin: Option<&str>) -> (Strin
         .current_dir(cwd)
         .env("DOTONCE_HOME", home.join("dotonce"))
         .env("HOME", home)
+        .env_remove("CLAUDECODE")
+        .env_remove("CLAUDE_CODE_ENTRYPOINT")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -603,11 +605,31 @@ fn hook_config_points_at_this_binary() {
 
 /// Runs dotonce in `cwd` and returns stdout, stderr and whether it exited 0.
 fn run_full(home: &Path, cwd: &Path, args: &[&str], stdin: Option<&str>) -> (String, String, bool) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dotonce"))
-        .args(args)
+    run_env(home, cwd, args, stdin, &[])
+}
+
+/// The variables Claude Code sets for its Bash tool. This test process runs
+/// inside Claude Code too, so every run removes them unless a test sets one.
+const AGENT_VARS: [&str; 2] = ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"];
+
+/// Like `run_full`, with extra environment variables set.
+fn run_env(
+    home: &Path,
+    cwd: &Path,
+    args: &[&str],
+    stdin: Option<&str>,
+    env: &[(&str, &str)],
+) -> (String, String, bool) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_dotonce"));
+    cmd.args(args)
         .current_dir(cwd)
         .env("DOTONCE_HOME", home.join("dotonce"))
-        .env("HOME", home)
+        .env("HOME", home);
+    for v in AGENT_VARS {
+        cmd.env_remove(v);
+    }
+    let mut child = cmd
+        .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -820,5 +842,68 @@ fn rules_list_hides_private_sets_outside_private_paths() {
     assert!(out.contains("1 private set(s) hidden"), "{out}");
     let (out, _) = run_in(&h, &proj, &["rules", "list"], None);
     assert!(out.contains("secret-notes"), "{out}");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn rule_changes_are_refused_under_an_ai_agent() {
+    let h = home("agent");
+    add_set(&h, "acme-replies", "");
+    let json = h.join("dotonce/approvals.json");
+    for var in AGENT_VARS {
+        let (_, err, ok) = run_env(
+            &h,
+            &h,
+            &["rules", "approve", "acme-replies"],
+            Some("acme-replies\n"),
+            &[(var, "1")],
+        );
+        assert!(!ok, "{var}");
+        assert!(
+            err.contains("Run this in your own terminal, not through an AI agent."),
+            "{var}: {err}"
+        );
+        assert!(!json.exists(), "{var}");
+    }
+    approve(&h, "acme-replies", "warn");
+    let before = std::fs::read(&json).unwrap();
+    for var in AGENT_VARS {
+        for args in [
+            &["rules", "level", "acme-replies", "fix"][..],
+            &["rules", "off", "acme-replies"],
+        ] {
+            let (_, err, ok) = run_env(&h, &h, args, Some("acme-replies\n"), &[(var, "1")]);
+            assert!(!ok, "{var} {args:?}");
+            assert!(
+                err.contains("not through an AI agent"),
+                "{var} {args:?}: {err}"
+            );
+        }
+    }
+    assert_eq!(std::fs::read(&json).unwrap(), before);
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn rules_off_on_an_approved_set_needs_a_terminal() {
+    let h = home("offterm");
+    add_set(&h, "acme-replies", "");
+    approve(&h, "acme-replies", "warn");
+    let json = h.join("dotonce/approvals.json");
+    let before = std::fs::read(&json).unwrap();
+    let (_, err, ok) = run_full(
+        &h,
+        &h,
+        &["rules", "off", "acme-replies"],
+        Some("acme-replies\n"),
+    );
+    assert!(!ok);
+    assert!(
+        err.contains("turn acme-replies off only works in a terminal"),
+        "{err}"
+    );
+    assert_eq!(std::fs::read(&json).unwrap(), before);
+    let (out, _) = run(&h, &["rules", "list"], None);
+    assert!(out.contains("warn"), "{out}");
     std::fs::remove_dir_all(&h).unwrap();
 }
