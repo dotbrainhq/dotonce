@@ -3365,3 +3365,29 @@ fn guard_catches_plain_text_changes_to_the_home() {
     }
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+#[test]
+fn guard_reads_su_sudo_shells_and_a_substituted_dotonce() {
+    let h = home("guardsu");
+    let proj = h.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let bash = |cmd: &str| serde_json::json!({"command": cmd});
+    for cmd in [
+        "su -c 'dotonce rules off acme' sam",
+        "sudo -s <<< 'dotonce rules off acme'",
+        "sudo -s <<EOF\ndotonce rules approve acme\nEOF",
+        "$(which dotonce) rules approve acme",
+        "`which dotonce` rules approve acme",
+    ] {
+        assert_eq!(
+            pre(&h, &proj, "Bash", bash(cmd)).as_deref(),
+            Some(GUARD),
+            "{cmd}"
+        );
+    }
+    assert_eq!(
+        pre(&h, &proj, "Bash", bash("$(which dotonce) rules list")),
+        None
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}

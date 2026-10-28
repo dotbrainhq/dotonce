@@ -81,24 +81,26 @@ const fn runner(
     }
 }
 
+const SUDO: Runner = runner(
+    "sudo",
+    "ugCDhprtUT",
+    &[
+        "--user",
+        "--group",
+        "--close-from",
+        "--chdir",
+        "--host",
+        "--prompt",
+        "--role",
+        "--type",
+        "--other-user",
+        "--command-timeout",
+    ],
+    0,
+);
+
 const RUNNERS: [Runner; 19] = [
-    runner(
-        "sudo",
-        "ugCDhprtUT",
-        &[
-            "--user",
-            "--group",
-            "--close-from",
-            "--chdir",
-            "--host",
-            "--prompt",
-            "--role",
-            "--type",
-            "--other-user",
-            "--command-timeout",
-        ],
-        0,
-    ),
+    SUDO,
     runner("su", "csgGw", &["--command", "--shell", "--group"], 0),
     runner("env", "uCPS", &["--unset", "--chdir", "--split-string"], 0),
     runner("exec", "a", &[], 0),
@@ -445,6 +447,9 @@ struct Lexer {
     redir: Option<usize>,
     /// The next word is a redirection target (`> file`).
     redir_next: bool,
+    /// For each open `$(...)` or backtick: whether it stands where a command
+    /// word goes, and the index of its first command.
+    subs: Vec<(bool, usize)>,
 }
 
 impl Lexer {
@@ -482,6 +487,31 @@ impl Lexer {
                 self.cur.piped_from = Some(self.pipe_start);
             }
             self.out.push(std::mem::take(&mut self.cur));
+        }
+    }
+
+    /// Starts a `$(...)` or backtick command of its own.
+    fn open_sub(&mut self) {
+        let at_cmd = self.word.as_deref().is_none_or(str::is_empty)
+            && self.cur.words.iter().all(|w| is_assignment(w));
+        self.end_cmd();
+        self.subs.push((at_cmd, self.out.len()));
+    }
+
+    /// Ends a `$(...)` or backtick command. The outer command gets a word in
+    /// its place: `dotonce` when it stands where the command word goes and
+    /// names dotonce (`$(which dotonce) rules ...`), a stand-in otherwise.
+    fn close_sub(&mut self) {
+        self.end_cmd();
+        if let Some((at_cmd, start)) = self.subs.pop() {
+            let names = self
+                .out
+                .get(start..)
+                .unwrap_or_default()
+                .iter()
+                .any(|c| c.words.iter().any(|w| is_dotonce(w)));
+            let word = if at_cmd && names { "dotonce" } else { "$()" };
+            self.cur.words.push(word.to_string());
         }
     }
 
@@ -577,12 +607,12 @@ fn lex(cmd: &str, mut stack: Vec<Ctx>) -> Vec<Simple> {
                     }
                 }
                 '`' => {
-                    l.end_cmd();
+                    l.open_sub();
                     stack.push(Ctx::Tick);
                 }
                 '$' if chars.peek() == Some(&'(') => {
                     chars.next();
-                    l.end_cmd();
+                    l.open_sub();
                     stack.push(Ctx::Paren);
                 }
                 _ if !body => l.push(c),
@@ -624,23 +654,22 @@ fn lex(cmd: &str, mut stack: Vec<Ctx>) -> Vec<Simple> {
                 }
             }
             c if c.is_whitespace() => l.end_word(),
-            ')' => {
-                l.end_cmd();
-                if stack.last() == Some(&Ctx::Paren) {
-                    stack.pop();
-                }
+            ')' if stack.last() == Some(&Ctx::Paren) => {
+                stack.pop();
+                l.close_sub();
+            }
+            ')' => l.end_cmd(),
+            '`' if stack.last() == Some(&Ctx::Tick) => {
+                stack.pop();
+                l.close_sub();
             }
             '`' => {
-                l.end_cmd();
-                if stack.last() == Some(&Ctx::Tick) {
-                    stack.pop();
-                } else {
-                    stack.push(Ctx::Tick);
-                }
+                l.open_sub();
+                stack.push(Ctx::Tick);
             }
             '$' if chars.peek() == Some(&'(') => {
                 chars.next();
-                l.end_cmd();
+                l.open_sub();
                 stack.push(Ctx::Paren);
             }
             '\'' => {
@@ -796,6 +825,39 @@ fn shell_runs(args: &[String]) -> Shell {
     }
 }
 
+/// The command `su` runs with `-c` or `--command`. None means su starts a
+/// shell that reads stdin.
+fn su_command(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while let Some(a) = args.get(i).map(String::as_str) {
+        i += 1;
+        if let Some(cmd) = a.strip_prefix("--command=") {
+            return Some(cmd.to_string());
+        } else if a == "--command" {
+            return args.get(i).cloned();
+        } else if ["--shell", "--group", "--supp-group"].contains(&a) {
+            i += 1;
+        } else if a.len() > 1 && a.starts_with('-') && !a.starts_with("--") {
+            let cluster = &a[1..];
+            for (k, c) in cluster.char_indices() {
+                let value = &cluster[k + c.len_utf8()..];
+                if c == 'c' {
+                    return if value.is_empty() {
+                        args.get(i).cloned()
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
+                if "sgGw".contains(c) {
+                    i += usize::from(value.is_empty());
+                    break;
+                }
+            }
+        }
+    }
+    None
+}
+
 /// The command `env -S` or `--split-string` runs, if any.
 fn env_split(args: &[String]) -> Option<String> {
     let mut i = 0;
@@ -827,6 +889,14 @@ fn quoted_commands(words: &[String]) -> (Vec<String>, bool) {
         match base_name(&words[i]) {
             "eval" => cmds.push(rest.join(" ")),
             "env" => cmds.extend(env_split(rest)),
+            "su" => match su_command(rest) {
+                Some(c) => cmds.push(c),
+                None => stdin = true,
+            },
+            "sudo" => {
+                let (next, flags) = skip_opts(words, i + 1, SUDO.short, SUDO.long);
+                stdin |= flags.contains(['s', 'i']) && next >= words.len();
+            }
             b if SHELLS.contains(&b) => match shell_runs(rest) {
                 Shell::Command(c) => cmds.push(c),
                 Shell::Stdin => stdin = true,
@@ -1375,5 +1445,36 @@ mod tests {
             assert!(!guard("Write", &write(p), &proj, &home, None), "{p}");
         }
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn su_sudo_shells_and_a_substituted_dotonce_are_read() {
+        for cmd in [
+            "su -c 'dotonce rules off x' sam",
+            "su sam -c 'dotonce rules off x'",
+            "su - sam --command='dotonce rules off x'",
+            "su -lc 'dotonce rules off x' sam",
+            "echo 'dotonce rules off x' | su sam",
+            "sudo -s <<< 'dotonce rules off x'",
+            "sudo -s <<EOF\ndotonce rules off x\nEOF",
+            "sudo -u sam -i <<< 'dotonce rules approve x'",
+            "$(which dotonce) rules approve x",
+            "`which dotonce` rules approve x",
+            "\"$(command -v dotonce)\" rules level x fix",
+            "X=1 $(which dotonce) rules off x",
+        ] {
+            assert!(runs_rule_change(cmd), "{cmd}");
+        }
+        for cmd in [
+            "su -c 'dotonce rules list' sam",
+            "su -c 'ls' sam <<< 'dotonce rules off x'",
+            "sudo -s <<< 'ls src'",
+            "sudo -s ls <<< 'dotonce rules off x'",
+            "$(which dotonce) rules list",
+            "echo $(which dotonce) rules",
+            "ls $(which dotonce) approve",
+        ] {
+            assert!(!runs_rule_change(cmd), "{cmd}");
+        }
     }
 }
