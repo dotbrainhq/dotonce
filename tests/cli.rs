@@ -4273,7 +4273,11 @@ fn run_with_path(home: &Path, exe: &Path, path: Option<&std::ffi::OsStr>, args: 
     };
     let out = cmd.output().unwrap();
     assert!(out.status.success(), "{:?}", out);
-    String::from_utf8_lossy(&out.stdout).to_string()
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
 }
 
 const PATH_HINT: &str = "dotonce is not on your PATH, so the short `dotonce` command won't work in a new terminal. Add its folder once:";

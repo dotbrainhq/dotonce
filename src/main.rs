@@ -226,8 +226,9 @@ fn run(cmd: Cmd) -> Result<()> {
         }
         Cmd::Init => {
             println!("{}", config::init()?.display());
+            // On stderr, so `$(dotonce init)` still captures only the path.
             if let Some(hint) = config::path_hint() {
-                println!("{hint}");
+                eprintln!("{hint}");
             }
             Ok(())
         }
