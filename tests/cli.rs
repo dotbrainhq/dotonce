@@ -2217,6 +2217,46 @@ fn text_after_a_labeled_fence_stays_its_own_paragraph() {
     std::fs::remove_dir_all(&h).unwrap();
 }
 
+#[test]
+fn a_fence_split_mid_line_is_read_whole() {
+    let h = ticket_home("displaymidline", "fix");
+    register_stop(&h);
+    use_skill(&h, "s1", "p1");
+    let at = |mid: &str, i: u32, last: bool, delta: &str| serde_json::json!({"session_id": "s1", "prompt_id": "p1", "message_id": mid, "index": i, "final": last, "delta": delta});
+    let label =
+        "dotonce: the draft above breaks your no-stock-wait-opener rule. A corrected one follows.";
+    assert_eq!(
+        display_out(
+            &h,
+            at("m1", 0, false, "```markdown\nSorry for the wait.\n```")
+        ),
+        None,
+        "a batch ending mid-line isn't read as a whole line"
+    );
+    assert_eq!(
+        display_out(&h, at("m1", 1, false, "bash\nmore\n")),
+        None,
+        "```bash is not a closing fence"
+    );
+    assert_eq!(
+        display_out(&h, at("m1", 2, true, "```\nDone.\n")),
+        Some(format!("```\n\n{label}\n\nDone.\n"))
+    );
+    assert_eq!(
+        display_out(
+            &h,
+            at("m2", 0, false, "```markdown\nSorry for the wait.\n``")
+        ),
+        None
+    );
+    assert_eq!(
+        display_out(&h, at("m2", 1, true, "`\nDone.\n")),
+        Some(format!("`\n\n{label}\n\nDone.\n")),
+        "a closing fence split as `` and `\\n is still found"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
 /// Where a label starts on screen. A blank line always follows it.
 const LABEL_START: &str = "\ndotonce: the draft above breaks your ";
 

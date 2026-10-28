@@ -34,6 +34,9 @@ pub struct DraftCopy {
     pub fence: Option<(char, usize, bool)>,
     /// The open draft's lines so far, its opening fence first.
     pub lines: Vec<String>,
+    /// The batch's unfinished last line, read with the next batch. Kept to
+    /// find fences only, never shown again.
+    pub partial: String,
     /// The batch index expected next.
     #[serde(default)]
     pub next: u64,
@@ -74,46 +77,83 @@ fn broken(buf: &mut DraftCopy, sets: &[&Live]) -> Vec<String> {
     ids
 }
 
+/// Reads one whole line of the message and returns the ids to label when
+/// it closes a draft that breaks a set in `sets`.
+fn read_line(buf: &mut DraftCopy, line: &str, sets: &[&Live]) -> Vec<String> {
+    let bare = line.trim_end_matches(['\n', '\r']);
+    match buf.fence {
+        Some((ch, len, draft)) => {
+            if draft {
+                buf.lines.push(line.to_string());
+            }
+            if fence_closes(bare, ch, len) {
+                buf.fence = None;
+                if draft {
+                    return broken(buf, sets);
+                }
+            }
+        }
+        None => {
+            if let Some((ch, len, info)) = fence_open(bare) {
+                let draft = sets.iter().any(|l| marks_drafts(l, &info));
+                buf.fence = Some((ch, len, draft));
+                if draft {
+                    buf.lines.push(line.to_string());
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Forgets the open fence, the draft's lines and the unfinished line.
+fn forget(buf: &mut DraftCopy) {
+    buf.fence = None;
+    buf.lines.clear();
+    buf.partial.clear();
+}
+
 /// One batch as it streamed, with the label after the closing fence of each
 /// draft that breaks a set in `sets`, the fix sets whose drafts get labeled.
 /// A blank line comes before and after the label, so it never joins the
 /// next line or turns a following `---` into a heading. `last` is the
 /// message's final batch.
+///
+/// Only whole lines are read: a batch's unfinished last line waits in
+/// `partial` for the rest of it, except at the last batch. The batch's own
+/// text is never changed; the one newline added is at the last batch, to
+/// end a closing fence line before its label.
 pub fn step(buf: &mut DraftCopy, delta: &str, last: bool, sets: &[&Live]) -> String {
+    let mut text = std::mem::take(&mut buf.partial);
+    let carried = text.len();
+    text.push_str(delta);
     let mut shown = String::new();
-    for line in delta.split_inclusive('\n') {
-        shown.push_str(line);
-        let bare = line.trim_end_matches(['\n', '\r']);
-        match buf.fence {
-            Some((ch, len, draft)) => {
-                if draft {
-                    buf.lines.push(line.to_string());
-                }
-                if fence_closes(bare, ch, len) {
-                    buf.fence = None;
-                    let ids = if draft { broken(buf, sets) } else { Vec::new() };
-                    if !ids.is_empty() {
-                        if !line.ends_with('\n') {
-                            shown.push('\n');
-                        }
-                        shown.push_str(&format!("\n{}\n\n", label(&ids)));
-                    }
-                }
-            }
-            None => {
-                if let Some((ch, len, info)) = fence_open(bare) {
-                    let draft = sets.iter().any(|l| marks_drafts(l, &info));
-                    buf.fence = Some((ch, len, draft));
-                    if draft {
-                        buf.lines.push(line.to_string());
-                    }
-                }
-            }
+    let mut shown_to = 0;
+    let mut read_to = 0;
+    for line in text.split_inclusive('\n') {
+        read_to += line.len();
+        let whole = line.ends_with('\n');
+        if !whole && !last {
+            buf.partial = line.to_string();
+            break;
         }
+        let ids = read_line(buf, line, sets);
+        if ids.is_empty() {
+            continue;
+        }
+        // A whole line ends in a newline from this batch, so its end lies
+        // inside `delta`.
+        let at = read_to - carried;
+        shown.push_str(&delta[shown_to..at]);
+        shown_to = at;
+        if !whole {
+            shown.push('\n');
+        }
+        shown.push_str(&format!("\n{}\n\n", label(&ids)));
     }
+    shown.push_str(&delta[shown_to..]);
     if last {
-        buf.lines.clear();
-        buf.fence = None;
+        forget(buf);
     }
     shown
 }
@@ -168,8 +208,7 @@ pub fn display(v: &Value, cwd: &Path) -> Result<Option<String>> {
                 buf.next = i + 1;
             }
             if buf.pass {
-                buf.lines.clear();
-                buf.fence = None;
+                forget(&mut buf);
                 delta.to_string()
             } else {
                 step(&mut buf, delta, last, &fix.iter().collect::<Vec<_>>())
@@ -178,8 +217,7 @@ pub fn display(v: &Value, cwd: &Path) -> Result<Option<String>> {
         Err(e) => {
             log_error(&format!("display: {e:#}"));
             buf.pass = true;
-            buf.lines.clear();
-            buf.fence = None;
+            forget(&mut buf);
             delta.to_string()
         }
     };
@@ -366,6 +404,59 @@ mod tests {
             step(&mut DraftCopy::default(), draft, true, &[&l]),
             format!("{draft}{}", after(&["stock", "links"]))
         );
+    }
+
+    #[test]
+    fn a_line_split_across_batches_is_read_whole() {
+        let l = live();
+        let sets = vec![&l];
+        let mut buf = DraftCopy::default();
+        assert_eq!(
+            step(
+                &mut buf,
+                "```markdown\nSorry for the wait.\n```",
+                false,
+                &sets
+            ),
+            "```markdown\nSorry for the wait.\n```",
+            "an unfinished line isn't a closing fence yet"
+        );
+        assert_eq!(
+            step(&mut buf, "bash\nmore\n```\nDone.\n", false, &sets),
+            format!("bash\nmore\n```\n{}Done.\n", after(&["stock"])),
+            "```bash is a line of the draft, not its close"
+        );
+        let mut buf = DraftCopy::default();
+        assert_eq!(
+            step(
+                &mut buf,
+                "```markdown\nSorry for the wait.\n``",
+                false,
+                &sets
+            ),
+            "```markdown\nSorry for the wait.\n``"
+        );
+        assert_eq!(
+            step(&mut buf, "`\nDone.\n", false, &sets),
+            format!("`\n{}Done.\n", after(&["stock"])),
+            "a closing fence split in two is still found"
+        );
+        let mut buf = DraftCopy::default();
+        assert_eq!(
+            step(&mut buf, "``", false, &sets),
+            "``",
+            "an opening fence split in two"
+        );
+        assert_eq!(
+            step(
+                &mut buf,
+                "`markdown\nSorry for the wait.\n```\n",
+                true,
+                &sets
+            ),
+            format!("`markdown\nSorry for the wait.\n```\n{}", after(&["stock"]))
+        );
+        assert!(buf.partial.is_empty() && buf.lines.is_empty());
     }
 
     #[test]
