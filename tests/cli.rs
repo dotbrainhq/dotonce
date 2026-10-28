@@ -2464,6 +2464,41 @@ fn the_recheck_cuts_at_the_continuation_or_is_unverified() {
 }
 
 #[test]
+fn the_recheck_prefers_the_continuation_to_a_repeated_message() {
+    let h = ticket_home("recheckrepeat", "fix");
+    use_skill(&h, "s1", "p1");
+    let user = serde_json::json!({"type": "user", "message": {"role": "user", "content": "Draft the reply"}, "promptId": "p1"}).to_string();
+    let said = |t: &str| {
+        serde_json::json!({"type": "assistant", "message": {"content": [{"type": "text", "text": t}]}}).to_string()
+    };
+    let first = [user, said(BROKEN), said("Saved.")];
+    let record = h.join("session.jsonl");
+    std::fs::write(&record, first.join("\n")).unwrap();
+    assert!(!sent_back(&stop_with(&h, "s1", "p1", "Saved.", false, &record)).is_empty());
+    let mut later = first.to_vec();
+    later.push(serde_json::json!({"type": "attachment", "attachment": {"type": "hook_additional_context", "content": [format!("{}\n- inline-links: ...", dotonce::reply::SEND_BACK_START)]}}).to_string());
+    later.push(said(FIXED));
+    later.push(said("Saved."));
+    std::fs::write(&record, later.join("\n")).unwrap();
+    assert!(
+        stop_with(&h, "s1", "p1", "Saved.", true, &record)
+            .trim()
+            .is_empty()
+    );
+    assert_eq!(
+        outcomes(&h, "catches.jsonl"),
+        pairs(&[
+            ("no-stock-wait-opener", "caught"),
+            ("inline-links", "caught"),
+            ("no-stock-wait-opener", "fixed"),
+            ("inline-links", "fixed"),
+        ]),
+        "the second Saved. is not where the send-back continued"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
 fn a_warn_catch_is_logged_once_per_turn() {
     let h = ticket_home("stopwarnonce", "warn");
     use_skill(&h, "s1", "p1");

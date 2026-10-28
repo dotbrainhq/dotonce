@@ -173,17 +173,20 @@ pub fn turn_text(transcript: Option<&Path>, last: Option<&str>) -> Vec<String> {
     read_turn(transcript, last).parts
 }
 
-/// Where the text written after the send-back starts: after the part it
-/// was sent back at, else after the record's continuation entry. With no
-/// record, the only part is the last message, which came after it. None
-/// when the cut can't be found, since checking the whole turn would count
-/// the old broken draft against the new one.
+/// Where the text written after the send-back starts: after the record's
+/// continuation entry, else after the last part matching the one it was
+/// sent back at. The continuation comes first because two messages can
+/// have the same text. With no record, the only part is the last message,
+/// which came after it. None when the cut can't be found, since checking
+/// the whole turn would count the old broken draft against the new one.
 fn fresh_start(p: &Pending, turn: &Turn) -> Option<usize> {
-    turn.parts
-        .iter()
-        .rposition(|t| approvals::hash(t) == p.after)
-        .map(|i| i + 1)
-        .or(turn.continued_at)
+    turn.continued_at
+        .or_else(|| {
+            turn.parts
+                .iter()
+                .rposition(|t| approvals::hash(t) == p.after)
+                .map(|i| i + 1)
+        })
         .or((turn.recorded == 0).then_some(0))
 }
 
