@@ -1894,6 +1894,36 @@ fn a_second_broken_draft_is_let_through_and_a_missing_one_is_unverified() {
 }
 
 #[test]
+fn a_corrected_draft_that_breaks_another_check_logs_the_new_catch() {
+    let h = ticket_home("recheckother-check", "fix");
+    use_skill(&h, "s1", "p1");
+    let first = "Draft:\n```markdown\nHi Sam,\nSorry for the wait.\n```";
+    let msg = sent_back(&stop(&h, "s1", "p1", first, false));
+    assert!(
+        msg.contains("no-stock-wait-opener") && !msg.contains("inline-links"),
+        "setup: {msg}"
+    );
+    let corrected = "Fixed the opener.\n\n```markdown\nHi Sam,\nThanks for the details. More at https://example.com/guide\n```";
+    assert!(stop(&h, "s1", "p1", corrected, true).trim().is_empty());
+    assert_eq!(
+        outcomes(&h, "catches.jsonl"),
+        pairs(&[
+            ("no-stock-wait-opener", "caught"),
+            ("no-stock-wait-opener", "fixed"),
+            ("inline-links", "caught"),
+        ]),
+        "the corrected draft's new failure is logged as caught"
+    );
+    assert!(stop(&h, "s1", "p1", corrected, true).trim().is_empty());
+    assert_eq!(
+        outcomes(&h, "catches.jsonl").len(),
+        3,
+        "a later Stop in the turn logs nothing again"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
 fn another_stop_hook_continuing_the_turn_does_not_count_as_ours() {
     let h = ticket_home("stopother", "fix");
     use_skill(&h, "s1", "p1");

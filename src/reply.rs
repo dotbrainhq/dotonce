@@ -187,10 +187,9 @@ fn fresh_start(p: &Pending, turn: &Turn) -> Option<usize> {
         .or((turn.recorded == 0).then_some(0))
 }
 
-/// After a send-back, checks only the text that came after it and logs
-/// whether each sent-back check is now fixed.
-fn recheck(p: &Pending, live: &[Live], turn: &Turn, log: &dyn Fn(&Live, &str, Outcome)) {
-    let fresh = fresh_start(p, turn).map(|start| turn.parts[start..].join("\n\n"));
+/// After a send-back, logs whether each sent-back check is fixed in
+/// `fresh`, the text that came after it. None when the cut can't be found.
+fn recheck(p: &Pending, live: &[Live], fresh: Option<&str>, log: &dyn Fn(&Live, &str, Outcome)) {
     for (set_id, check_id) in &p.checks {
         let Some(l) = live.iter().find(|l| &l.set.id == set_id) else {
             continue;
@@ -198,10 +197,7 @@ fn recheck(p: &Pending, live: &[Live], turn: &Turn, log: &dyn Fn(&Live, &str, Ou
         let Some(c) = l.set.checks.iter().find(|c| &c.id == check_id) else {
             continue;
         };
-        let drafts = fresh
-            .as_deref()
-            .map(|f| checks::drafts(&l.set, f))
-            .unwrap_or_default();
+        let drafts = fresh.map(|f| checks::drafts(&l.set, f)).unwrap_or_default();
         let outcome = if drafts.is_empty() {
             Outcome::Unverified
         } else if drafts.iter().any(|d| checks::failing_line(c, d).is_some()) {
@@ -268,24 +264,36 @@ fn send_back(v: &Value, cwd: &Path, now: i64, sid: &str, dir: &Path) -> Result<O
         };
         catches::record(&c, l.set.private);
     };
-    let out = if again {
-        if let Some(p) = state.take_pending(&turn) {
-            recheck(&p, &live, &turn_read, &log);
-        }
-        None
-    } else {
-        let text = parts.join("\n\n");
-        let mut send = Vec::new();
+    // Runs every checking set on `text` and logs each failure not logged
+    // yet this turn as caught.
+    let caught = |state: &mut session::State, text: &str| {
+        let mut fails = Vec::new();
         for &l in &checking {
-            for f in checks::run_reply(&l.set, &text) {
+            for f in checks::run_reply(&l.set, text) {
                 if state.first_log(&turn, &l.set.id, &f.check) {
                     log(l, &f.check, Outcome::Caught);
                 }
-                if fix.contains(&l.set.id) {
-                    send.push(f);
-                }
+                fails.push((l, f));
             }
         }
+        fails
+    };
+    let out = if again {
+        if let Some(p) = state.take_pending(&turn) {
+            let fresh = fresh_start(&p, &turn_read).map(|start| parts[start..].join("\n\n"));
+            recheck(&p, &live, fresh.as_deref(), &log);
+            // The corrected draft can break a check the first one passed.
+            if let Some(f) = &fresh {
+                caught(&mut state, f);
+            }
+        }
+        None
+    } else {
+        let send: Vec<Failure> = caught(&mut state, &parts.join("\n\n"))
+            .into_iter()
+            .filter(|(l, _)| fix.contains(&l.set.id))
+            .map(|(_, f)| f)
+            .collect();
         if send.is_empty() {
             None
         } else {
