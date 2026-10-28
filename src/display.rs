@@ -1,6 +1,7 @@
 //! MessageDisplay: labels a draft that breaks a fix set's checks, so the user
-//! knows a corrected one follows. Never hides or drops text. Display only:
-//! what Claude sees doesn't change.
+//! knows a corrected one follows. Every batch shows as it streamed, with the
+//! label added after the draft's closing fence. Display only: what Claude
+//! sees doesn't change.
 
 use std::fs;
 use std::io;
@@ -15,28 +16,29 @@ use crate::checks::{self, fence_closes, fence_open};
 use crate::hook::{log_error, prompt_id, session_id, str_field};
 use crate::session;
 
-/// The line shown above a draft that breaks the checks with these ids.
+/// The line shown below a draft that breaks the checks with these ids.
 pub fn label(ids: &[String]) -> String {
     format!(
-        "dotonce: this draft breaks your {} rule. A corrected one follows below.",
+        "dotonce: the draft above breaks your {} rule. A corrected one follows.",
         ids.join(", ")
     )
 }
 
-/// A message's lines still buffered while a draft streams in, so it can be
-/// checked whole.
+/// What display keeps of a message between batches to check a draft once
+/// it closes. Never used to show text: every batch shows as it streamed.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct Buffer {
+pub struct DraftCopy {
     pub message_id: String,
-    /// The open fence: its character, its length, and whether its lines are
-    /// buffered.
+    /// The open fence: its character, its length, and whether it opens a
+    /// draft whose lines are copied.
     pub fence: Option<(char, usize, bool)>,
+    /// The open draft's lines so far, its opening fence first.
     pub lines: Vec<String>,
     /// The batch index expected next.
     #[serde(default)]
     pub next: u64,
-    /// A batch came out of order or a check failed: the rest of the message
-    /// shows as it is.
+    /// A batch came out of order or a check failed: the copy may miss
+    /// lines, so the rest of the message isn't checked.
     #[serde(default)]
     pub pass: bool,
 }
@@ -49,10 +51,10 @@ fn marks_drafts(l: &Live, info: &str) -> bool {
         .is_some_and(|d| d.fence.iter().any(|f| f == info))
 }
 
-/// The buffered block as written, under the label when a set that marks its
-/// fence fails it. A whole-reply set checks the full reply at Stop, never
-/// one block of it.
-fn release(buf: &mut Buffer, sets: &[&Live]) -> String {
+/// The ids of the checks the copied draft breaks, for the sets that mark
+/// its fence. A whole-reply set checks the full reply at Stop, never one
+/// block of it.
+fn broken(buf: &mut DraftCopy, sets: &[&Live]) -> Vec<String> {
     let text = buf.lines.concat();
     buf.lines.clear();
     let info = text
@@ -69,73 +71,61 @@ fn release(buf: &mut Buffer, sets: &[&Live]) -> String {
             }
         }
     }
-    if ids.is_empty() {
-        text
-    } else {
-        format!("{}\n{text}", label(&ids))
-    }
+    ids
 }
 
-/// What to show in place of one batch of lines. `sets` are the fix sets
-/// whose drafts get labeled; `last` is the message's final batch.
-pub fn step(buf: &mut Buffer, delta: &str, last: bool, sets: &[&Live]) -> String {
+/// One batch as it streamed, with a blank line and the label after the
+/// closing fence of each draft that breaks a set in `sets`, the fix sets
+/// whose drafts get labeled. `last` is the message's final batch.
+pub fn step(buf: &mut DraftCopy, delta: &str, last: bool, sets: &[&Live]) -> String {
     let mut shown = String::new();
     for line in delta.split_inclusive('\n') {
+        shown.push_str(line);
         let bare = line.trim_end_matches(['\n', '\r']);
         match buf.fence {
-            Some((ch, len, buffered)) => {
-                if buffered {
+            Some((ch, len, draft)) => {
+                if draft {
                     buf.lines.push(line.to_string());
-                } else {
-                    shown.push_str(line);
                 }
                 if fence_closes(bare, ch, len) {
                     buf.fence = None;
-                    if buffered {
-                        shown.push_str(&release(buf, sets));
+                    let ids = if draft { broken(buf, sets) } else { Vec::new() };
+                    if !ids.is_empty() {
+                        if !line.ends_with('\n') {
+                            shown.push('\n');
+                        }
+                        shown.push_str(&format!("\n{}\n", label(&ids)));
                     }
                 }
             }
             None => {
                 if let Some((ch, len, info)) = fence_open(bare) {
-                    let buffered = sets.iter().any(|l| marks_drafts(l, &info));
-                    buf.fence = Some((ch, len, buffered));
-                    if buffered {
+                    let draft = sets.iter().any(|l| marks_drafts(l, &info));
+                    buf.fence = Some((ch, len, draft));
+                    if draft {
                         buf.lines.push(line.to_string());
-                        continue;
                     }
                 }
-                shown.push_str(line);
             }
         }
     }
     if last {
-        shown.push_str(&buf.lines.concat());
         buf.lines.clear();
         buf.fence = None;
     }
     shown
 }
 
-fn load_buffer(path: &Path) -> Buffer {
+fn load_copy(path: &Path) -> DraftCopy {
     fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
 
-/// Everything buffered, then the batch as it is.
-fn release_all(buf: &mut Buffer, delta: &str) -> String {
-    let mut shown = buf.lines.concat();
-    shown.push_str(delta);
-    buf.lines.clear();
-    buf.fence = None;
-    shown
-}
-
-/// Buffered lines only reach the screen through a later batch's output, so
-/// anything that goes wrong while lines are buffered shows them at once and
-/// lets the rest of the message through as it is.
+/// Every batch shows exactly as it streamed; at most a label is added after
+/// a draft's closing fence. Anything that goes wrong skips the label, never
+/// the text.
 pub fn display(v: &Value, cwd: &Path) -> Result<Option<String>> {
     let sid = match session_id(v) {
         Ok(sid) => sid,
@@ -146,31 +136,16 @@ pub fn display(v: &Value, cwd: &Path) -> Result<Option<String>> {
     let path = session::display_file(&dir, sid)?;
     let message = str_field(v, "message_id");
     let state = session::load(&dir, sid).unwrap_or_default();
-    let mut buf = load_buffer(&path);
-    let mut early = String::new();
+    let mut buf = load_copy(&path);
     let same = buf.message_id == message;
-    // Lines still buffered from another message: that message stopped before
-    // its final batch (Esc), so they show now, ahead of this one.
     if !same {
-        if !buf.lines.is_empty() {
-            early.push_str(&buf.lines.concat());
-            if !early.ends_with('\n') {
-                early.push('\n');
-            }
-            // The draft stopped inside its fence: close it, so this
-            // message doesn't show inside the old block.
-            if let Some((ch, len, _)) = buf.fence {
-                early.push_str(&ch.to_string().repeat(len));
-                early.push('\n');
-            }
-        }
-        buf = Buffer {
+        buf = DraftCopy {
             message_id: message.to_string(),
-            ..Buffer::default()
+            ..DraftCopy::default()
         };
     }
     let delta = str_field(v, "delta");
-    // Without a final flag, nothing is buffered past this batch.
+    // Without a final flag, nothing is kept past this batch.
     let last = v.get("final").and_then(Value::as_bool).unwrap_or(true);
     // Labeled only when Stop will send the draft back, so a corrected one
     // follows: a fix set, a turn not sent back yet, and dotonce run at Stop.
@@ -183,17 +158,17 @@ pub fn display(v: &Value, cwd: &Path) -> Result<Option<String>> {
                 Vec::new()
             }
         });
-    let mut shown = match fix {
-        Ok(fix) if fix.is_empty() && buf.lines.is_empty() && early.is_empty() => {
-            return Ok(None);
-        }
+    let shown = match fix {
+        Ok(fix) if fix.is_empty() => return Ok(None),
         Ok(fix) => {
             if let Some(i) = v.get("index").and_then(Value::as_u64) {
                 buf.pass |= i != if same { buf.next } else { 0 };
                 buf.next = i + 1;
             }
             if buf.pass {
-                release_all(&mut buf, delta)
+                buf.lines.clear();
+                buf.fence = None;
+                delta.to_string()
             } else {
                 step(&mut buf, delta, last, &fix.iter().collect::<Vec<_>>())
             }
@@ -201,22 +176,23 @@ pub fn display(v: &Value, cwd: &Path) -> Result<Option<String>> {
         Err(e) => {
             log_error(&format!("display: {e:#}"));
             buf.pass = true;
-            release_all(&mut buf, delta)
+            buf.lines.clear();
+            buf.fence = None;
+            delta.to_string()
         }
     };
     let saved = if last {
         let _ = fs::remove_file(&path);
         Ok(())
     } else {
-        save_buffer(&dir, &path, &buf)
+        save_copy(&dir, &path, &buf)
     };
     if let Err(e) = saved {
-        // What isn't saved can't show later, so it shows now.
+        // A copy that isn't saved can't be checked later: the next batch
+        // finds none and skips the label.
         log_error(&format!("display: {e:#}"));
-        shown.push_str(&buf.lines.concat());
         let _ = fs::remove_file(&path);
     }
-    shown.insert_str(0, &early);
     if shown == delta {
         return Ok(None);
     }
@@ -286,7 +262,7 @@ fn runs_stop(settings: &Value) -> bool {
 
 /// Written to a temp file and renamed, like `session::save`, so a hook that
 /// stops halfway never leaves a broken file.
-fn save_buffer(dir: &Path, path: &Path, buf: &Buffer) -> Result<()> {
+fn save_copy(dir: &Path, path: &Path, buf: &DraftCopy) -> Result<()> {
     fs::create_dir_all(dir)?;
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     fs::write(&tmp, serde_json::to_string(buf)?)?;
@@ -322,11 +298,26 @@ mod tests {
         assert!(!runs_stop(&json!([])));
     }
 
+    /// What the screen shows after a closing fence for a draft that breaks
+    /// the checks with these ids.
+    fn after(ids: &[&str]) -> String {
+        let ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+        format!("\n{}\n", label(&ids))
+    }
+
     #[test]
-    fn a_broken_draft_shows_in_full_under_a_label() {
+    fn the_label_says_the_corrected_draft_follows() {
+        assert_eq!(
+            label(&["stock".to_string(), "links".to_string()]),
+            "dotonce: the draft above breaks your stock, links rule. A corrected one follows."
+        );
+    }
+
+    #[test]
+    fn a_broken_draft_gets_the_label_after_its_closing_fence() {
         let l = live();
         let sets = vec![&l];
-        let mut buf = Buffer::default();
+        let mut buf = DraftCopy::default();
         assert_eq!(
             step(
                 &mut buf,
@@ -334,14 +325,31 @@ mod tests {
                 false,
                 &sets
             ),
-            "Here it is:\n"
+            "Here it is:\n```markdown\nHi Sam,\n"
         );
         assert_eq!(buf.lines.len(), 2);
         assert_eq!(
             step(&mut buf, "Sorry for the wait.\n```\nDone.\n", false, &sets),
-            "dotonce: this draft breaks your stock rule. A corrected one follows below.\n```markdown\nHi Sam,\nSorry for the wait.\n```\nDone.\n"
+            format!("Sorry for the wait.\n```\n{}Done.\n", after(&["stock"]))
         );
         assert!(buf.lines.is_empty() && buf.fence.is_none());
+    }
+
+    #[test]
+    fn a_closing_fence_without_a_newline_gets_its_own_line_before_the_label() {
+        let l = live();
+        assert_eq!(
+            step(
+                &mut DraftCopy::default(),
+                "```markdown\nSorry for the wait.\n```",
+                true,
+                &[&l]
+            ),
+            format!(
+                "```markdown\nSorry for the wait.\n```\n{}",
+                after(&["stock"])
+            )
+        );
     }
 
     #[test]
@@ -353,22 +361,23 @@ mod tests {
         };
         let draft = "```markdown\nSorry for the wait.\nSee https://example.com\n```\n";
         assert_eq!(
-            step(&mut Buffer::default(), draft, true, &[&l]),
-            format!(
-                "dotonce: this draft breaks your stock, links rule. A corrected one follows below.\n{draft}"
-            )
+            step(&mut DraftCopy::default(), draft, true, &[&l]),
+            format!("{draft}{}", after(&["stock", "links"]))
         );
     }
 
     #[test]
-    fn a_passing_draft_shows_in_full_at_its_closing_fence() {
+    fn a_passing_draft_gets_no_label() {
         let l = live();
         let sets = vec![&l];
-        let mut buf = Buffer::default();
-        assert_eq!(step(&mut buf, "```markdown\nHi Sam,\n", false, &sets), "");
+        let mut buf = DraftCopy::default();
+        assert_eq!(
+            step(&mut buf, "```markdown\nHi Sam,\n", false, &sets),
+            "```markdown\nHi Sam,\n"
+        );
         assert_eq!(
             step(&mut buf, "Thanks for the details.\n```\n", false, &sets),
-            "```markdown\nHi Sam,\nThanks for the details.\n```\n"
+            "Thanks for the details.\n```\n"
         );
     }
 
@@ -384,36 +393,28 @@ mod tests {
             level: Level::Fix,
         };
         let sets = vec![&l, &whole];
-        let mut buf = Buffer::default();
-        assert_eq!(
-            step(
-                &mut buf,
-                "Here:\n```markdown\nHi Sam,\nThanks for the details.\n```\nCheers\n",
-                true,
-                &sets
-            ),
-            "Here:\n```markdown\nHi Sam,\nThanks for the details.\n```\nCheers\n"
-        );
+        let text = "Here:\n```markdown\nHi Sam,\nThanks for the details.\n```\nCheers\n";
+        assert_eq!(step(&mut DraftCopy::default(), text, true, &sets), text);
     }
 
     #[test]
     fn other_fences_and_unclosed_drafts_show_as_they_are() {
         let l = live();
         let sets = vec![&l];
-        let mut buf = Buffer::default();
+        let mut buf = DraftCopy::default();
         assert_eq!(
             step(&mut buf, "```bash\nsorry for the wait\n```\n", false, &sets),
             "```bash\nsorry for the wait\n```\n"
         );
+        assert!(buf.lines.is_empty(), "only draft lines are copied");
         assert_eq!(
             step(&mut buf, "```markdown\nSorry for the wait.", true, &sets),
             "```markdown\nSorry for the wait."
         );
-        assert!(buf.lines.is_empty());
-        let mut buf = Buffer::default();
+        assert!(buf.lines.is_empty() && buf.fence.is_none());
         assert_eq!(
             step(
-                &mut buf,
+                &mut DraftCopy::default(),
                 "```markdown\nSorry for the wait.\n```\n",
                 false,
                 &[]

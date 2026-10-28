@@ -2042,87 +2042,61 @@ fn display_hook_labels_a_broken_draft() {
     let h = ticket_home("display", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
-    let shown = |out: &str| -> Option<String> {
-        if out.trim().is_empty() {
-            return None;
-        }
-        let v: serde_json::Value = serde_json::from_str(out).unwrap();
-        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "MessageDisplay");
-        Some(
-            v["hookSpecificOutput"]["displayContent"]
-                .as_str()
-                .unwrap()
-                .to_string(),
-        )
-    };
-    let batch = |mid: &str, i: u32, last: bool, delta: &str| {
-        hook(
-            &h,
-            "display",
-            serde_json::json!({"session_id": "s1", "turn_id": "p1", "message_id": mid, "index": i, "final": last, "delta": delta}),
-        )
-    };
+    let input = |mid: &str, i: u32, last: bool, delta: &str| serde_json::json!({"session_id": "s1", "turn_id": "p1", "message_id": mid, "index": i, "final": last, "delta": delta});
+    let batch =
+        |mid: &str, i: u32, last: bool, delta: &str| display_out(&h, input(mid, i, last, delta));
     assert_eq!(
-        shown(&batch("m1", 0, false, "Draft:\n```markdown\nHi Sam,\n")).as_deref(),
-        Some("Draft:\n")
+        batch("m1", 0, false, "Draft:\n```markdown\nHi Sam,\n"),
+        None,
+        "the draft's first lines show at once"
     );
     assert_eq!(
-        shown(&batch("m1", 1, true, "Sorry for the wait.\n```\n")).as_deref(),
+        batch("m1", 1, true, "Sorry for the wait.\n```\n").as_deref(),
         Some(
-            "dotonce: this draft breaks your no-stock-wait-opener rule. A corrected one follows below.\n```markdown\nHi Sam,\nSorry for the wait.\n```\n"
+            "Sorry for the wait.\n```\n\ndotonce: the draft above breaks your no-stock-wait-opener rule. A corrected one follows.\n"
         ),
-        "the whole draft shows, under the label"
+        "the label follows the closing fence"
     );
     assert_eq!(
-        shown(&batch(
+        batch(
             "m2",
             0,
             true,
             "Draft:\n```markdown\nHi Sam,\nThanks for the details.\n```\n"
-        )),
+        ),
         None,
-        "a passing draft shows as written"
+        "a passing draft gets no label"
     );
-    assert_eq!(batch("m3", 0, true, "Plain reply.\n"), "");
+    assert_eq!(
+        hook(&h, "display", input("m3", 0, true, "Plain reply.\n")),
+        ""
+    );
     std::fs::remove_dir_all(&h).unwrap();
 }
 
 #[test]
-fn display_hook_never_loses_buffered_lines() {
+fn display_hook_never_holds_text() {
     let h = ticket_home("displaysafe", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
-    let batch = |input: serde_json::Value| -> Option<String> {
-        let out = hook(&h, "display", input);
-        if out.trim().is_empty() {
-            return None;
-        }
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        Some(
-            v["hookSpecificOutput"]["displayContent"]
-                .as_str()
-                .unwrap()
-                .to_string(),
-        )
-    };
+    let batch = |input: serde_json::Value| display_out(&h, input);
     let at = |mid: &str, i: u32, last: bool, delta: &str| serde_json::json!({"session_id": "s1", "message_id": mid, "index": i, "final": last, "delta": delta});
     let open = "Draft:\n```markdown\nHi Sam,\n";
-    let buffered = "```markdown\nHi Sam,\nSorry for the wait.\n";
 
-    assert_eq!(batch(at("m1", 0, false, open)).as_deref(), Some("Draft:\n"));
+    assert_eq!(batch(at("m1", 0, false, open)), None);
     let approvals = h.join("dotonce/approvals.json");
     let saved = std::fs::read_to_string(&approvals).unwrap();
     std::fs::write(&approvals, "not json").unwrap();
     assert_eq!(
-        batch(at("m1", 1, false, "Sorry for the wait.\n")).as_deref(),
-        Some(buffered),
-        "a hook error shows the buffered lines"
+        batch(at("m1", 1, false, "Sorry for the wait.\n")),
+        None,
+        "a hook error shows the batch as it is"
     );
     std::fs::write(&approvals, saved).unwrap();
     assert_eq!(
         batch(at("m1", 2, true, "```\n")),
         None,
-        "the rest of the message shows as it is"
+        "a draft missing a batch is not labeled"
     );
     assert!(
         std::fs::read_to_string(h.join("dotonce/errors.log"))
@@ -2130,19 +2104,23 @@ fn display_hook_never_loses_buffered_lines() {
             .contains("display")
     );
 
-    assert_eq!(batch(at("m2", 0, false, open)).as_deref(), Some("Draft:\n"));
+    assert_eq!(batch(at("m2", 0, false, open)), None);
+    assert_eq!(batch(at("m2", 2, false, "Sorry for the wait.\n")), None);
     assert_eq!(
-        batch(at("m2", 2, false, "Sorry for the wait.\n")).as_deref(),
-        Some(buffered),
-        "a skipped batch shows the buffered lines"
+        batch(at("m2", 3, true, "```\n")),
+        None,
+        "a skipped batch leaves the draft unlabeled"
     );
-    assert_eq!(batch(at("m2", 3, true, "```\n")), None);
 
-    assert_eq!(batch(at("m4", 0, false, open)).as_deref(), Some("Draft:\n"));
+    assert_eq!(batch(at("m4", 0, false, open)), None);
     assert_eq!(
-        batch(at("m4", 1, true, "Sorry for the wait.\n")).as_deref(),
-        Some(buffered),
-        "a fence still open at the last batch shows as written, unlabeled"
+        batch(at("m4", 1, true, "Sorry for the wait.\n")),
+        None,
+        "a fence still open at the last batch gets no label"
+    );
+    assert!(
+        !h.join("dotonce/sessions/s1.display.json").exists(),
+        "the last batch leaves no draft copy"
     );
 
     let no_final =
@@ -2150,26 +2128,102 @@ fn display_hook_never_loses_buffered_lines() {
     assert_eq!(
         batch(no_final(open)),
         None,
-        "without a final flag nothing is buffered past the batch"
+        "without a final flag each batch is the last"
     );
     assert_eq!(batch(no_final("Sorry for the wait.\n```\n")), None);
     std::fs::remove_dir_all(&h).unwrap();
 }
 
-/// What a display hook call puts on screen, or None when the batch shows as it is.
+#[test]
+fn a_corrupt_display_file_still_shows_the_text() {
+    let h = ticket_home("displaycorrupt", "fix");
+    register_stop(&h);
+    use_skill(&h, "s1", "p1");
+    let at = |mid: &str, i: u32, last: bool, delta: &str| serde_json::json!({"session_id": "s1", "prompt_id": "p1", "message_id": mid, "index": i, "final": last, "delta": delta});
+    assert_eq!(
+        display_out(&h, at("m1", 0, false, "Draft:\n```markdown\nHi Sam,\n")),
+        None
+    );
+    let file = h.join("dotonce/sessions/s1.display.json");
+    assert!(file.exists(), "setup");
+    std::fs::write(&file, "not json").unwrap();
+    assert_eq!(
+        display_out(&h, at("m1", 1, false, "Sorry for the wait.\n")),
+        None,
+        "the batch shows as it is"
+    );
+    assert_eq!(
+        display_out(&h, at("m1", 2, true, "```\nDone.\n")),
+        None,
+        "the draft's start is lost, so no label"
+    );
+    std::fs::write(&file, "not json").unwrap();
+    assert_eq!(
+        display_out(&h, at("m2", 0, true, STOCK_DRAFT)),
+        labeled(),
+        "a new message checks again"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn a_draft_split_across_batches_is_checked_whole() {
+    let h = ticket_home("displaysplit", "fix");
+    register_stop(&h);
+    use_skill(&h, "s1", "p1");
+    let at = |i: u32, last: bool, delta: &str| serde_json::json!({"session_id": "s1", "prompt_id": "p1", "message_id": "m1", "index": i, "final": last, "delta": delta});
+    assert_eq!(
+        display_out(
+            &h,
+            at(
+                0,
+                false,
+                "Draft:\n```markdown\nHi Sam,\nThe guide is at https://example.com/guide\n"
+            )
+        ),
+        None
+    );
+    assert_eq!(display_out(&h, at(1, false, "Sorry for the wait.\n")), None);
+    assert_eq!(
+        display_out(&h, at(2, true, "Thanks.\n```\n\nLet me know.\n")).as_deref(),
+        Some(
+            "Thanks.\n```\n\ndotonce: the draft above breaks your no-stock-wait-opener, inline-links rule. A corrected one follows.\n\nLet me know.\n"
+        ),
+        "lines from all three batches are checked at the close"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+/// Where a label starts on screen.
+const LABEL_START: &str = "\ndotonce: the draft above breaks your ";
+
+/// What a display hook call puts on screen, or None when the batch shows as
+/// it is. Every output must be the batch's own text unchanged, with at most
+/// label lines added after it.
 fn display_out(h: &Path, input: serde_json::Value) -> Option<String> {
-    let out = hook(h, "display", input);
+    let out = hook(h, "display", input.clone());
     if out.trim().is_empty() {
         return None;
     }
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["hookSpecificOutput"]["hookEventName"], "MessageDisplay");
-    Some(
-        v["hookSpecificOutput"]["displayContent"]
-            .as_str()
-            .unwrap()
-            .to_string(),
-    )
+    let shown = v["hookSpecificOutput"]["displayContent"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut bare = shown.clone();
+    while let Some(i) = bare.find(LABEL_START) {
+        let end = bare[i + 1..]
+            .find('\n')
+            .map_or(bare.len(), |e| i + 1 + e + 1);
+        bare.replace_range(i..end, "");
+    }
+    assert_eq!(
+        bare,
+        input["delta"].as_str().unwrap_or_default(),
+        "the batch's own text shows unchanged: {shown:?}"
+    );
+    Some(shown)
 }
 
 #[test]
@@ -2203,14 +2257,16 @@ fn no_label_after_the_turn_was_sent_back() {
     .unwrap();
     assert_eq!(
         out,
-        "Second try:\ndotonce: this draft breaks your no-stock-wait-opener rule. A corrected one follows below.\n```markdown\nHi Sam,\nSorry for the wait.\n```\n",
+        format!(
+            "{again}\ndotonce: the draft above breaks your no-stock-wait-opener rule. A corrected one follows.\n"
+        ),
         "a new turn labels again"
     );
     std::fs::remove_dir_all(&h).unwrap();
 }
 
 #[test]
-fn a_new_message_shows_the_lines_still_buffered() {
+fn a_new_message_resets_the_draft_copy() {
     let h = ticket_home("displaystop", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
@@ -2222,11 +2278,10 @@ fn a_new_message_shows_the_lines_still_buffered() {
                 "m1",
                 0,
                 false,
-                "Draft:\n```markdown\nHi Sam,\nSorry for the wa"
+                "Draft:\n```markdown\nHi Sam,\nSorry for the wait.\n"
             )
-        )
-        .as_deref(),
-        Some("Draft:\n")
+        ),
+        None
     );
     let files: Vec<String> = std::fs::read_dir(h.join("dotonce/sessions"))
         .unwrap()
@@ -2235,25 +2290,22 @@ fn a_new_message_shows_the_lines_still_buffered() {
     assert!(
         files.contains(&"s1.display.json".to_string())
             && !files.iter().any(|f| f.ends_with(".tmp")),
-        "the buffered lines are saved through a renamed temp file: {files:?}"
+        "the draft copy is saved through a renamed temp file: {files:?}"
     );
     assert_eq!(
         display_out(
             &h,
             at("m2", 0, false, "Plain reply.\n```markdown\nHi Sam,\n")
         ),
-        Some("```markdown\nHi Sam,\nSorry for the wa\n```\nPlain reply.\n".to_string()),
-        "the buffered lines show first, then the new message, whose draft is buffered"
-    );
-    assert_eq!(
-        display_out(&h, at("m2", 1, true, "Thanks for the details.\n```\n")).as_deref(),
-        Some("```markdown\nHi Sam,\nThanks for the details.\n```\n")
-    );
-    assert_eq!(
-        display_out(&h, at("m3", 0, true, "Plain reply.\n")),
         None,
-        "nothing is shown twice"
+        "nothing from the stopped message shows again"
     );
+    assert_eq!(
+        display_out(&h, at("m2", 1, true, "Thanks for the details.\n```\n")),
+        None,
+        "the stopped message's lines are not part of this draft"
+    );
+    assert_eq!(display_out(&h, at("m3", 0, true, STOCK_DRAFT)), labeled());
     std::fs::remove_dir_all(&h).unwrap();
 }
 
@@ -2355,7 +2407,7 @@ fn show_draft(h: &Path, cwd: &Path, sid: &str, pid: &str, mid: &str) -> Option<S
 /// What the screen shows when `STOCK_DRAFT` is labeled.
 fn labeled() -> Option<String> {
     Some(
-        "Draft:\ndotonce: this draft breaks your no-stock-wait-opener rule. A corrected one follows below.\n```markdown\nHi Sam,\nSorry for the wait.\n```\n"
+        "Draft:\n```markdown\nHi Sam,\nSorry for the wait.\n```\n\ndotonce: the draft above breaks your no-stock-wait-opener rule. A corrected one follows.\n"
             .to_string(),
     )
 }
@@ -2479,7 +2531,7 @@ fn the_label_names_every_failing_check() {
             serde_json::json!({"session_id": "s1", "prompt_id": "p1", "message_id": "m1", "index": 0, "final": true, "delta": draft, "cwd": h}),
         ),
         Some(format!(
-            "dotonce: this draft breaks your no-stock-wait-opener, inline-links rule. A corrected one follows below.\n{draft}"
+            "{draft}\ndotonce: the draft above breaks your no-stock-wait-opener, inline-links rule. A corrected one follows.\n"
         ))
     );
     std::fs::remove_dir_all(&h).unwrap();

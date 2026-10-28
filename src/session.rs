@@ -160,8 +160,8 @@ pub fn save(dir: &Path, session_id: &str, state: &State) -> Result<()> {
     Ok(())
 }
 
-/// Where the MessageDisplay hook keeps the lines it buffers while a draft
-/// streams in.
+/// Where the MessageDisplay hook keeps its copy of a draft that is still
+/// streaming in, to check it once it closes.
 pub fn display_file(dir: &Path, session_id: &str) -> Result<PathBuf> {
     Ok(dir.join(format!("{}.display.json", safe_name(session_id)?)))
 }
