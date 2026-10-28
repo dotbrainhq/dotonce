@@ -1598,3 +1598,105 @@ fn a_changed_file_cannot_make_a_private_set_public() {
     );
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+#[test]
+fn a_reminder_left_out_at_the_cap_comes_with_the_next_prompt() {
+    let h = home("remindcap");
+    // About 1,100 tokens each: two don't fit under the 2,000-token cap.
+    let long = |word: &str| format!("{word} ").repeat(880);
+    for (id, word) in [("first-set", "alpha"), ("second-set", "bravo")] {
+        add_set(
+            &h,
+            id,
+            &format!(
+                "[when]\nskills = [\"writing-support\"]\n[remind]\ntext = \"{}\"\n",
+                long(word)
+            ),
+        );
+        approve(&h, id, "warn");
+    }
+    let skill = serde_json::json!({"session_id": "s1", "prompt_id": "p1", "tool_name": "Skill", "tool_input": {"skill": "writing-support"}, "cwd": "/tmp"});
+    let ctx = context(&hook(&h, "skill", skill), "PostToolUse");
+    assert!(
+        ctx.contains("[first-set]") && !ctx.contains("[second-set]"),
+        "{ctx}"
+    );
+    let out = hook(
+        &h,
+        "prompt",
+        serde_json::json!({"session_id": "s1", "prompt_id": "p2", "prompt": "what now?", "cwd": "/tmp"}),
+    );
+    let ctx = context(&out, "UserPromptSubmit");
+    assert!(
+        ctx.contains("[second-set]") && !ctx.contains("[first-set]"),
+        "{ctx}"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn rules_check_warns_about_a_reminder_too_long_to_fit() {
+    let h = home("checklong");
+    let text = "alpha ".repeat(1_300);
+    add_set(&h, "wordy", &format!("[remind]\ntext = \"{text}\"\n"));
+    add_set(&h, "short", "[remind]\ntext = \"Keep it short.\"\n");
+    let (out, ok) = run(&h, &["rules", "check"], None);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("warn   wordy: its reminder is about") && out.contains("over 1,800"),
+        "{out}"
+    );
+    assert!(!out.contains("warn   short"), "{out}");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn compaction_gives_back_only_this_turns_prompt_sets() {
+    let h = home("compactturn");
+    let proj = h.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    add_set(&h, "acme-replies", REPLIES);
+    approve(&h, "acme-replies", "warn");
+    add_set(
+        &h,
+        "acme-folder",
+        &format!(
+            "[when]\nfolders = [{:?}]\n[remind]\ntext = \"Run the tests first.\"\n",
+            proj.to_string_lossy()
+        ),
+    );
+    approve(&h, "acme-folder", "warn");
+    let out = hook(
+        &h,
+        "prompt",
+        serde_json::json!({"session_id": "s1", "prompt_id": "p1", "prompt": "draft it", "cwd": proj}),
+    );
+    let ctx = context(&out, "UserPromptSubmit");
+    assert!(
+        ctx.contains("Links go inline") && ctx.contains("Run the tests first"),
+        "{ctx}"
+    );
+    let compact = |pid: Option<&str>| {
+        let mut v = serde_json::json!({"session_id": "s1", "source": "compact", "cwd": proj});
+        if let Some(p) = pid {
+            v["prompt_id"] = serde_json::json!(p);
+        }
+        context(&hook(&h, "session-start", v), "SessionStart")
+    };
+    let ctx = compact(None);
+    assert!(
+        ctx.contains("Run the tests first") && !ctx.contains("Links go inline"),
+        "no current turn, so no prompt sets: {ctx}"
+    );
+    let ctx = compact(Some("p1"));
+    assert!(
+        ctx.contains("Links go inline"),
+        "this turn's prompt set: {ctx}"
+    );
+    let ctx = compact(Some("p2"));
+    assert!(
+        ctx.contains("Run the tests first") && !ctx.contains("Links go inline"),
+        "a later turn drops the earlier turn's prompt set: {ctx}"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}

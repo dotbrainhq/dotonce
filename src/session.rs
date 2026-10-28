@@ -385,24 +385,42 @@ fn reminder(live: &[Live], id: &str) -> Option<(String, String)> {
     Some((id.to_string(), text))
 }
 
-/// The reminders of active sets that haven't had theirs yet, marked as given.
-pub fn take_reminders(state: &mut State, live: &[Live]) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for a in state.active.iter_mut().filter(|a| !a.reminded) {
-        a.reminded = true;
-        out.extend(reminder(live, &a.id));
-    }
-    out
+/// The reminders of active sets that haven't had theirs yet. Mark the ones
+/// actually given with `mark_reminded`, so one left out at the token cap
+/// comes with the next hook that can add context.
+pub fn pending_reminders(state: &State, live: &[Live]) -> Vec<(String, String)> {
+    state
+        .active
+        .iter()
+        .filter(|a| !a.reminded)
+        .filter_map(|a| reminder(live, &a.id))
+        .collect()
 }
 
-/// Every active set's reminder, for after the context was compacted.
-pub fn all_reminders(state: &mut State, live: &[Live]) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for a in state.active.iter_mut() {
+/// Records that these sets' reminders were given.
+pub fn mark_reminded(state: &mut State, ids: &[String]) {
+    for a in state.active.iter_mut().filter(|a| ids.contains(&a.id)) {
         a.reminded = true;
-        out.extend(reminder(live, &a.id));
     }
-    out
+}
+
+/// The reminders to give again after the context was compacted: skill and
+/// folder sets, and prompt-word sets from the turn `current`. With no
+/// current turn, no prompt-word set comes back, since it may be an earlier
+/// turn's.
+pub fn compact_reminders(
+    state: &State,
+    live: &[Live],
+    current: Option<&str>,
+) -> Vec<(String, String)> {
+    state
+        .active
+        .iter()
+        .filter(|a| {
+            a.by != Trigger::Prompt || (current.is_some() && a.prompt_id.as_deref() == current)
+        })
+        .filter_map(|a| reminder(live, &a.id))
+        .collect()
 }
 
 /// The active sets whose checks run now: warn and fix sets, without the
@@ -437,6 +455,14 @@ mod tests {
     }
 
     const REMIND: &str = "[remind]\ntext = \"Links go inline.\"\n";
+
+    /// Gives every pending reminder and marks it given.
+    fn take(st: &mut State, live: &[Live]) -> Vec<(String, String)> {
+        let r = pending_reminders(st, live);
+        let ids: Vec<String> = r.iter().map(|(id, _)| id.clone()).collect();
+        mark_reminded(st, &ids);
+        r
+    }
 
     fn ids(st: &State) -> Vec<&str> {
         st.active.iter().map(|a| a.id.as_str()).collect()
@@ -564,8 +590,8 @@ mod tests {
             Event::Prompt("draft it"),
         );
         assert_eq!(ids(&st), ["by-folder", "by-prompt"]);
-        assert_eq!(take_reminders(&mut st, &sets).len(), 2);
-        assert!(take_reminders(&mut st, &sets).is_empty());
+        assert_eq!(take(&mut st, &sets).len(), 2);
+        assert!(take(&mut st, &sets).is_empty());
         let on: Vec<&str> = checking(&st, &sets)
             .iter()
             .map(|l| l.set.id.as_str())
@@ -579,7 +605,7 @@ mod tests {
             Some("p1"),
             Event::Skill("acme:writing-support"),
         );
-        let r = take_reminders(&mut st, &sets);
+        let r = take(&mut st, &sets);
         assert_eq!(
             r,
             vec![("by-skill".to_string(), "Links go inline.".to_string())]
@@ -833,12 +859,53 @@ mod tests {
     }
 
     #[test]
-    fn all_reminders_gives_every_active_set_again() {
-        let sets = vec![live(
-            "a",
-            &format!("[when]\nfolders = [\"/x\"]\n{REMIND}"),
-            Level::Warn,
-        )];
+    fn compaction_gives_back_skill_folder_and_this_turns_prompt_sets() {
+        let sets = vec![
+            live(
+                "folder",
+                &format!("[when]\nfolders = [\"/x\"]\n{REMIND}"),
+                Level::Warn,
+            ),
+            live(
+                "words",
+                &format!("[when]\nprompt = [\"draft\"]\n{REMIND}"),
+                Level::Warn,
+            ),
+        ];
+        let mut st = State::default();
+        refresh(
+            &mut st,
+            &sets,
+            &cfg(),
+            Path::new("/x"),
+            Some("p1"),
+            Event::Prompt("draft it"),
+        );
+        assert_eq!(take(&mut st, &sets).len(), 2);
+        let ids = |r: Vec<(String, String)>| r.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(compact_reminders(&st, &sets, Some("p1"))),
+            ["folder", "words"]
+        );
+        assert_eq!(ids(compact_reminders(&st, &sets, Some("p2"))), ["folder"]);
+        assert_eq!(ids(compact_reminders(&st, &sets, None)), ["folder"]);
+        assert!(take(&mut st, &sets).is_empty());
+    }
+
+    #[test]
+    fn only_reminders_marked_given_stop_coming() {
+        let sets = vec![
+            live(
+                "a",
+                &format!("[when]\nfolders = [\"/x\"]\n{REMIND}"),
+                Level::Warn,
+            ),
+            live(
+                "b",
+                &format!("[when]\nfolders = [\"/x\"]\n{REMIND}"),
+                Level::Warn,
+            ),
+        ];
         let mut st = State::default();
         refresh(
             &mut st,
@@ -848,9 +915,11 @@ mod tests {
             Some("p1"),
             Event::Other,
         );
-        assert_eq!(take_reminders(&mut st, &sets).len(), 1);
-        assert_eq!(all_reminders(&mut st, &sets).len(), 1);
-        assert!(take_reminders(&mut st, &sets).is_empty());
+        assert_eq!(pending_reminders(&st, &sets).len(), 2);
+        mark_reminded(&mut st, &["a".to_string()]);
+        let left = pending_reminders(&st, &sets);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].0, "b");
     }
 
     #[test]

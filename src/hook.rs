@@ -69,9 +69,11 @@ pub fn context(event: &str, block: &str) -> String {
 }
 
 /// The rules section of a `<dotonce>` block: whole reminders only, as many
-/// as fit in `budget` tokens. Returns the text and the tokens it uses.
-pub fn reminder_section(rem: &[(String, String)], budget: usize) -> (String, usize) {
+/// as fit in `budget` tokens. Returns the text, the tokens it uses and the
+/// ids of the sets whose reminder is in it.
+pub fn reminder_section(rem: &[(String, String)], budget: usize) -> (String, usize, Vec<String>) {
     let mut body = String::new();
+    let mut given = Vec::new();
     let mut used = estimate_tokens(RULES_TITLE) + 1;
     for (id, text) in rem {
         let item = format!("[{id}]\n{text}\n");
@@ -84,11 +86,12 @@ pub fn reminder_section(rem: &[(String, String)], budget: usize) -> (String, usi
         }
         used += cost;
         body.push_str(&item);
+        given.push(id.clone());
     }
     if body.is_empty() {
-        return (String::new(), 0);
+        return (String::new(), 0, given);
     }
-    (format!("{RULES_TITLE}\n{body}"), used)
+    (format!("{RULES_TITLE}\n{body}"), used, given)
 }
 
 /// One `<dotonce>` block: the rules section first, then the facts block's
@@ -103,37 +106,40 @@ fn compose(rules: &str, facts: Option<String>) -> Option<String> {
 }
 
 /// Turns on the sets this hook call matches and saves the session state.
-/// With `remind`, returns the reminders not given yet and marks them given.
+/// With a budget, returns the rules section of the reminders not given yet
+/// that fit in it, and its tokens, and marks only those reminders given.
 fn turn_on(
     v: &Value,
     cfg: &Config,
     cwd: &Path,
     event: Event,
-    remind: bool,
-) -> Result<Vec<(String, String)>> {
+    budget: Option<usize>,
+) -> Result<(String, usize)> {
     let (live, _) = approvals::load_live()?;
     if live.is_empty() {
-        return Ok(Vec::new());
+        return Ok((String::new(), 0));
     }
     let sid = session_id(v)?;
     let dir = session::dir()?;
     let mut state = session::load(&dir, sid)?;
     session::refresh(&mut state, &live, cfg, cwd, prompt_id(v), event);
-    let out = if remind {
-        session::take_reminders(&mut state, &live)
-    } else {
-        Vec::new()
-    };
+    let mut out = (String::new(), 0);
+    if let Some(budget) = budget {
+        let (text, used, given) =
+            reminder_section(&session::pending_reminders(&state, &live), budget);
+        session::mark_reminded(&mut state, &given);
+        out = (text, used);
+    }
     session::save(&dir, sid, &state)?;
     Ok(out)
 }
 
 /// Like `turn_on`, but a failure is logged and gives no reminders, so the
 /// facts still arrive.
-fn reminders_for(v: &Value, cfg: &Config, cwd: &Path, event: Event) -> Vec<(String, String)> {
-    turn_on(v, cfg, cwd, event, true).unwrap_or_else(|e| {
+fn reminders_for(v: &Value, cfg: &Config, cwd: &Path, event: Event) -> (String, usize) {
+    turn_on(v, cfg, cwd, event, Some(MAX_BUDGET)).unwrap_or_else(|e| {
         log_error(&format!("rules: {e:#}"));
-        Vec::new()
+        (String::new(), 0)
     })
 }
 
@@ -141,8 +147,7 @@ fn prompt(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
     let text = str_field(v, "prompt");
     let file_cfg = config::load_file()?;
     let cfg = file_cfg.clone().unwrap_or_default();
-    let rem = reminders_for(v, &cfg, cwd, Event::Prompt(text));
-    let (rules_text, used) = reminder_section(&rem, MAX_BUDGET);
+    let (rules_text, used) = reminders_for(v, &cfg, cwd, Event::Prompt(text));
     let mut facts_block = None;
     // Without a config, dotonce isn't set up yet: leave no index behind.
     if file_cfg.is_some() {
@@ -433,9 +438,10 @@ fn session_rules(v: &Value, cfg: &Config, cwd: &Path) -> Result<(String, usize, 
         bail!("the hook input has no session_id");
     };
     session::refresh(state, &live, cfg, cwd, prompt_id(v), Event::Other);
-    let rem = session::all_reminders(state, &live);
+    let rem = session::compact_reminders(state, &live, prompt_id(v));
+    let (text, used, given) = reminder_section(&rem, MAX_BUDGET);
+    session::mark_reminded(state, &given);
     session::save(&dir, sid, state)?;
-    let (text, used) = reminder_section(&rem, MAX_BUDGET);
     Ok((text, used, system))
 }
 
@@ -477,8 +483,7 @@ fn skill_named(v: &Value, cwd: &Path, name: &str, event_name: &str) -> Result<Op
         return Ok(None);
     }
     let cfg = config::load_file()?.unwrap_or_default();
-    let rem = turn_on(v, &cfg, cwd, Event::Skill(name), true)?;
-    let (text, _) = reminder_section(&rem, MAX_BUDGET);
+    let (text, _) = turn_on(v, &cfg, cwd, Event::Skill(name), Some(MAX_BUDGET))?;
     Ok(compose(&text, None).map(|b| context(event_name, &b)))
 }
 

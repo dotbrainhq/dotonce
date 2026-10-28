@@ -11,7 +11,11 @@ use serde::Serialize;
 use crate::approvals;
 use crate::checks::{self, Failure};
 use crate::config;
+use crate::retrieve::estimate_tokens;
 use crate::rules::{self, Level, RuleSet};
+
+/// A reminder this long leaves little room under the hooks' 2,000-token cap.
+const LONG_REMINDER: usize = 1_800;
 
 /// Writes a starter rule set. `whole` picks whole replies over fenced
 /// drafts; when it is None the user is asked on `input`, and an empty answer
@@ -51,6 +55,16 @@ pub fn rules_check() -> Result<()> {
     }
     for s in &loaded.sets {
         println!("ok     {} ({} checks)", s.id, s.checks.len());
+        if let Some(r) = &s.remind {
+            // The cost the hooks count for it: `[id]`, the text, two newlines.
+            let tokens = estimate_tokens(&format!("[{}]\n{}\n", s.id, r.text.trim()));
+            if tokens > LONG_REMINDER {
+                println!(
+                    "warn   {}: its reminder is about {tokens} tokens, over 1,800, so it may not fit under the hooks' 2,000-token cap",
+                    s.id
+                );
+            }
+        }
     }
     for e in &loaded.errors {
         println!("error  {}: {}", e.file.display(), e.error);
