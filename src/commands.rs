@@ -148,15 +148,7 @@ fn now_text() -> String {
 pub fn rules_approve(id: &str) -> Result<()> {
     approvals::refuse_agent()?;
     let set = find_set(id)?;
-    let a = approvals::load()?;
-    let level = a.sets.get(id).map_or(set.level, |x| x.level);
-    println!(
-        "{}: level {}, {} checks, file {}",
-        set.id,
-        level.as_str(),
-        set.checks.len(),
-        set.file.display()
-    );
+    print!("{}", approvals::summary(&set, &approvals::load()?));
     confirmed(id, &format!("approve {id}"))?;
     // Read again: the prompt can wait a long time, and saving the copy from
     // before it would drop any change made meanwhile.

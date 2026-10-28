@@ -1048,3 +1048,54 @@ fn changes_made_while_a_prompt_waits_are_kept() {
     }
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+#[test]
+fn approve_shows_the_checks_and_that_an_off_set_turns_on() {
+    let h = home("summary");
+    add_set(
+        &h,
+        "acme-replies",
+        "[[check]]\nid = \"no-x\"\nwhy = \"x reads badly\"\nforbid = [\"x\"]\n",
+    );
+    approve(&h, "acme-replies", "warn");
+    let json = h.join("dotonce/approvals.json");
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+    v["sets"]["acme-replies"]["off"] = serde_json::json!(true);
+    std::fs::write(&json, v.to_string()).unwrap();
+    let f = h.join("dotonce/rules/acme-replies.toml");
+    std::fs::write(&f, std::fs::read_to_string(&f).unwrap() + "# edited\n").unwrap();
+    let (out, err, ok) = run_full(
+        &h,
+        &h,
+        &["rules", "approve", "acme-replies"],
+        Some("acme-replies\n"),
+    );
+    assert!(!ok);
+    assert!(err.contains("terminal"), "{err}");
+    assert!(out.contains("  no-x (forbid): x reads badly"), "{out}");
+    assert!(out.contains("changed since the last approval"), "{out}");
+    assert!(out.contains("approving it turns it back on"), "{out}");
+    #[cfg(unix)]
+    {
+        approve(&h, "acme-replies", "warn");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+        v["sets"]["acme-replies"]["off"] = serde_json::json!(true);
+        std::fs::write(&json, v.to_string()).unwrap();
+        let (out, _) = run(&h, &["rules", "list"], None);
+        assert!(out.contains(" off "), "{out}");
+        if let Some((out, ok)) = run_pty(
+            &h,
+            &["rules", "approve", "acme-replies"],
+            "acme-replies\n",
+            || {},
+        ) {
+            assert!(ok, "{out}");
+            assert!(out.contains("approving it turns it back on"), "{out}");
+            let (out, _) = run(&h, &["rules", "list"], None);
+            assert!(out.contains("warn") && !out.contains(" off "), "{out}");
+        }
+    }
+    std::fs::remove_dir_all(&h).unwrap();
+}

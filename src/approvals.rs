@@ -124,6 +124,32 @@ impl Approvals {
     }
 }
 
+/// What `rules approve` shows before it asks: the level the approval gives,
+/// each check, and whether the file changed or the set is off.
+pub fn summary(set: &RuleSet, a: &Approvals) -> String {
+    let prev = a.sets.get(&set.id);
+    let level = prev.map_or(set.level, |p| p.level);
+    let mut s = format!(
+        "{}: level {}, {} checks, file {}\n",
+        set.id,
+        level.as_str(),
+        set.checks.len(),
+        set.file.display()
+    );
+    for c in &set.checks {
+        let _ = writeln!(s, "  {} ({}): {}", c.id, c.kind.name(), c.why);
+    }
+    if let Some(p) = prev {
+        if p.hash != hash(&set.src) {
+            s.push_str("The file changed since the last approval.\n");
+        }
+        if p.off {
+            s.push_str("The set is off now, and approving it turns it back on.\n");
+        }
+    }
+    s
+}
+
 pub fn path() -> Result<PathBuf> {
     Ok(home_dir()?.join("approvals.json"))
 }
@@ -292,6 +318,38 @@ mod tests {
                 "closed"
             )))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn approve_summary_shows_checks_and_what_changes() {
+        let s = set(
+            "id = \"acme\"\nlevel = \"fix\"\n[[check]]\nid = \"no-x\"\nwhy = \"x reads badly\"\nforbid = [\"x\"]\n",
+        );
+        let mut a = Approvals::default();
+        let first = summary(&s, &a);
+        assert!(
+            first.starts_with("acme: level fix, 1 checks, file /r/acme.toml\n"),
+            "{first}"
+        );
+        assert!(
+            first.contains("  no-x (forbid): x reads badly\n"),
+            "{first}"
+        );
+        assert!(!first.contains("since the last approval"), "{first}");
+        assert!(!first.contains("off now"), "{first}");
+        a.approve(&s, "t");
+        a.set_level(&s, Level::Remind).unwrap();
+        assert!(!summary(&s, &a).contains("since the last approval"));
+        let edited = set(&format!("{}# edited\n", s.src));
+        let again = summary(&edited, &a);
+        assert!(again.starts_with("acme: level remind,"), "{again}");
+        assert!(again.contains("changed since the last approval"), "{again}");
+        a.turn_off("acme").unwrap();
+        let off = summary(&s, &a);
+        assert!(
+            off.contains("off now, and approving it turns it back on"),
+            "{off}"
         );
     }
 
