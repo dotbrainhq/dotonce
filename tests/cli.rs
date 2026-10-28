@@ -907,3 +907,144 @@ fn rules_off_on_an_approved_set_needs_a_terminal() {
     assert!(out.contains("warn"), "{out}");
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+/// Runs a command under a pseudo-terminal, copying its output to stdout and
+/// stdin to it, so tests can reach the approve, level and off prompts.
+#[cfg(unix)]
+const PTY_DRIVER: &str = r#"
+import os, pty, select, sys
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(sys.argv[1], sys.argv[1:])
+ins = [0]
+while True:
+    r, _, _ = select.select([fd] + ins, [], [], 30)
+    if not r:
+        break
+    if fd in r:
+        try:
+            b = os.read(fd, 4096)
+        except OSError:
+            b = b""
+        if not b:
+            break
+        os.write(1, b)
+    if 0 in r:
+        b = os.read(0, 4096)
+        if b:
+            os.write(fd, b)
+        else:
+            ins = []
+_, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+"#;
+
+/// Runs dotonce under a pty, waits for the confirmation prompt, calls
+/// `meanwhile`, then types `typed`. Returns the output and whether it exited
+/// 0, or None when python3 isn't installed.
+#[cfg(unix)]
+fn run_pty(
+    h: &Path,
+    args: &[&str],
+    typed: &str,
+    meanwhile: impl FnOnce(),
+) -> Option<(String, bool)> {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+    let mut cmd = Command::new("python3");
+    cmd.args(["-I", "-c", PTY_DRIVER, env!("CARGO_BIN_EXE_dotonce")])
+        .args(args)
+        .current_dir(h)
+        .env("DOTONCE_HOME", h.join("dotonce"))
+        .env("HOME", h);
+    for v in AGENT_VARS {
+        cmd.env_remove(v);
+    }
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut out = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = out.read(&mut buf) {
+            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !String::from_utf8_lossy(&seen).contains("press Return: ") {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(b) => seen.extend(b),
+            Err(_) => {
+                let _ = child.kill();
+                panic!(
+                    "no prompt from {args:?}: {}",
+                    String::from_utf8_lossy(&seen)
+                );
+            }
+        }
+    }
+    meanwhile();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(typed.as_bytes()).unwrap();
+    drop(stdin);
+    let status = child.wait().unwrap();
+    reader.join().unwrap();
+    seen.extend(rx.try_iter().flatten());
+    Some((String::from_utf8_lossy(&seen).to_string(), status.success()))
+}
+
+#[cfg(unix)]
+#[test]
+fn changes_made_while_a_prompt_waits_are_kept() {
+    let h = home("waits");
+    add_set(&h, "acme-replies", "");
+    let json = h.join("dotonce/approvals.json");
+    let read = || -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap()
+    };
+    let Some((out, ok)) = run_pty(
+        &h,
+        &["rules", "approve", "acme-replies"],
+        "acme-replies\n",
+        || approve_src(&h, "beta", "id = \"beta\"\n", "warn"),
+    ) else {
+        eprintln!("python3 isn't installed, skipping");
+        return;
+    };
+    assert!(ok && out.contains("approved acme-replies"), "{out}");
+    let v = read();
+    assert_eq!(v["sets"]["acme-replies"]["level"], "warn", "{v}");
+    assert!(v["sets"]["beta"].is_object(), "{v}");
+    let (out, ok) = run_pty(
+        &h,
+        &["rules", "level", "acme-replies", "fix"],
+        "acme-replies\n",
+        || approve_src(&h, "gamma", "id = \"gamma\"\n", "warn"),
+    )
+    .unwrap();
+    assert!(ok, "{out}");
+    let v = read();
+    assert_eq!(v["sets"]["acme-replies"]["level"], "fix", "{v}");
+    assert!(v["sets"]["gamma"].is_object(), "{v}");
+    let (out, ok) = run_pty(
+        &h,
+        &["rules", "off", "acme-replies"],
+        "acme-replies\n",
+        || approve_src(&h, "delta", "id = \"delta\"\n", "warn"),
+    )
+    .unwrap();
+    assert!(ok, "{out}");
+    let v = read();
+    assert_eq!(v["sets"]["acme-replies"]["off"], true, "{v}");
+    for id in ["beta", "gamma", "delta"] {
+        assert!(v["sets"][id].is_object(), "{id}: {v}");
+    }
+    std::fs::remove_dir_all(&h).unwrap();
+}

@@ -148,7 +148,7 @@ fn now_text() -> String {
 pub fn rules_approve(id: &str) -> Result<()> {
     approvals::refuse_agent()?;
     let set = find_set(id)?;
-    let mut a = approvals::load()?;
+    let a = approvals::load()?;
     let level = a.sets.get(id).map_or(set.level, |x| x.level);
     println!(
         "{}: level {}, {} checks, file {}",
@@ -158,6 +158,9 @@ pub fn rules_approve(id: &str) -> Result<()> {
         set.file.display()
     );
     confirmed(id, &format!("approve {id}"))?;
+    // Read again: the prompt can wait a long time, and saving the copy from
+    // before it would drop any change made meanwhile.
+    let mut a = approvals::load()?;
     let level = a.approve(&set, &now_text());
     approvals::save(&a)?;
     println!("approved {id} at level {}", level.as_str());
@@ -168,8 +171,8 @@ pub fn rules_level(id: &str, level: &str) -> Result<()> {
     approvals::refuse_agent()?;
     let level = Level::parse(level)?;
     let set = find_set(id)?;
-    let mut a = approvals::load()?;
     confirmed(id, &format!("set {id} to {}", level.as_str()))?;
+    let mut a = approvals::load()?;
     a.set_level(&set, level)?;
     approvals::save(&a)?;
     println!("{id} is now at level {}", level.as_str());
@@ -178,11 +181,11 @@ pub fn rules_level(id: &str, level: &str) -> Result<()> {
 
 pub fn rules_off(id: &str) -> Result<()> {
     approvals::refuse_agent()?;
-    let mut a = approvals::load()?;
-    if !a.sets.contains_key(id) {
+    if !approvals::load()?.sets.contains_key(id) {
         bail!("{id} isn't approved, so it's already off");
     }
     confirmed(id, &format!("turn {id} off"))?;
+    let mut a = approvals::load()?;
     a.turn_off(id)?;
     approvals::save(&a)?;
     println!("{id} is off. Turn it on again with dotonce rules level {id} <level>");
