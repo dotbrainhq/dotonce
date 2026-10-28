@@ -2036,3 +2036,98 @@ fn the_stop_continuation_in_the_session_record_is_not_a_new_turn() {
     );
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+#[test]
+fn display_hook_holds_a_broken_draft_back() {
+    let h = ticket_home("display", "fix");
+    use_skill(&h, "s1", "p1");
+    let shown = |out: &str| -> Option<String> {
+        if out.trim().is_empty() {
+            return None;
+        }
+        let v: serde_json::Value = serde_json::from_str(out).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "MessageDisplay");
+        Some(
+            v["hookSpecificOutput"]["displayContent"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        )
+    };
+    let batch = |mid: &str, i: u32, last: bool, delta: &str| {
+        hook(
+            &h,
+            "display",
+            serde_json::json!({"session_id": "s1", "turn_id": "p1", "message_id": mid, "index": i, "final": last, "delta": delta}),
+        )
+    };
+    assert_eq!(
+        shown(&batch("m1", 0, false, "Draft:\n```markdown\nHi Sam,\n")).as_deref(),
+        Some("Draft:\n")
+    );
+    let out = shown(&batch("m1", 1, true, "Sorry for the wait.\n```\n")).unwrap();
+    assert!(out.starts_with("(dotonce held back a draft"), "{out}");
+    assert_eq!(batch("m2", 0, true, "Plain reply.\n"), "");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn display_hook_never_loses_held_lines() {
+    let h = ticket_home("displaysafe", "fix");
+    use_skill(&h, "s1", "p1");
+    let batch = |input: serde_json::Value| -> Option<String> {
+        let out = hook(&h, "display", input);
+        if out.trim().is_empty() {
+            return None;
+        }
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        Some(
+            v["hookSpecificOutput"]["displayContent"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        )
+    };
+    let at = |mid: &str, i: u32, last: bool, delta: &str| serde_json::json!({"session_id": "s1", "message_id": mid, "index": i, "final": last, "delta": delta});
+    let open = "Draft:\n```markdown\nHi Sam,\n";
+    let held = "```markdown\nHi Sam,\nSorry for the wait.\n";
+
+    assert_eq!(batch(at("m1", 0, false, open)).as_deref(), Some("Draft:\n"));
+    let approvals = h.join("dotonce/approvals.json");
+    let saved = std::fs::read_to_string(&approvals).unwrap();
+    std::fs::write(&approvals, "not json").unwrap();
+    assert_eq!(
+        batch(at("m1", 1, false, "Sorry for the wait.\n")).as_deref(),
+        Some(held),
+        "a hook error shows what was held"
+    );
+    std::fs::write(&approvals, saved).unwrap();
+    assert_eq!(
+        batch(at("m1", 2, true, "```\n")),
+        None,
+        "the rest of the message shows as it is"
+    );
+    assert!(
+        std::fs::read_to_string(h.join("dotonce/errors.log"))
+            .unwrap()
+            .contains("display")
+    );
+
+    assert_eq!(batch(at("m2", 0, false, open)).as_deref(), Some("Draft:\n"));
+    assert_eq!(
+        batch(at("m2", 2, false, "Sorry for the wait.\n")).as_deref(),
+        Some(held),
+        "a skipped batch shows what was held"
+    );
+    assert_eq!(batch(at("m2", 3, true, "```\n")), None);
+
+    let no_final =
+        |delta: &str| serde_json::json!({"session_id": "s1", "message_id": "m3", "delta": delta});
+    assert_eq!(
+        batch(no_final(open)),
+        None,
+        "without a final flag nothing is held past the batch"
+    );
+    assert_eq!(batch(no_final("Sorry for the wait.\n```\n")), None);
+    std::fs::remove_dir_all(&h).unwrap();
+}

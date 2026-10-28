@@ -138,6 +138,11 @@ pub fn save(dir: &Path, session_id: &str, state: &State) -> Result<()> {
     Ok(())
 }
 
+/// Where the MessageDisplay hook keeps the lines it holds back.
+pub fn display_file(dir: &Path, session_id: &str) -> Result<PathBuf> {
+    Ok(dir.join(format!("{}.display.json", safe_name(session_id)?)))
+}
+
 /// The id of the most recently written session file.
 pub fn newest(dir: &Path) -> Option<String> {
     fs::read_dir(dir)

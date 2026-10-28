@@ -3,6 +3,7 @@ pub mod catches;
 pub mod checks;
 pub mod commands;
 pub mod config;
+pub mod display;
 pub mod fact;
 pub mod facts;
 pub mod fuse;
