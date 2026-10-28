@@ -29,8 +29,9 @@ pub fn label(ids: &[String]) -> String {
 ///
 /// Saved in `sessions/<sid>.display.json`. After an interrupted message
 /// (Esc, an API error) that never sends its last batch, the draft's lines
-/// stay in that file until the next message replaces them or the 7-day
-/// sweep of old session files removes it. It is never logged.
+/// and the unfinished last line stay in that file until the next message
+/// replaces them or the 7-day sweep of old session files removes it. It is
+/// never logged.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DraftCopy {
     pub message_id: String,
