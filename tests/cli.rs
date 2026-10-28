@@ -2179,3 +2179,44 @@ fn a_draft_after_the_send_back_always_shows() {
     assert!(out.contains("(dotonce held back a draft"), "{out}");
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+#[test]
+fn an_interrupted_draft_shows_with_the_next_message() {
+    let h = ticket_home("displaystop", "fix");
+    use_skill(&h, "s1", "p1");
+    let at = |mid: &str, i: u32, last: bool, delta: &str| serde_json::json!({"session_id": "s1", "prompt_id": "p1", "message_id": mid, "index": i, "final": last, "delta": delta});
+    let note = "(dotonce: an earlier draft, not checked because the reply was interrupted)\n";
+    assert_eq!(
+        display_out(
+            &h,
+            at(
+                "m1",
+                0,
+                false,
+                "Draft:\n```markdown\nHi Sam,\nSorry for the wa"
+            )
+        )
+        .as_deref(),
+        Some("Draft:\n")
+    );
+    assert_eq!(
+        display_out(
+            &h,
+            at("m2", 0, false, "Plain reply.\n```markdown\nHi Sam,\n")
+        ),
+        Some(format!(
+            "{note}```markdown\nHi Sam,\nSorry for the wa\nPlain reply.\n"
+        )),
+        "the held lines show first, then the new message, whose draft is held"
+    );
+    assert_eq!(
+        display_out(&h, at("m2", 1, true, "Thanks for the details.\n```\n")).as_deref(),
+        Some("```markdown\nHi Sam,\nThanks for the details.\n```\n")
+    );
+    assert_eq!(
+        display_out(&h, at("m3", 0, true, "Plain reply.\n")),
+        None,
+        "nothing is shown twice"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}

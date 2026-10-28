@@ -16,6 +16,8 @@ use crate::session;
 
 pub const HELD_NOTE: &str =
     "(dotonce held back a draft that breaks your rules. The corrected draft follows.)";
+pub const INTERRUPTED_NOTE: &str =
+    "(dotonce: an earlier draft, not checked because the reply was interrupted)";
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Held {
@@ -159,7 +161,16 @@ pub fn display(v: &Value) -> Result<Option<String>> {
     let message = str_field(v, "message_id");
     let mut held = load_held(&path);
     let same = held.message_id == message;
+    // Lines still held from another message: that message stopped before its
+    // final batch (Esc), so they show now, ahead of this one.
+    let mut stale = String::new();
     if !same {
+        if !held.lines.is_empty() {
+            stale = format!("{INTERRUPTED_NOTE}\n{}", held.lines.concat());
+            if !stale.ends_with('\n') {
+                stale.push('\n');
+            }
+        }
         held = Held {
             message_id: message.to_string(),
             ..Held::default()
@@ -169,7 +180,9 @@ pub fn display(v: &Value) -> Result<Option<String>> {
     // Without a final flag, nothing is held past this batch.
     let last = v.get("final").and_then(Value::as_bool).unwrap_or(true);
     let mut shown = match fix_sets(live, &dir, sid, prompt_id(v)) {
-        Ok(fix) if fix.is_empty() && held.lines.is_empty() => return Ok(None),
+        Ok(fix) if fix.is_empty() && held.lines.is_empty() && stale.is_empty() => {
+            return Ok(None);
+        }
         Ok(fix) => {
             if let Some(i) = v.get("index").and_then(Value::as_u64) {
                 held.pass |= i != if same { held.next } else { 0 };
@@ -194,6 +207,7 @@ pub fn display(v: &Value) -> Result<Option<String>> {
         shown.push_str(&held.lines.concat());
         let _ = fs::remove_file(&path);
     }
+    shown.insert_str(0, &stale);
     if shown == delta {
         return Ok(None);
     }
