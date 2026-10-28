@@ -3440,3 +3440,34 @@ fn pre_tool_reads_the_session_file_only_with_rule_sets() {
     );
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+#[test]
+fn tool_check_paths_match_the_normalized_path() {
+    let h = home("toolnorm");
+    let proj = h.join("proj");
+    std::fs::create_dir_all(proj.join("docs")).unwrap();
+    std::fs::create_dir_all(proj.join("src")).unwrap();
+    let src = proj.join("src").to_string_lossy().to_string();
+    add_set(
+        &h,
+        "src-todo",
+        &format!(
+            "[when]\nfolders = [{:?}]\n[[check]]\nid = \"no-todo-in-src\"\non = \"tool\"\ntool = \"Write\"\npath = [{:?}]\nforbid = [\"TODO\"]\nwhy = \"No TODOs in src.\"\n",
+            proj.to_string_lossy(),
+            format!("{src}/*.rs")
+        ),
+    );
+    approve(&h, "src-todo", "fix");
+    let write = |p: &str| serde_json::json!({"file_path": p, "content": "// TODO"});
+    let docs = proj.join("docs");
+    assert_eq!(
+        pre(&h, &docs, "Write", write("../src/a.rs")).as_deref(),
+        Some("no-todo-in-src: No TODOs in src.")
+    );
+    assert_eq!(
+        pre(&h, &proj, "Write", write("./src/./b.rs")).as_deref(),
+        Some("no-todo-in-src: No TODOs in src.")
+    );
+    assert_eq!(pre(&h, &docs, "Write", write("a.rs")), None);
+    std::fs::remove_dir_all(&h).unwrap();
+}

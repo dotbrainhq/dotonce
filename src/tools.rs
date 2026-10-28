@@ -987,9 +987,11 @@ pub fn pre_tool(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
         mut state,
         turn,
     } = session::checks_with(live, &before, cwd, prompt_id(v))?;
-    let abs = path
-        .filter(|p| !p.is_empty())
-        .map(|p| cwd.join(p).to_string_lossy().into_owned());
+    let abs = path.filter(|p| !p.is_empty()).map(|p| {
+        lexical_normalize(&cwd.join(p))
+            .to_string_lossy()
+            .into_owned()
+    });
     let time = catches::timestamp(now);
     let mut reasons = Vec::new();
     for l in session::checking(&state, &live) {
