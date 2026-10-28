@@ -472,7 +472,7 @@ pub fn turn_key(state: &State, prompt_id: Option<&str>) -> String {
 /// The live sets and the session state as Stop sees them for one hook call.
 pub struct Now {
     pub live: Vec<Live>,
-    /// A refreshed copy of the session state. Only Stop saves it.
+    /// A refreshed copy of the session state. Only Stop and PreToolUse save it.
     pub state: State,
     pub turn: String,
 }

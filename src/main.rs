@@ -100,6 +100,12 @@ enum RulesCmd {
         /// Print the result as JSON.
         #[arg(long)]
         json: bool,
+        /// Run this tool's checks instead, reading the file as the tool's text.
+        #[arg(long)]
+        tool: Option<String>,
+        /// The file path a Write, Edit, MultiEdit or NotebookEdit call would have.
+        #[arg(long, requires = "tool")]
+        path: Option<String>,
     },
     /// Approve a set as its file is now. Needs a terminal and the typed id.
     Approve { id: String },
@@ -130,7 +136,13 @@ fn rules_cmd(cmd: RulesCmd) -> Result<()> {
             Ok(())
         }
         RulesCmd::Check => commands::rules_check(),
-        RulesCmd::Test { id, file, json } => commands::rules_test(&id, &file, json),
+        RulesCmd::Test {
+            id,
+            file,
+            json,
+            tool,
+            path,
+        } => commands::rules_test(&id, &file, json, tool.as_deref(), path.as_deref()),
         RulesCmd::Approve { id } => commands::rules_approve(&id),
         RulesCmd::Level { id, level } => commands::rules_level(&id, &level),
         RulesCmd::Off { id } => commands::rules_off(&id),

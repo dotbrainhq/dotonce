@@ -4,6 +4,7 @@
 //! UserPromptExpansion turn on the rule sets for a skill.
 //! Stop runs the reply checks (see reply.rs); MessageDisplay labels a broken
 //! draft on screen (see display.rs).
+//! PreToolUse runs tool checks and the rules guard (see tools.rs).
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -33,6 +34,7 @@ const EVENTS: &[&str] = &[
     "expansion",
     "stop",
     "display",
+    "pre-tool",
 ];
 
 /// Handles one Claude Code hook call. Returns the JSON to print, or None when
@@ -53,6 +55,7 @@ pub fn handle(event: &str, input: &str, now: i64) -> Result<Option<String>> {
         "skill" => skill(&v, &cwd),
         "stop" => crate::reply::stop(&v, &cwd, now),
         "display" => crate::display::display(&v, &cwd),
+        "pre-tool" => crate::tools::pre_tool(&v, &cwd, now),
         _ => expansion(&v, &cwd),
     }
 }

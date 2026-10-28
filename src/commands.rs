@@ -13,6 +13,7 @@ use crate::checks::{self, Failure};
 use crate::config;
 use crate::retrieve::estimate_tokens;
 use crate::rules::{self, Level, RuleSet};
+use crate::tools;
 
 /// A reminder this long leaves little room under the hooks' 2,000-token cap.
 const LONG_REMINDER: usize = 1_800;
@@ -114,12 +115,24 @@ fn print_failures(fails: &[Failure]) {
     }
 }
 
-/// Runs a set's reply checks on a text file, approved or not.
-pub fn rules_test(id: &str, file: &Path, json: bool) -> Result<()> {
+/// Runs a set's checks on a text file, approved or not: the reply checks, or
+/// with `tool` that tool's checks, reading the file as the tool's text.
+pub fn rules_test(
+    id: &str,
+    file: &Path,
+    json: bool,
+    tool: Option<&str>,
+    path: Option<&str>,
+) -> Result<()> {
     let set = find_set(id)?;
     let text = fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
-    let drafts = checks::drafts(&set, &text).len();
-    let fails = checks::run_reply(&set, &text);
+    let (drafts, fails) = match tool {
+        Some(t) => (1, tools::run_tool(&set, t, path, &text)),
+        None => (
+            checks::drafts(&set, &text).len(),
+            checks::run_reply(&set, &text),
+        ),
+    };
     if json {
         let report = TestReport {
             drafts,

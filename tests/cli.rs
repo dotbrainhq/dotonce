@@ -2877,3 +2877,373 @@ fn another_hooks_added_context_is_not_the_send_back() {
     );
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+/// Runs the PreToolUse hook and returns the deny reason, or None when the
+/// call may run.
+fn pre(h: &Path, cwd: &Path, tool: &str, input: serde_json::Value) -> Option<String> {
+    let out = hook(
+        h,
+        "pre-tool",
+        serde_json::json!({"session_id": "s1", "prompt_id": "p1", "hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": input, "cwd": cwd}),
+    );
+    if out.trim().is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+    Some(
+        v["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    )
+}
+
+#[test]
+fn guard_keeps_rule_files_and_approvals_out_of_reach_with_no_rule_sets() {
+    let h = home("guard");
+    let proj = h.join("proj");
+    let d = h.join("dotonce");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::create_dir_all(&d).unwrap();
+    let p = |rel: &str| d.join(rel).to_string_lossy().to_string();
+    let denied = [
+        (
+            "Write",
+            serde_json::json!({"file_path": p("rules/acme.toml"), "content": "id = \"acme\""}),
+        ),
+        (
+            "Edit",
+            serde_json::json!({"file_path": p("approvals.json"), "old_string": "a", "new_string": "b"}),
+        ),
+        (
+            "MultiEdit",
+            serde_json::json!({"file_path": p("rules/acme.toml"), "edits": [{"old_string": "a", "new_string": "b"}]}),
+        ),
+        (
+            "NotebookEdit",
+            serde_json::json!({"notebook_path": p("rules/x.ipynb"), "new_source": "x"}),
+        ),
+        (
+            "Bash",
+            serde_json::json!({"command": "cat > ~/dotonce/rules/acme.toml"}),
+        ),
+        (
+            "Bash",
+            serde_json::json!({"command": "echo '{}' > $HOME/dotonce/approvals.json"}),
+        ),
+        (
+            "Bash",
+            serde_json::json!({"command": format!("rm {}", p("rules/acme.toml"))}),
+        ),
+        (
+            "Bash",
+            serde_json::json!({"command": "cd ~/dotonce && rm rules/acme.toml"}),
+        ),
+    ];
+    for (tool, input) in denied {
+        let reason =
+            pre(&h, &proj, tool, input.clone()).unwrap_or_else(|| panic!("{tool} {input}"));
+        assert!(reason.contains("own terminal"), "{reason}");
+    }
+    assert!(
+        pre(
+            &h,
+            &d,
+            "Write",
+            serde_json::json!({"file_path": "rules/acme.toml", "content": "x"})
+        )
+        .is_some()
+    );
+    let allowed = [
+        (
+            "Write",
+            serde_json::json!({"file_path": proj.join("a.txt"), "content": "x"}),
+        ),
+        (
+            "Bash",
+            serde_json::json!({"command": "grep -rn \"dotonce rules approve\" src"}),
+        ),
+        (
+            "Bash",
+            serde_json::json!({"command": "git commit -m \"Add the dotonce rules approve command\""}),
+        ),
+        ("Bash", serde_json::json!({"command": "ls ~/dotonce/notes"})),
+        (
+            "Read",
+            serde_json::json!({"file_path": p("rules/acme.toml")}),
+        ),
+    ];
+    for (tool, input) in allowed {
+        assert_eq!(pre(&h, &proj, tool, input.clone()), None, "{tool} {input}");
+    }
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+const CODE_CHECKS: &str = "[[check]]\nid = \"no-force-push\"\non = \"tool\"\ntool = \"Bash\"\nforbid_regex = 'git\\s+push\\b.*(--force|-f\\b)'\nwhy = \"Never force push. Ask first.\"\n[[check]]\nid = \"no-todo-in-rust\"\non = \"tool\"\ntool = \"Write\"\npath = [\"*.rs\"]\nforbid = [\"TODO\"]\nwhy = \"No TODOs in Rust files.\"\n[[check]]\nid = \"no-unwrap\"\non = \"tool\"\ntool = \"Edit\"\nforbid = [\"unwrap()\"]\nwhy = \"Handle the error.\"\n[[check]]\nid = \"no-unwrap-multi\"\non = \"tool\"\ntool = \"MultiEdit\"\nforbid = [\"unwrap()\"]\nwhy = \"Handle the error.\"\n[[check]]\nid = \"no-print\"\non = \"tool\"\ntool = \"NotebookEdit\"\nforbid = [\"print(\"]\nwhy = \"Use the logger.\"\n";
+
+fn code_home(name: &str, level: &str) -> (PathBuf, PathBuf) {
+    let h = home(name);
+    let proj = h.join("proj");
+    std::fs::create_dir_all(proj.join("src")).unwrap();
+    add_set(
+        &h,
+        "code-safety",
+        &format!(
+            "[when]\nfolders = [{:?}]\n{CODE_CHECKS}",
+            proj.to_string_lossy()
+        ),
+    );
+    approve(&h, "code-safety", level);
+    (h, proj)
+}
+
+#[test]
+fn tool_checks_read_each_tool_field_and_deny_at_fix() {
+    let (h, proj) = code_home("toolfix", "fix");
+    let bash = |cmd: &str| serde_json::json!({"command": cmd});
+    assert_eq!(
+        pre(&h, &proj, "Bash", bash("git push --force origin main")).as_deref(),
+        Some("no-force-push: Never force push. Ask first.")
+    );
+    assert!(pre(&h, &proj, "Bash", bash("git push -f")).is_some());
+    assert_eq!(pre(&h, &proj, "Bash", bash("git push origin main")), None);
+    let rs = proj.join("src/main.rs");
+    assert!(
+        pre(
+            &h,
+            &proj,
+            "Write",
+            serde_json::json!({"file_path": rs, "content": "// TODO: later"})
+        )
+        .unwrap()
+        .starts_with("no-todo-in-rust")
+    );
+    assert_eq!(
+        pre(
+            &h,
+            &proj,
+            "Write",
+            serde_json::json!({"file_path": proj.join("notes.md"), "content": "TODO"})
+        ),
+        None
+    );
+    assert!(
+        pre(
+            &h,
+            &proj,
+            "Edit",
+            serde_json::json!({"file_path": rs, "old_string": "a", "new_string": "x.unwrap()"})
+        )
+        .unwrap()
+        .starts_with("no-unwrap")
+    );
+    assert!(pre(&h, &proj, "MultiEdit", serde_json::json!({"file_path": rs, "edits": [{"old_string": "a", "new_string": "ok"}, {"old_string": "b", "new_string": "y.unwrap()"}]})).unwrap().starts_with("no-unwrap-multi"));
+    assert!(
+        pre(
+            &h,
+            &proj,
+            "NotebookEdit",
+            serde_json::json!({"notebook_path": proj.join("n.ipynb"), "new_source": "print(1)"})
+        )
+        .unwrap()
+        .starts_with("no-print")
+    );
+    assert_eq!(
+        pre(&h, &h, "Bash", bash("git push --force")),
+        None,
+        "outside the folder the set is off"
+    );
+    let got = outcomes(&h, "catches.jsonl");
+    assert_eq!(got.len(), 6, "{got:?}");
+    assert!(got.iter().all(|(_, o)| o == "denied"), "{got:?}");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn tool_checks_at_warn_only_log() {
+    let (h, proj) = code_home("toolwarn", "warn");
+    assert_eq!(
+        pre(
+            &h,
+            &proj,
+            "Bash",
+            serde_json::json!({"command": "git push --force"})
+        ),
+        None
+    );
+    assert_eq!(
+        outcomes(&h, "catches.jsonl"),
+        pairs(&[("no-force-push", "caught")])
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn rules_test_runs_tool_checks_too() {
+    let (h, _) = code_home("tooltest", "warn");
+    let file = h.join("cmd.txt");
+    std::fs::write(&file, "git push --force origin main").unwrap();
+    let f = file.to_string_lossy().to_string();
+    let (out, ok) = run(
+        &h,
+        &["rules", "test", "code-safety", &f, "--tool", "Bash"],
+        None,
+    );
+    assert!(ok, "{out}");
+    assert!(out.contains("no-force-push"), "{out}");
+    std::fs::write(&file, "// TODO").unwrap();
+    let (out, _) = run(
+        &h,
+        &[
+            "rules",
+            "test",
+            "code-safety",
+            &f,
+            "--tool",
+            "Write",
+            "--path",
+            "/code/a.rs",
+        ],
+        None,
+    );
+    assert!(out.contains("no-todo-in-rust"), "{out}");
+    let (out, _) = run(
+        &h,
+        &[
+            "rules",
+            "test",
+            "code-safety",
+            &f,
+            "--tool",
+            "Write",
+            "--path",
+            "/code/a.md",
+        ],
+        None,
+    );
+    assert!(out.contains("passes"), "{out}");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn guard_covers_last_live_and_rule_changing_commands() {
+    let h = home("guardextra");
+    let proj = h.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let last = h
+        .join("dotonce/last-live.json")
+        .to_string_lossy()
+        .to_string();
+    let bash = |cmd: &str| serde_json::json!({"command": cmd});
+    let denied = [
+        (
+            "Write",
+            serde_json::json!({"file_path": last, "content": "{}"}),
+        ),
+        (
+            "Edit",
+            serde_json::json!({"file_path": last, "old_string": "a", "new_string": "b"}),
+        ),
+        ("Bash", bash("echo '{}' > ~/dotonce/last-live.json")),
+        ("Bash", bash("dotonce rules approve acme")),
+        (
+            "Bash",
+            bash("env -u CLAUDECODE dotonce rules level acme fix"),
+        ),
+        (
+            "Bash",
+            bash("script -q /dev/null ~/.cargo/bin/dotonce rules off acme"),
+        ),
+        ("Bash", bash("cd /tmp && dotonce rules pause acme")),
+    ];
+    for (tool, input) in denied {
+        let reason =
+            pre(&h, &proj, tool, input.clone()).unwrap_or_else(|| panic!("{tool} {input}"));
+        assert!(reason.contains("own terminal"), "{reason}");
+    }
+    for cmd in [
+        "grep -rn \"dotonce rules approve\" src",
+        "git commit -m \"Add the dotonce rules approve command\"",
+        "dotonce rules list",
+    ] {
+        assert_eq!(pre(&h, &proj, "Bash", bash(cmd)), None, "{cmd}");
+    }
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+/// Runs the PreToolUse hook with extra environment variables and returns
+/// the deny reason, or None.
+fn pre_env(
+    h: &Path,
+    cwd: &Path,
+    tool: &str,
+    input: serde_json::Value,
+    env: &[(&str, &str)],
+) -> Option<String> {
+    let json = serde_json::json!({"session_id": "s1", "prompt_id": "p1", "hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": input, "cwd": cwd});
+    let (out, _, ok) = run_env(h, cwd, &["hook", "pre-tool"], Some(&json.to_string()), env);
+    assert!(ok);
+    if out.trim().is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    Some(
+        v["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    )
+}
+
+#[test]
+fn guard_follows_dotonce_home() {
+    let h = home("guardhome");
+    let proj = h.join("proj");
+    let custom = h.join("elsewhere/dot");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::create_dir_all(&custom).unwrap();
+    let env = [("DOTONCE_HOME", custom.to_str().unwrap())];
+    let write = |p: PathBuf| serde_json::json!({"file_path": p, "content": "x"});
+    for name in ["rules/acme.toml", "approvals.json", "last-live.json"] {
+        assert!(
+            pre_env(&h, &proj, "Write", write(custom.join(name)), &env).is_some(),
+            "{name}"
+        );
+    }
+    let cmd = format!("rm {}", custom.join("last-live.json").display());
+    assert!(pre_env(&h, &proj, "Bash", serde_json::json!({"command": cmd}), &env).is_some());
+    assert_eq!(
+        pre_env(
+            &h,
+            &proj,
+            "Write",
+            write(h.join("dotonce/rules/acme.toml")),
+            &env
+        ),
+        None,
+        "the default home is not the home now"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn a_repeated_warn_tool_catch_is_logged_once_per_turn() {
+    let (h, proj) = code_home("toolwarnonce", "warn");
+    let push = serde_json::json!({"command": "git push --force"});
+    assert_eq!(pre(&h, &proj, "Bash", push.clone()), None);
+    assert_eq!(pre(&h, &proj, "Bash", push.clone()), None);
+    assert_eq!(
+        outcomes(&h, "catches.jsonl"),
+        pairs(&[("no-force-push", "caught")])
+    );
+    let next = serde_json::json!({"session_id": "s1", "prompt_id": "p2", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": push, "cwd": proj});
+    assert!(hook(&h, "pre-tool", next).trim().is_empty());
+    assert_eq!(
+        outcomes(&h, "catches.jsonl").len(),
+        2,
+        "the next turn logs again"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
