@@ -2787,6 +2787,38 @@ fn display_never_writes_the_session_state() {
 }
 
 #[test]
+fn disabled_hooks_mean_no_label() {
+    let h = ticket_home("displaydisabled", "fix");
+    register_stop(&h);
+    for sid in ["s1", "s2", "s3"] {
+        use_skill(&h, sid, "p1");
+    }
+    let proj = h.join("proj");
+    std::fs::create_dir_all(proj.join(".claude")).unwrap();
+    assert_eq!(show_draft(&h, &proj, "s3", "p1", "m1"), labeled(), "setup");
+    let local = proj.join(".claude/settings.local.json");
+    std::fs::write(&local, r#"{"disableAllHooks": true}"#).unwrap();
+    assert_eq!(
+        show_draft(&h, &proj, "s1", "p1", "m1"),
+        None,
+        "the project's local settings turn every hook off"
+    );
+    std::fs::write(&local, r#"{"disableAllHooks": false}"#).unwrap();
+    assert_eq!(show_draft(&h, &proj, "s1", "p1", "m2"), labeled());
+    let user = h.join(".claude/settings.json");
+    let mut settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&user).unwrap()).unwrap();
+    settings["disableAllHooks"] = serde_json::json!(true);
+    std::fs::write(&user, settings.to_string()).unwrap();
+    assert_eq!(
+        show_draft(&h, &proj, "s2", "p1", "m1"),
+        None,
+        "the file that adds the Stop hook also turns hooks off"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
 fn an_unreadable_settings_file_means_no_label() {
     let h = ticket_home("displaybadsettings", "fix");
     register_stop(&h);

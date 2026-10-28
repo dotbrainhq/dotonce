@@ -247,7 +247,8 @@ pub fn display(v: &Value, cwd: &Path) -> Result<Option<String>> {
 /// that has a fix set, so display never writes the session state Stop
 /// keeps. Reads Claude Code's user settings and the project's settings
 /// under `cwd`, without changing them. A file that exists but can't be read
-/// or parsed counts as no Stop hook.
+/// or parsed, or one that sets `"disableAllHooks": true`, counts as no Stop
+/// hook.
 fn settings_run_stop(cwd: &Path) -> bool {
     let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
         return false;
@@ -267,6 +268,9 @@ fn settings_run_stop(cwd: &Path) -> bool {
         let Ok(settings) = serde_json::from_str::<Value>(&src) else {
             return false;
         };
+        if settings.get("disableAllHooks").and_then(Value::as_bool) == Some(true) {
+            return false;
+        }
         found |= runs_stop(&settings);
     }
     found
