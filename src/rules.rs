@@ -1,9 +1,11 @@
 //! Rule set files: one TOML file per set in `~/.dotonce/rules/`. Parsing is
 //! strict, and a file with any error is skipped whole, never half-loaded.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -78,13 +80,78 @@ pub enum On {
 /// The tools a tool check can name.
 pub const TOOLS: [&str; 5] = ["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"];
 
+/// Every pattern this process has compiled, by its source, so a pattern
+/// shared by several sets compiles once.
+static COMPILED: LazyLock<Mutex<HashMap<String, Result<Regex, String>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// A check's regex, kept as its source and compiled on first use, so a hook
+/// pays only for the patterns it runs. Commands compile every pattern up
+/// front with `validate`.
+#[derive(Debug, Clone)]
+pub struct Pattern {
+    src: String,
+    /// Where the pattern is, such as `check a: forbid_regex`, for errors.
+    what: String,
+    /// The groups the pattern must have, counting the whole match.
+    groups: Option<usize>,
+    re: OnceLock<Result<Regex, String>>,
+}
+
+impl Pattern {
+    fn new(src: String, what: String, groups: Option<usize>) -> Pattern {
+        Pattern {
+            src,
+            what,
+            groups,
+            re: OnceLock::new(),
+        }
+    }
+
+    pub fn source(&self) -> &str {
+        &self.src
+    }
+
+    /// The compiled pattern, or why it can't be used.
+    pub fn regex(&self) -> Result<&Regex, &str> {
+        self.re
+            .get_or_init(|| {
+                let re = compiled(&self.src).map_err(|e| format!("{}: {e}", self.what))?;
+                match self.groups {
+                    Some(n) if re.captures_len() != n => Err(format!(
+                        "{}: needs exactly one group in its pattern, around the text to count",
+                        self.what
+                    )),
+                    _ => Ok(re),
+                }
+            })
+            .as_ref()
+            .map_err(String::as_str)
+    }
+}
+
+/// Patterns run with multi-line on, so `^` and `$` match at each line.
+fn compiled(src: &str) -> Result<Regex, String> {
+    let mut cache = COMPILED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(r) = cache.get(src) {
+        return r.clone();
+    }
+    let r = RegexBuilder::new(src)
+        .multi_line(true)
+        .size_limit(1 << 20)
+        .build()
+        .map_err(|e| e.to_string());
+    cache.insert(src.to_string(), r.clone());
+    r
+}
+
 #[derive(Debug, Clone)]
 pub enum CheckKind {
     Forbid(Vec<String>),
-    ForbidRegex(Regex),
+    ForbidRegex(Pattern),
     Require(Vec<String>),
     BareUrl,
-    RepeatOf { pattern: Regex, max: usize },
+    RepeatOf { pattern: Pattern, max: usize },
     MaxParagraphs(usize),
     MaxWords(usize),
 }
@@ -228,14 +295,6 @@ pub fn valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
-/// Patterns run with multi-line on, so `^` and `$` match at each line.
-fn pattern(src: &str) -> Result<Regex> {
-    Ok(RegexBuilder::new(src)
-        .multi_line(true)
-        .size_limit(1 << 20)
-        .build()?)
-}
-
 fn phrases(list: Vec<String>, id: &str, field: &str) -> Result<Vec<String>> {
     let out: Vec<String> = list
         .into_iter()
@@ -282,7 +341,7 @@ fn check(raw: RawCheck, n: usize) -> Result<Check> {
     let kind = if let Some(list) = raw.forbid {
         CheckKind::Forbid(phrases(list, &id, "forbid")?)
     } else if let Some(re) = raw.forbid_regex {
-        CheckKind::ForbidRegex(pattern(&re).with_context(|| format!("check {id}: forbid_regex"))?)
+        CheckKind::ForbidRegex(Pattern::new(re, format!("check {id}: forbid_regex"), None))
     } else if let Some(list) = raw.require {
         CheckKind::Require(phrases(list, &id, "require")?)
     } else if let Some(k) = raw.kind {
@@ -291,12 +350,7 @@ fn check(raw: RawCheck, n: usize) -> Result<Check> {
         }
         CheckKind::BareUrl
     } else if let Some(re) = raw.repeat_of {
-        let pattern = pattern(&re).with_context(|| format!("check {id}: repeat_of"))?;
-        if pattern.captures_len() != 2 {
-            bail!(
-                "check {id}: repeat_of needs exactly one group in its pattern, around the text to count"
-            );
-        }
+        let pattern = Pattern::new(re, format!("check {id}: repeat_of"), Some(2));
         let max = raw
             .max
             .with_context(|| format!("check {id}: repeat_of needs max"))?;
@@ -352,9 +406,29 @@ fn check(raw: RawCheck, n: usize) -> Result<Check> {
     })
 }
 
-/// Parses one rule set file. `file` is where it was read from: the set's id
-/// must match its name.
+/// Parses one rule set file and compiles every pattern in it. `file` is
+/// where it was read from: the set's id must match its name.
 pub fn parse(src: &str, file: &Path) -> Result<RuleSet> {
+    let set = parse_lazy(src, file)?;
+    validate(&set)?;
+    Ok(set)
+}
+
+/// Compiles every pattern in the set, so a bad one is an error here rather
+/// than a skipped check in a hook.
+pub fn validate(set: &RuleSet) -> Result<()> {
+    for c in &set.checks {
+        if let CheckKind::ForbidRegex(p) | CheckKind::RepeatOf { pattern: p, .. } = &c.kind {
+            if let Err(e) = p.regex() {
+                bail!("{e}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parses one rule set file, leaving its patterns to compile on first use.
+fn parse_lazy(src: &str, file: &Path) -> Result<RuleSet> {
     let raw: RawSet = toml::from_str(src)?;
     let id = raw
         .id
@@ -410,8 +484,28 @@ pub fn parse(src: &str, file: &Path) -> Result<RuleSet> {
     })
 }
 
-/// Every `*.toml` file in `dir`, sorted by name. Names starting with `.` or
-/// `_` are skipped, as in stores. A missing folder has no sets.
+/// Every `*.toml` file in `dir`, sorted by name, with every pattern
+/// compiled: a set with a bad pattern is an error. For commands.
+pub fn load_dir_checked(dir: &Path) -> Result<Loaded> {
+    let mut out = load_dir(dir)?;
+    let mut sets = Vec::new();
+    for s in std::mem::take(&mut out.sets) {
+        match validate(&s) {
+            Ok(()) => sets.push(s),
+            Err(e) => out.errors.push(FileError {
+                file: s.file.clone(),
+                error: format!("{e:#}"),
+            }),
+        }
+    }
+    out.errors.sort_by(|a, b| a.file.cmp(&b.file));
+    out.sets = sets;
+    Ok(out)
+}
+
+/// Every `*.toml` file in `dir`, sorted by name, with patterns left to
+/// compile on first use, for hooks. Names starting with `.` or `_` are
+/// skipped, as in stores. A missing folder has no sets.
 pub fn load_dir(dir: &Path) -> Result<Loaded> {
     let mut out = Loaded::default();
     let entries = match fs::read_dir(dir) {
@@ -440,7 +534,7 @@ pub fn load_dir(dir: &Path) -> Result<Loaded> {
         } else {
             fs::read_to_string(&file)
                 .map_err(anyhow::Error::from)
-                .and_then(|src| parse(&src, &file))
+                .and_then(|src| parse_lazy(&src, &file))
         };
         match res {
             Ok(s) => out.sets.push(s),
@@ -453,8 +547,14 @@ pub fn load_dir(dir: &Path) -> Result<Loaded> {
     Ok(out)
 }
 
+/// The rule sets, patterns compiled on first use: the hooks' loader.
 pub fn load() -> Result<Loaded> {
     load_dir(&rules_dir()?)
+}
+
+/// The rule sets with every pattern compiled: the commands' loader.
+pub fn load_checked() -> Result<Loaded> {
+    load_dir_checked(&rules_dir()?)
 }
 
 const STARTER: &str = r##"# dotonce rule set. See the README, "Rules and reply checks".
@@ -736,6 +836,53 @@ why = "No TODOs in Rust files."
             let e = err(&src);
             assert!(e.contains(want), "want {want:?} in: {e}");
         }
+    }
+
+    #[test]
+    fn patterns_compile_on_first_use_and_commands_compile_them_all() {
+        let bad = "id = \"ticket-reply\"\n[[check]]\nid = \"a\"\nwhy = \"b\"\nforbid_regex = '('\n[[check]]\nid = \"c\"\nwhy = \"d\"\nrepeat_of = 'Hi \\w+'\nmax = 0\n";
+        let file = Path::new("/rules/ticket-reply.toml");
+        let s = parse_lazy(bad, file).unwrap();
+        let e = format!("{:#}", validate(&s).unwrap_err());
+        assert!(e.contains("check a: forbid_regex"), "{e}");
+        let CheckKind::RepeatOf { pattern, .. } = &s.checks[1].kind else {
+            panic!("repeat_of")
+        };
+        assert!(pattern.regex().unwrap_err().contains("one group"));
+        assert!(parse(bad, file).is_err());
+
+        let dir = std::env::temp_dir().join(format!("dotonce-lazy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("ticket-reply.toml"), bad).unwrap();
+        fs::write(dir.join("good.toml"), "id = \"good\"\n").unwrap();
+        let hooks = load_dir(&dir).unwrap();
+        assert_eq!(hooks.sets.len(), 2);
+        assert!(hooks.errors.is_empty());
+        let cmds = load_dir_checked(&dir).unwrap();
+        let ids: Vec<&str> = cmds.sets.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["good"]);
+        assert_eq!(cmds.errors.len(), 1);
+        assert!(cmds.errors[0].error.contains("forbid_regex"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_pattern_shared_by_sets_compiles_once() {
+        let src = format!("cache-probe-{}", std::process::id());
+        COMPILED
+            .lock()
+            .unwrap()
+            .insert(src.clone(), Err("from the cache".to_string()));
+        let p = Pattern::new(src.clone(), "check a: forbid_regex".to_string(), None);
+        assert!(p.regex().unwrap_err().contains("from the cache"));
+        let fresh = format!("shared-{}", std::process::id());
+        let a = Pattern::new(fresh.clone(), "a".to_string(), None);
+        let b = Pattern::new(fresh.clone(), "b".to_string(), None);
+        assert!(a.regex().unwrap().is_match(&fresh));
+        assert!(COMPILED.lock().unwrap().contains_key(&fresh));
+        assert!(b.regex().unwrap().is_match(&fresh));
+        assert_eq!(b.source(), fresh);
     }
 
     #[test]

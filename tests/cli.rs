@@ -1869,6 +1869,42 @@ fn fix_set_sends_a_broken_draft_back_once_and_logs_the_fix() {
 }
 
 #[test]
+fn a_pattern_that_does_not_compile_skips_only_its_check_in_hooks() {
+    let h = home("badpattern");
+    let body = format!(
+        "{TICKET}[[check]]\nid = \"no-todo\"\nforbid_regex = '('\nwhy = \"No placeholders.\"\n"
+    );
+    add_set(&h, "ticket-reply", &body);
+    approve(&h, "ticket-reply", "fix");
+    use_skill(&h, "s1", "p1");
+    let msg = sent_back(&stop(&h, "s1", "p1", BROKEN, false));
+    assert!(msg.contains("- no-stock-wait-opener: "), "{msg}");
+    assert!(!msg.contains("no-todo"), "{msg}");
+    let log = std::fs::read_to_string(h.join("dotonce/errors.log")).unwrap();
+    assert!(
+        log.contains("check no-todo: forbid_regex") && log.contains("skipped"),
+        "{log}"
+    );
+    let (out, _, ok) = run_full(&h, &h, &["rules", "check"], None);
+    assert!(!ok);
+    assert!(out.contains("check no-todo: forbid_regex"), "{out}");
+    let f = h.join("reply.md");
+    std::fs::write(&f, BROKEN).unwrap();
+    for args in [
+        &["rules", "test", "ticket-reply", &f.to_string_lossy()][..],
+        &["rules", "approve", "ticket-reply"],
+    ] {
+        let (_, err, ok) = run_full(&h, &h, args, Some("ticket-reply\n"));
+        assert!(!ok, "{args:?}");
+        assert!(
+            err.contains("has an error") && err.contains("forbid_regex"),
+            "{args:?}: {err}"
+        );
+    }
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
 fn a_second_broken_draft_is_let_through_and_a_missing_one_is_unverified() {
     let h = ticket_home("stopbroken", "fix");
     use_skill(&h, "s1", "p1");

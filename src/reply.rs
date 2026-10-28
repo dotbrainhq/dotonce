@@ -194,7 +194,10 @@ fn recheck(p: &Pending, live: &[Live], fresh: Option<&str>, log: &dyn Fn(&Live, 
         let drafts = fresh.map(|f| checks::drafts(&l.set, f)).unwrap_or_default();
         let outcome = if drafts.is_empty() {
             Outcome::Unverified
-        } else if drafts.iter().any(|d| checks::failing_line(c, d).is_some()) {
+        } else if drafts
+            .iter()
+            .any(|d| checks::failing_line(set_id, c, d).is_some())
+        {
             Outcome::StillBroken
         } else {
             Outcome::Fixed

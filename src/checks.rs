@@ -6,7 +6,8 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde::Serialize;
 
-use crate::rules::{Check, CheckKind, On, RuleSet};
+use crate::hook::log_error;
+use crate::rules::{Check, CheckKind, On, Pattern, RuleSet};
 
 /// A failing line is cut to this many characters in messages.
 pub const LINE_CHARS: usize = 120;
@@ -308,16 +309,26 @@ fn over_words(text: &str, max: usize) -> Option<&str> {
     None
 }
 
+/// The compiled pattern. One that doesn't compile is logged to errors.log,
+/// and its check is skipped.
+fn usable<'a>(set: &str, p: &'a Pattern) -> Option<&'a Regex> {
+    p.regex()
+        .map_err(|e| log_error(&format!("rules: {set}: {e}: the check is skipped")))
+        .ok()
+}
+
 /// The line that breaks the check, cut for messages, or None when the text
-/// passes.
-pub fn failing_line(check: &Check, text: &str) -> Option<String> {
+/// passes. `set` names the check's set when a pattern doesn't compile.
+pub fn failing_line(set: &str, check: &Check, text: &str) -> Option<String> {
     match &check.kind {
         CheckKind::Forbid(list) => list.iter().find_map(|p| find_phrase(text, p)).map(cut),
-        CheckKind::ForbidRegex(re) => re.find(text).map(|m| cut(line_at(text, m.start()))),
+        CheckKind::ForbidRegex(p) => usable(set, p)?
+            .find(text)
+            .map(|m| cut(line_at(text, m.start()))),
         CheckKind::Require(list) => (!list.iter().any(|p| find_phrase(text, p).is_some()))
             .then(|| format!("(missing: {})", list.join(" / "))),
         CheckKind::BareUrl => bare_url(text).map(cut),
-        CheckKind::RepeatOf { pattern, max } => repeat(text, pattern, *max).map(cut),
+        CheckKind::RepeatOf { pattern, max } => repeat(text, usable(set, pattern)?, *max).map(cut),
         CheckKind::MaxParagraphs(max) => paragraphs(text).get(*max).copied().map(cut),
         CheckKind::MaxWords(max) => over_words(text, *max).map(cut),
     }
@@ -333,7 +344,7 @@ pub fn run_reply(set: &RuleSet, text: &str) -> Vec<Failure> {
         .filter_map(|c| {
             drafts
                 .iter()
-                .find_map(|d| failing_line(c, d))
+                .find_map(|d| failing_line(&set.id, c, d))
                 .map(|line| Failure {
                     set: set.id.clone(),
                     check: c.id.clone(),
@@ -356,7 +367,7 @@ mod tests {
 
     fn fails(kind: &str, text: &str) -> Option<String> {
         let s = set(&format!("[[check]]\nid = \"c\"\nwhy = \"w\"\n{kind}\n"));
-        failing_line(&s.checks[0], text)
+        failing_line("t", &s.checks[0], text)
     }
 
     #[test]

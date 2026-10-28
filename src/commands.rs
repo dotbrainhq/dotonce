@@ -54,7 +54,7 @@ pub fn rules_new(id: &str, whole: Option<bool>, input: &mut dyn BufRead) -> Resu
 
 /// Prints one line per rule file and fails when any file has an error.
 pub fn rules_check() -> Result<()> {
-    let loaded = rules::load()?;
+    let loaded = rules::load_checked()?;
     if loaded.sets.is_empty() && loaded.errors.is_empty() {
         println!("no rule sets in {}", rules::rules_dir()?.display());
         return Ok(());
@@ -87,7 +87,7 @@ pub fn rules_check() -> Result<()> {
 /// The set with this id. A file with an error is named with its error, so
 /// the user sees why the set is missing.
 fn find_set(id: &str) -> Result<RuleSet> {
-    let mut loaded = rules::load()?;
+    let mut loaded = rules::load_checked()?;
     if let Some(i) = loaded.sets.iter().position(|s| s.id == id) {
         return Ok(loaded.sets.swap_remove(i));
     }
@@ -224,7 +224,7 @@ fn private_here() -> Result<bool> {
 
 pub fn rules_list() -> Result<()> {
     let private_ok = private_here()?;
-    let loaded = rules::load()?;
+    let loaded = rules::load_checked()?;
     let a = approvals::load()?;
     if loaded.sets.is_empty() && loaded.errors.is_empty() {
         println!("no rule sets in {}", rules::rules_dir()?.display());
@@ -538,7 +538,7 @@ pub fn doctor() -> Result<()> {
     for line in home_overrides(&files) {
         println!("{line}");
     }
-    let loaded = rules::load()?;
+    let loaded = rules::load_checked()?;
     let a = approvals::load()?;
     let waiting = loaded
         .sets

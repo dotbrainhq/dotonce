@@ -169,7 +169,7 @@ pub fn run_tool(set: &RuleSet, tool: &str, path: Option<&str>, body: &str) -> Ve
             (Some(_), None) => false,
         })
         .filter_map(|c| {
-            failing_line(c, &text).map(|line| Failure {
+            failing_line(&set.id, c, &text).map(|line| Failure {
                 set: set.id.clone(),
                 check: c.id.clone(),
                 line,
