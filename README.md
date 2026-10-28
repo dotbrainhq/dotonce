@@ -30,7 +30,7 @@ dotonce is free and open source. It's in early development, and there's no relea
 
 ## What's coming
 
-- **Your yes first:** a correction becomes a proposed rule, and it only takes effect after you approve it.
+- **Rules from corrections:** when you correct Claude, dotonce drafts the rule set for you, and it only runs after you approve it.
 - **More agents:** an MCP server for Codex, Cursor, and any other MCP client.
 
 ## How it's built
