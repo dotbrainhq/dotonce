@@ -2,7 +2,9 @@
 //! Claude from editing rule files, approvals.json or last-live.json, and
 //! from running the `dotonce rules` commands that change approvals.
 
+use std::iter::Peekable;
 use std::path::{Path, PathBuf};
+use std::str::Chars;
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -14,7 +16,7 @@ use crate::hook::{prompt_id, session_id, str_field};
 use crate::rules::{Level, On, RuleSet};
 use crate::session;
 
-pub const GUARD_REASON: &str = "dotonce: rule files and approvals.json only change from the user's own terminal. Ask the user to make this change and approve it with dotonce rules approve.";
+pub const GUARD_REASON: &str = "dotonce: rule files, approvals and rule commands only change from the user's own terminal. Ask the user to run it there.";
 
 const FILE_TOOLS: [&str; 4] = ["Write", "Edit", "MultiEdit", "NotebookEdit"];
 /// The files in the dotonce home that only the user changes. last-live.json
@@ -22,21 +24,15 @@ const FILE_TOOLS: [&str; 4] = ["Write", "Edit", "MultiEdit", "NotebookEdit"];
 const GUARDED_FILES: [&str; 2] = ["approvals.json", "last-live.json"];
 /// The `dotonce rules` subcommands that change what checks run.
 const RULE_CHANGES: [&str; 4] = ["approve", "level", "off", "pause"];
-/// Words that run the command after them.
-const RUNS_NEXT: [&str; 13] = [
-    "!", "{", "if", "then", "else", "elif", "do", "while", "until", "exec", "command", "nohup",
-    "time",
-];
+/// Shells whose `-c` argument, or stdin, runs as a command.
+const SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", "fish"];
+/// Shell options that take the next word as their value.
+const SHELL_VALUE_OPTS: [&str; 6] = ["-o", "+o", "-O", "+O", "--rcfile", "--init-file"];
+/// How many quoted commands deep (`sh -c`, `eval`, `env -S`) the guard
+/// reads. One quoted deeper is denied when it names dotonce and rules.
+const MAX_DEPTH: usize = 3;
 /// env options that take the next word as their value.
-const ENV_VALUE_OPTS: [&str; 7] = [
-    "-u",
-    "--unset",
-    "-C",
-    "--chdir",
-    "-P",
-    "-S",
-    "--split-string",
-];
+const ENV_VALUE_OPTS: [&str; 5] = ["-u", "--unset", "-C", "--chdir", "-P"];
 
 pub fn tool_text(tool: &str, input: &Value) -> Option<(Option<String>, String)> {
     let s = |k: &str| str_field(input, k).to_string();
@@ -179,64 +175,208 @@ enum Ctx {
     Paren,
     Tick,
     Quote,
+    /// A here-doc body with an unquoted delimiter: only `$(...)` and
+    /// backticks in it run.
+    Body,
 }
 
-/// Splits a shell command into its simple commands, each a list of words
-/// with quotes taken off. A quoted string stays one word, so text that only
-/// quotes a command never reads as running it; `$(...)` and backticks
-/// inside double quotes still run, so they start a command of their own.
-fn simple_commands(cmd: &str) -> Vec<Vec<String>> {
-    let mut out: Vec<Vec<String>> = Vec::new();
-    let mut cur: Vec<String> = Vec::new();
-    let mut word: Option<String> = None;
-    let mut stack: Vec<Ctx> = Vec::new();
+/// One simple command: its words with quotes taken off, and what it reads
+/// on stdin from here-docs and here-strings.
+#[derive(Default)]
+struct Simple {
+    words: Vec<String>,
+    stdin: Vec<String>,
+    /// The index of the first command of the pipeline that feeds this one.
+    piped_from: Option<usize>,
+}
+
+/// A here-doc waiting for its body: the command's index, the delimiter,
+/// whether the delimiter was quoted, and whether `<<-` strips tabs.
+type Doc = (usize, String, bool, bool);
+
+#[derive(Default)]
+struct Lexer {
+    out: Vec<Simple>,
+    cur: Simple,
+    word: Option<String>,
+    here_string: bool,
+    after_pipe: bool,
+    pipe_start: usize,
+    docs: Vec<Doc>,
+}
+
+impl Lexer {
+    fn push(&mut self, c: char) {
+        self.word.get_or_insert_default().push(c);
+    }
+
+    fn end_word(&mut self) {
+        if let Some(w) = self.word.take() {
+            if std::mem::take(&mut self.here_string) {
+                self.cur.stdin.push(w);
+            } else {
+                self.cur.words.push(w);
+            }
+        }
+    }
+
+    fn end_cmd(&mut self) {
+        self.end_word();
+        if !self.cur.words.is_empty() || !self.cur.stdin.is_empty() {
+            if std::mem::take(&mut self.after_pipe) {
+                self.cur.piped_from = Some(self.pipe_start);
+            }
+            self.out.push(std::mem::take(&mut self.cur));
+        }
+    }
+
+    /// Ends the command and its pipeline: `;`, `&`, `&&`, `||`, `(` or a
+    /// newline.
+    fn end_list(&mut self) {
+        self.end_cmd();
+        self.after_pipe = false;
+        self.pipe_start = self.out.len();
+    }
+
+    /// Reads the bodies of the here-docs opened on the line that just ended.
+    fn read_docs(&mut self, chars: &mut Peekable<Chars>) {
+        for (idx, delim, quoted, strip) in std::mem::take(&mut self.docs) {
+            let mut body = String::new();
+            while chars.peek().is_some() {
+                let line: String = chars.by_ref().take_while(|c| *c != '\n').collect();
+                let line = if strip {
+                    line.trim_start_matches('\t').to_string()
+                } else {
+                    line
+                };
+                if line == delim {
+                    break;
+                }
+                body.push_str(&line);
+                body.push('\n');
+            }
+            if !quoted {
+                let offset = self.out.len();
+                self.out
+                    .extend(lex(&body, vec![Ctx::Body]).into_iter().map(|mut s| {
+                        s.piped_from = s.piped_from.map(|p| p + offset);
+                        s
+                    }));
+            }
+            if let Some(c) = self.out.get_mut(idx) {
+                c.stdin.push(body);
+            }
+        }
+        self.pipe_start = self.out.len();
+    }
+}
+
+/// The word after `<<` or `<<-`, with quotes taken off, and whether any
+/// part of it was quoted (then the body is plain text).
+fn read_delimiter(chars: &mut Peekable<Chars>) -> Option<(String, bool)> {
+    while chars.next_if(|c| *c == ' ' || *c == '\t').is_some() {}
+    let mut d = String::new();
+    let mut quoted = false;
+    while let Some(c) = chars.next_if(|c| !c.is_whitespace() && !";|&()<>".contains(*c)) {
+        match c {
+            '\'' | '"' => {
+                quoted = true;
+                for n in chars.by_ref() {
+                    if n == c {
+                        break;
+                    }
+                    d.push(n);
+                }
+            }
+            '\\' => {
+                quoted = true;
+                d.extend(chars.next());
+            }
+            _ => d.push(c),
+        }
+    }
+    (!d.is_empty()).then_some((d, quoted))
+}
+
+/// Splits a shell command into its simple commands. A quoted string stays
+/// one word, so text that only quotes a command never reads as running it;
+/// `$(...)` and backticks inside double quotes still run, so they start a
+/// command of their own.
+fn simple_commands(cmd: &str) -> Vec<Simple> {
+    lex(cmd, Vec::new())
+}
+
+fn lex(cmd: &str, mut stack: Vec<Ctx>) -> Vec<Simple> {
+    let mut l = Lexer::default();
     let mut chars = cmd.chars().peekable();
-    let end_word = |word: &mut Option<String>, cur: &mut Vec<String>| {
-        if let Some(w) = word.take() {
-            cur.push(w);
-        }
-    };
-    let end_cmd = |word: &mut Option<String>, cur: &mut Vec<String>, out: &mut Vec<Vec<String>>| {
-        end_word(word, cur);
-        if !cur.is_empty() {
-            out.push(std::mem::take(cur));
-        }
-    };
     while let Some(c) = chars.next() {
-        if stack.last() == Some(&Ctx::Quote) {
+        if matches!(stack.last(), Some(Ctx::Quote | Ctx::Body)) {
+            let body = stack.last() == Some(&Ctx::Body);
             match c {
-                '"' => {
+                '"' if !body => {
                     stack.pop();
                 }
                 '\\' => {
-                    if let Some(n) = chars.next() {
-                        word.get_or_insert_default().push(n);
+                    if let Some(n) = chars.next().filter(|_| !body) {
+                        l.push(n);
                     }
                 }
                 '`' => {
-                    end_cmd(&mut word, &mut cur, &mut out);
+                    l.end_cmd();
                     stack.push(Ctx::Tick);
                 }
                 '$' if chars.peek() == Some(&'(') => {
                     chars.next();
-                    end_cmd(&mut word, &mut cur, &mut out);
+                    l.end_cmd();
                     stack.push(Ctx::Paren);
                 }
-                _ => word.get_or_insert_default().push(c),
+                _ if !body => l.push(c),
+                _ => {}
             }
             continue;
         }
         match c {
-            '\n' | ';' | '|' | '&' | '(' => end_cmd(&mut word, &mut cur, &mut out),
-            c if c.is_whitespace() => end_word(&mut word, &mut cur),
+            '\n' => {
+                l.end_list();
+                l.read_docs(&mut chars);
+            }
+            ';' | '(' => l.end_list(),
+            // `2>&1` and `&>file` are redirections, not separators.
+            '&' if chars.peek() == Some(&'>')
+                || l.word.as_deref().is_some_and(|w| w.ends_with(['>', '<'])) =>
+            {
+                l.push(c)
+            }
+            '&' => {
+                chars.next_if_eq(&'&');
+                l.end_list();
+            }
+            '|' if chars.next_if_eq(&'|').is_some() => l.end_list(),
+            '|' => {
+                chars.next_if_eq(&'&');
+                l.end_cmd();
+                l.after_pipe = true;
+            }
+            '<' if chars.next_if_eq(&'<').is_some() => {
+                l.end_word();
+                if chars.next_if_eq(&'<').is_some() {
+                    l.here_string = true;
+                } else {
+                    let strip = chars.next_if_eq(&'-').is_some();
+                    if let Some((delim, quoted)) = read_delimiter(&mut chars) {
+                        l.docs.push((l.out.len(), delim, quoted, strip));
+                    }
+                }
+            }
+            c if c.is_whitespace() => l.end_word(),
             ')' => {
-                end_cmd(&mut word, &mut cur, &mut out);
+                l.end_cmd();
                 if stack.last() == Some(&Ctx::Paren) {
                     stack.pop();
                 }
             }
             '`' => {
-                end_cmd(&mut word, &mut cur, &mut out);
+                l.end_cmd();
                 if stack.last() == Some(&Ctx::Tick) {
                     stack.pop();
                 } else {
@@ -245,39 +385,33 @@ fn simple_commands(cmd: &str) -> Vec<Vec<String>> {
             }
             '$' if chars.peek() == Some(&'(') => {
                 chars.next();
-                end_cmd(&mut word, &mut cur, &mut out);
+                l.end_cmd();
                 stack.push(Ctx::Paren);
             }
             '\'' => {
-                let w = word.get_or_insert_default();
+                let mut w = l.word.take().unwrap_or_default();
                 for n in chars.by_ref() {
                     if n == '\'' {
                         break;
                     }
                     w.push(n);
                 }
+                l.word = Some(w);
             }
             '"' => {
-                word.get_or_insert_default();
+                l.word.get_or_insert_default();
                 stack.push(Ctx::Quote);
             }
             '\\' => match chars.next() {
                 Some('\n') | None => {}
-                Some(n) => word.get_or_insert_default().push(n),
+                Some(n) => l.push(n),
             },
-            '#' if word.is_none() => {
-                for n in chars.by_ref() {
-                    if n == '\n' {
-                        break;
-                    }
-                }
-                end_cmd(&mut word, &mut cur, &mut out);
-            }
-            _ => word.get_or_insert_default().push(c),
+            '#' if l.word.is_none() => while chars.next_if(|n| *n != '\n').is_some() {},
+            _ => l.push(c),
         }
     }
-    end_cmd(&mut word, &mut cur, &mut out);
-    out
+    l.end_cmd();
+    l.out
 }
 
 fn is_assignment(w: &str) -> bool {
@@ -289,59 +423,146 @@ fn is_assignment(w: &str) -> bool {
     })
 }
 
-/// Where the command a simple command runs starts, past variable
-/// assignments, `env` and its options, and words such as `exec`.
-fn command_start(words: &[String]) -> usize {
+fn is_dotonce(w: &str) -> bool {
+    w == "dotonce" || w.ends_with("/dotonce")
+}
+
+/// True when a `dotonce` word is followed, anywhere later in the command, by
+/// `rules` and then a rule change. Wherever `dotonce` stands it can be run:
+/// by `sudo`, `xargs`, `script`, `nice`, `timeout` and the like.
+fn runs_change(words: &[String]) -> bool {
+    let mut rest = words.iter().skip_while(|w| !is_dotonce(w));
+    rest.next().is_some()
+        && rest.by_ref().any(|w| w == "rules")
+        && rest.any(|w| RULE_CHANGES.contains(&w.as_str()))
+}
+
+/// What a shell's arguments run: a `-c` command, stdin, or a script file.
+enum Shell {
+    Command(String),
+    Stdin,
+    File,
+}
+
+fn shell_runs(args: &[String]) -> Shell {
+    let (mut c, mut s) = (false, false);
     let mut i = 0;
-    while let Some(w) = words.get(i) {
-        let w = w.as_str();
+    while let Some(a) = args.get(i).map(String::as_str) {
         i += 1;
-        if w == "env" {
-            while let Some(o) = words.get(i).map(String::as_str) {
-                if o == "--" {
-                    i += 1;
-                    break;
-                }
-                if ENV_VALUE_OPTS.contains(&o) {
-                    i += 2;
-                } else if o.starts_with('-') || is_assignment(o) {
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-        } else if RUNS_NEXT.contains(&w) {
-            while words.get(i).is_some_and(|o| o.starts_with('-')) {
-                i += if words[i] == "-a" { 2 } else { 1 };
-            }
-        } else if !is_assignment(w) {
-            return i - 1;
+        if a == "--" {
+            break;
+        } else if let Some(cmd) = a.strip_prefix("--command=") {
+            return Shell::Command(cmd.to_string());
+        } else if a == "--command" {
+            c = true;
+        } else if SHELL_VALUE_OPTS.contains(&a) {
+            i += 1;
+        } else if a.starts_with("--") {
+        } else if a.len() > 1 && (a.starts_with('-') || a.starts_with('+')) {
+            c |= a.starts_with('-') && a.contains('c');
+            s |= a.starts_with('-') && a.contains('s');
+        } else {
+            i -= 1;
+            break;
         }
     }
-    i
+    match args.get(i) {
+        Some(cmd) if c => Shell::Command(cmd.clone()),
+        None if !c => Shell::Stdin,
+        _ if s => Shell::Stdin,
+        _ => Shell::File,
+    }
+}
+
+/// The command `env -S` or `--split-string` runs, if any.
+fn env_split(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while let Some(a) = args.get(i).map(String::as_str) {
+        i += 1;
+        if a == "-S" || a == "--split-string" {
+            return args.get(i).cloned();
+        } else if let Some(cmd) = a
+            .strip_prefix("--split-string=")
+            .or_else(|| a.strip_prefix("-S"))
+        {
+            return Some(cmd.to_string());
+        } else if ENV_VALUE_OPTS.contains(&a) {
+            i += 1;
+        } else if a == "--" || !(a.starts_with('-') || is_assignment(a)) {
+            return None;
+        }
+    }
+    None
+}
+
+/// The commands a simple command runs from a quoted string (`sh -c`,
+/// `eval`, `env -S`), and whether a shell in it reads stdin.
+fn quoted_commands(words: &[String]) -> (Vec<String>, bool) {
+    let mut cmds = Vec::new();
+    let mut stdin = false;
+    for (i, w) in words.iter().enumerate() {
+        let rest = &words[i + 1..];
+        match w.rsplit('/').next().unwrap_or(w) {
+            "eval" => cmds.push(rest.join(" ")),
+            "env" => cmds.extend(env_split(rest)),
+            b if SHELLS.contains(&b) => match shell_runs(rest) {
+                Shell::Command(c) => cmds.push(c),
+                Shell::Stdin => stdin = true,
+                Shell::File => {}
+            },
+            _ => {}
+        }
+    }
+    (cmds, stdin)
+}
+
+/// True when text names `dotonce`, `rules` and a rule change, in any order.
+fn names_change(text: &str) -> bool {
+    let words: Vec<&str> = text
+        .split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
+        .collect();
+    words.contains(&"dotonce")
+        && words.contains(&"rules")
+        && RULE_CHANGES.iter().any(|v| words.contains(v))
 }
 
 /// True when the command runs `dotonce rules` approve, level, off or pause.
 /// Approvals already refuse under Claude Code's variables; this stops an
-/// agent that unsets them.
+/// agent that unsets them. It reads command text only: a script file the
+/// agent writes and then runs gets past it, and the approval's terminal
+/// check covers that.
 fn runs_rule_change(cmd: &str) -> bool {
-    simple_commands(cmd).iter().any(|words| {
-        let changes_at = |i: usize| {
-            words.get(i + 1).is_some_and(|w| w == "rules")
-                && words
-                    .get(i + 2)
-                    .is_some_and(|w| RULE_CHANGES.contains(&w.as_str()))
-        };
-        // A path to the binary runs it wherever it stands, as under `script`.
-        if words
-            .iter()
-            .enumerate()
-            .any(|(i, w)| w.ends_with("/dotonce") && changes_at(i))
-        {
+    changes_at(cmd, 0)
+}
+
+fn changes_at(cmd: &str, depth: usize) -> bool {
+    let cmds = simple_commands(cmd);
+    cmds.iter().enumerate().any(|(k, c)| {
+        if runs_change(&c.words) {
             return true;
         }
-        let i = command_start(words);
-        words.get(i).is_some_and(|w| w == "dotonce") && changes_at(i)
+        let (quoted, stdin) = quoted_commands(&c.words);
+        let nested = |q: &String| {
+            if depth < MAX_DEPTH {
+                changes_at(q, depth + 1)
+            } else {
+                q.contains("dotonce") && q.contains("rules")
+            }
+        };
+        if quoted.iter().any(nested) {
+            return true;
+        }
+        let feeds = c
+            .piped_from
+            .and_then(|p| cmds.get(p..k))
+            .unwrap_or_default();
+        let text: Vec<&str> = feeds
+            .iter()
+            .chain([c])
+            .flat_map(|f| f.words.iter().chain(&f.stdin))
+            .map(String::as_str)
+            .collect();
+        stdin && names_change(&text.join(" "))
     })
 }
 
@@ -569,6 +790,7 @@ mod tests {
             "\"dotonce\" rules approve x",
             "(dotonce rules off x)",
             "ls\ndotonce rules approve x",
+            "echo dotonce rules approve x",
         ] {
             assert!(runs_rule_change(cmd), "{cmd}");
             let input = json!({"command": cmd});
@@ -579,12 +801,95 @@ mod tests {
             "grep -rn \"dotonce rules approve\" src",
             "git commit -m \"Add the dotonce rules approve command\"",
             "git commit -m 'dotonce rules off x'",
-            "echo dotonce rules approve x",
             "dotonce rules list",
             "dotonce rules test x reply.md",
             "dotonce search rules",
             "cargo test rules",
             "echo hi # ; dotonce rules approve x",
+        ] {
+            assert!(!runs_rule_change(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn rule_changes_are_denied_as_arguments_and_inside_shells() {
+        for cmd in [
+            "sudo dotonce rules approve x",
+            "echo x | xargs dotonce rules approve",
+            "script -q /dev/null dotonce rules off x",
+            "nice -n 5 dotonce rules level x fix",
+            "timeout 5 dotonce rules pause x",
+            "watch -n 1 dotonce rules approve x",
+            "bash -c 'dotonce rules approve x'",
+            "/bin/sh -c \"dotonce rules level x fix\"",
+            "zsh -c 'dotonce rules off x'",
+            "dash -c 'dotonce rules pause x'",
+            "ksh -c 'dotonce rules approve x'",
+            "fish -c 'dotonce rules approve x'",
+            "/usr/local/bin/fish --command 'dotonce rules approve x'",
+            "bash -lc 'dotonce rules approve x'",
+            "bash -o pipefail -c 'dotonce rules approve x'",
+            "sudo -u sam bash -c 'cd /tmp; dotonce rules approve x'",
+            "echo x | xargs sh -c 'dotonce rules off x'",
+            "bash -c \"sh -c 'dotonce rules approve x'\"",
+            "eval \"dotonce rules off x\"",
+            "eval dotonce rules off x",
+            "env -S 'dotonce rules pause x'",
+            "env --split-string='dotonce rules pause x'",
+            "env -u CLAUDECODE -S 'dotonce rules pause x'",
+        ] {
+            assert!(runs_rule_change(cmd), "{cmd}");
+        }
+        for cmd in [
+            "bash -c 'dotonce rules list'",
+            "sh -c 'echo \"dotonce rules approve x\"'",
+            "bash -c 'grep -rn \"dotonce rules approve\" src'",
+            "eval \"echo 'dotonce rules approve x'\"",
+            "env -S 'dotonce rules check'",
+            "echo \"run dotonce rules approve to approve\"",
+            "sudo dotonce rules list",
+        ] {
+            assert!(!runs_rule_change(cmd), "{cmd}");
+        }
+    }
+
+    /// `sh -c` with `cmd` quoted inside it, `n` times over.
+    fn nest(cmd: &str, n: usize) -> String {
+        (0..n).fold(cmd.to_string(), |c, _| {
+            format!("sh -c '{}'", c.replace('\'', "'\\''"))
+        })
+    }
+
+    #[test]
+    fn nested_shells_are_read_three_deep_and_denied_past_that() {
+        assert!(runs_rule_change(&nest("dotonce rules approve x", 3)));
+        assert!(!runs_rule_change(&nest("dotonce rules list", 3)));
+        assert!(runs_rule_change(&nest("dotonce rules list", 4)));
+        assert!(!runs_rule_change(&nest("ls src", 4)));
+    }
+
+    #[test]
+    fn rule_changes_piped_or_fed_to_a_shell_are_denied() {
+        for cmd in [
+            "echo 'dotonce rules approve x' | sh",
+            "printf '%s\\n' 'dotonce rules off x' | sudo bash",
+            "echo 'dotonce rules approve x' 2>&1 | bash -s",
+            "bash <<EOF\ndotonce rules approve x\nEOF",
+            "bash <<'EOF'\ndotonce rules level x fix\nEOF",
+            "sh <<-EOF\n\tdotonce rules off x\n\tEOF",
+            "cat <<EOF | sh\ndotonce rules pause x\nEOF",
+            "bash <<< 'dotonce rules approve x'",
+            "cat <<EOF\n$(dotonce rules approve x)\nEOF",
+        ] {
+            assert!(runs_rule_change(cmd), "{cmd}");
+        }
+        for cmd in [
+            "echo 'dotonce rules approve x' | grep approve",
+            "echo 'dotonce rules list' | sh",
+            "cat <<'EOF' > notes.md\nRun dotonce rules approve x in a terminal.\nEOF",
+            "cat <<EOF > notes.md\ndotonce rules approve x\nEOF\nls",
+            "cat <<'EOF' > notes.md\n$(dotonce rules approve x)\nEOF",
+            "bash <<EOF\nls src\nEOF",
         ] {
             assert!(!runs_rule_change(cmd), "{cmd}");
         }

@@ -2878,6 +2878,8 @@ fn another_hooks_added_context_is_not_the_send_back() {
     std::fs::remove_dir_all(&h).unwrap();
 }
 
+const GUARD: &str = "dotonce: rule files, approvals and rule commands only change from the user's own terminal. Ask the user to run it there.";
+
 /// Runs the PreToolUse hook and returns the deny reason, or None when the
 /// call may run.
 fn pre(h: &Path, cwd: &Path, tool: &str, input: serde_json::Value) -> Option<String> {
@@ -2945,7 +2947,7 @@ fn guard_keeps_rule_files_and_approvals_out_of_reach_with_no_rule_sets() {
     for (tool, input) in denied {
         let reason =
             pre(&h, &proj, tool, input.clone()).unwrap_or_else(|| panic!("{tool} {input}"));
-        assert!(reason.contains("own terminal"), "{reason}");
+        assert_eq!(reason, GUARD, "{tool} {input}");
     }
     assert!(
         pre(
@@ -3161,7 +3163,7 @@ fn guard_covers_last_live_and_rule_changing_commands() {
     for (tool, input) in denied {
         let reason =
             pre(&h, &proj, tool, input.clone()).unwrap_or_else(|| panic!("{tool} {input}"));
-        assert!(reason.contains("own terminal"), "{reason}");
+        assert_eq!(reason, GUARD, "{tool} {input}");
     }
     for cmd in [
         "grep -rn \"dotonce rules approve\" src",
@@ -3245,5 +3247,40 @@ fn a_repeated_warn_tool_catch_is_logged_once_per_turn() {
         2,
         "the next turn logs again"
     );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn guard_denies_rule_commands_through_shells_wrappers_and_pipes() {
+    let h = home("guardshell");
+    let proj = h.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let bash = |cmd: &str| serde_json::json!({"command": cmd});
+    for cmd in [
+        "bash -c 'dotonce rules approve acme'",
+        "/bin/sh -c \"dotonce rules level acme fix\"",
+        "eval \"dotonce rules off acme\"",
+        "env -S 'dotonce rules pause acme'",
+        "sudo dotonce rules approve acme",
+        "echo acme | xargs dotonce rules approve",
+        "script -q /dev/null dotonce rules off acme",
+        "echo 'dotonce rules approve acme' | sh",
+        "bash <<'EOF'\ndotonce rules approve acme\nEOF",
+    ] {
+        assert_eq!(
+            pre(&h, &proj, "Bash", bash(cmd)).as_deref(),
+            Some(GUARD),
+            "{cmd}"
+        );
+    }
+    for cmd in [
+        "grep -rn \"dotonce rules approve\" src",
+        "git commit -m \"Add the dotonce rules approve command\"",
+        "echo \"run dotonce rules approve to approve\"",
+        "dotonce rules list",
+        "dotonce rules check",
+    ] {
+        assert_eq!(pre(&h, &proj, "Bash", bash(cmd)), None, "{cmd}");
+    }
     std::fs::remove_dir_all(&h).unwrap();
 }
