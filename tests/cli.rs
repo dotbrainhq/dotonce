@@ -1114,6 +1114,192 @@ fn approve_shows_the_checks_and_that_an_off_set_turns_on() {
     std::fs::remove_dir_all(&h).unwrap();
 }
 
+/// Runs one hook with a JSON input and returns its stdout.
+fn hook(h: &Path, event: &str, input: serde_json::Value) -> String {
+    let (out, ok) = run(h, &["hook", event], Some(&input.to_string()));
+    assert!(ok, "hook {event} failed");
+    out
+}
+
+const REPLIES: &str = "[when]\nprompt = [\"draft\"]\nskills = [\"writing-support\"]\n[remind]\ntext = \"Links go inline as anchor text.\"\n";
+
+#[test]
+fn prompt_hook_adds_reminders_before_facts() {
+    let h = home("remindprompt");
+    run(&h, &["init"], None);
+    run(&h, &["save", "The staging site is acme.example.com"], None);
+    add_set(&h, "acme-replies", REPLIES);
+    approve(&h, "acme-replies", "warn");
+    let input = serde_json::json!({"session_id": "s1", "prompt_id": "p1", "prompt": "draft the staging site reply", "cwd": "/tmp"});
+    let ctx = context(&hook(&h, "prompt", input.clone()), "UserPromptSubmit");
+    let rule = ctx
+        .find("[acme-replies]\nLinks go inline as anchor text.")
+        .expect(&ctx);
+    let fact = ctx.find("acme.example.com").expect(&ctx);
+    assert!(
+        ctx.starts_with("<dotonce>\nRules from your rule sets"),
+        "{ctx}"
+    );
+    assert!(rule < fact, "{ctx}");
+    assert_eq!(ctx.matches("<dotonce>").count(), 1, "{ctx}");
+    let ctx = context(&hook(&h, "prompt", input), "UserPromptSubmit");
+    assert!(
+        !ctx.contains("Links go inline"),
+        "the same turn gets the reminder once: {ctx}"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn rules_need_approval_and_skip_pasted_text_and_project_folders() {
+    let h = home("remindgate");
+    add_set(&h, "acme-replies", REPLIES);
+    let input = |prompt: &str, sid: &str| serde_json::json!({"session_id": sid, "prompt_id": "p1", "prompt": prompt, "cwd": "/tmp"});
+    assert!(
+        hook(&h, "prompt", input("draft it", "s1"))
+            .trim()
+            .is_empty()
+    );
+    assert!(!h.join("dotonce/sessions").exists());
+    approve(&h, "acme-replies", "warn");
+    assert!(
+        hook(&h, "prompt", input("```\ndraft\n```\nwhat now?", "s2"))
+            .trim()
+            .is_empty()
+    );
+    let ctx = context(
+        &hook(&h, "prompt", input("draft it", "s3")),
+        "UserPromptSubmit",
+    );
+    assert!(ctx.contains("Links go inline"), "{ctx}");
+    std::fs::remove_dir_all(&h).unwrap();
+
+    let h = home("remindproject");
+    let proj = h.join("proj");
+    std::fs::create_dir_all(proj.join(".dotonce/rules")).unwrap();
+    let src = format!("id = \"acme-replies\"\n{REPLIES}");
+    std::fs::write(proj.join(".dotonce/rules/acme-replies.toml"), &src).unwrap();
+    approve_src(&h, "acme-replies", &src, "fix");
+    let input = serde_json::json!({"session_id": "s1", "prompt_id": "p1", "prompt": "draft it", "cwd": proj});
+    let (out, ok) = run_in(&h, &proj, &["hook", "prompt"], Some(&input.to_string()));
+    assert!(ok);
+    assert!(
+        out.trim().is_empty(),
+        "a repo's own rules are never read: {out}"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn skill_and_expansion_hooks_turn_sets_on_and_compaction_reminds_again() {
+    let h = home("remindskill");
+    add_set(&h, "acme-replies", REPLIES);
+    approve(&h, "acme-replies", "warn");
+    let skill = |sid: &str, tool: &str, name: &str| serde_json::json!({"session_id": sid, "prompt_id": "p1", "hook_event_name": "PostToolUse", "tool_name": tool, "tool_input": {"skill": name}, "cwd": "/tmp"});
+    let ctx = context(
+        &hook(
+            &h,
+            "skill",
+            skill("s1", "Skill", "acme-tools:writing-support"),
+        ),
+        "PostToolUse",
+    );
+    assert!(ctx.contains("Links go inline as anchor text."), "{ctx}");
+    assert!(
+        hook(&h, "skill", skill("s1", "Skill", "writing-support"))
+            .trim()
+            .is_empty()
+    );
+    assert!(
+        hook(&h, "skill", skill("s2", "Read", "writing-support"))
+            .trim()
+            .is_empty()
+    );
+    assert!(
+        hook(&h, "skill", skill("s2", "Skill", "other-skill"))
+            .trim()
+            .is_empty()
+    );
+    let exp = serde_json::json!({"session_id": "s3", "prompt_id": "p1", "hook_event_name": "UserPromptExpansion", "expansion_type": "slash_command", "command_name": "writing-support", "command_args": "", "command_source": "user", "prompt": "/writing-support", "cwd": "/tmp"});
+    let ctx = context(&hook(&h, "expansion", exp), "UserPromptExpansion");
+    assert!(ctx.contains("Links go inline"), "{ctx}");
+    let out = hook(
+        &h,
+        "session-start",
+        serde_json::json!({"session_id": "s1", "source": "compact", "cwd": "/tmp"}),
+    );
+    assert!(
+        context(&out, "SessionStart").contains("Links go inline"),
+        "{out}"
+    );
+    let out = hook(
+        &h,
+        "session-start",
+        serde_json::json!({"session_id": "s1", "source": "resume", "cwd": "/tmp"}),
+    );
+    assert!(out.trim().is_empty(), "{out}");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn session_start_reports_broken_rule_files_and_cleans_old_sessions() {
+    let h = home("sessionrules");
+    add_set(&h, "broken", "[[check]]\nid = \"a\"\nforbid = [\"x\"]\n");
+    let sessions = h.join("dotonce/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    for name in ["old.json", "fresh.json"] {
+        std::fs::write(sessions.join(name), "{}").unwrap();
+    }
+    std::fs::File::options()
+        .write(true)
+        .open(sessions.join("old.json"))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 86_400))
+        .unwrap();
+    let out = hook(
+        &h,
+        "session-start",
+        serde_json::json!({"session_id": "s1", "source": "startup", "cwd": "/tmp"}),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    let msg = v["systemMessage"].as_str().unwrap();
+    assert!(
+        msg.contains("broken.toml") && msg.contains("check a has no why"),
+        "{msg}"
+    );
+    assert!(msg.contains("dotonce rules check"), "{msg}");
+    assert!(v.get("hookSpecificOutput").is_none(), "{out}");
+    assert!(!sessions.join("old.json").exists());
+    assert!(sessions.join("fresh.json").exists());
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn private_sets_only_remind_inside_private_paths() {
+    let (h, proj) = home_with_private_path("remindpriv");
+    add_set(
+        &h,
+        "secret-notes",
+        "private = true\n[when]\nprompt = [\"draft\"]\n[remind]\ntext = \"Keep the launch quiet.\"\n",
+    );
+    approve(&h, "secret-notes", "warn");
+    let out = hook(
+        &h,
+        "prompt",
+        serde_json::json!({"session_id": "s1", "prompt_id": "p1", "prompt": "draft it", "cwd": "/tmp"}),
+    );
+    assert!(!out.contains("launch quiet"), "{out}");
+    let out = hook(
+        &h,
+        "prompt",
+        serde_json::json!({"session_id": "s2", "prompt_id": "p1", "prompt": "draft it", "cwd": proj}),
+    );
+    assert!(out.contains("Keep the launch quiet."), "{out}");
+    let state = std::fs::read_to_string(h.join("dotonce/sessions/s2.json")).unwrap();
+    assert!(!state.contains("draft"), "{state}");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
 #[test]
 fn hook_path_never_writes_to_stderr() {
     let h = home("stderr");
@@ -1145,5 +1331,106 @@ fn hook_path_never_writes_to_stderr() {
     assert!(out.status.success());
     let log = std::fs::read_to_string(h.join("dotonce/errors.log")).unwrap();
     assert!(!log.contains("panic"), "{log}");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+/// Runs session-start for a session and returns its systemMessage, or "".
+fn start_message(h: &Path, sid: &str, cwd: &Path) -> String {
+    let out = hook(
+        h,
+        "session-start",
+        serde_json::json!({"session_id": sid, "source": "startup", "cwd": cwd}),
+    );
+    if out.trim().is_empty() {
+        return String::new();
+    }
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    v["systemMessage"].as_str().unwrap_or_default().to_string()
+}
+
+#[test]
+fn session_start_names_approved_sets_that_stopped_running() {
+    let h = home("sessionlive");
+    let tmp = Path::new("/tmp");
+    add_set(&h, "acme-replies", REPLIES);
+    approve(&h, "acme-replies", "warn");
+    assert_eq!(start_message(&h, "s1", tmp), "");
+    assert!(h.join("dotonce/last-live.json").exists());
+    assert_eq!(start_message(&h, "s2", tmp), "", "nothing changed");
+    approve(&h, "acme-replies", "fix");
+    let msg = start_message(&h, "s3", tmp);
+    assert!(
+        msg.contains("acme-replies") && msg.contains("from warn to fix"),
+        "{msg}"
+    );
+    assert_eq!(start_message(&h, "s4", tmp), "");
+    let f = h.join("dotonce/rules/acme-replies.toml");
+    let mut src = std::fs::read_to_string(&f).unwrap();
+    src.push_str("# edited\n");
+    std::fs::write(&f, &src).unwrap();
+    let msg = start_message(&h, "s5", tmp);
+    assert!(
+        msg.contains("acme-replies") && msg.contains("changed since approval"),
+        "{msg}"
+    );
+    assert_eq!(msg.lines().count(), 1, "{msg}");
+    let msg = start_message(&h, "s6", tmp);
+    assert!(
+        msg.contains("changed since approval"),
+        "reported every session: {msg}"
+    );
+    approve(&h, "acme-replies", "fix");
+    let path = h.join("dotonce/approvals.json");
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    v["sets"]["acme-replies"]["off"] = serde_json::json!(true);
+    std::fs::write(&path, v.to_string()).unwrap();
+    let msg = start_message(&h, "s7", tmp);
+    assert!(msg.contains("acme-replies") && msg.contains("off"), "{msg}");
+    std::fs::remove_file(&f).unwrap();
+    let msg = start_message(&h, "s8", tmp);
+    assert!(
+        msg.contains("acme-replies") && msg.contains("missing"),
+        "{msg}"
+    );
+    std::fs::write(&f, "id = \"acme-replies\"\n[[check]]\n").unwrap();
+    let msg = start_message(&h, "s9", tmp);
+    assert!(
+        msg.contains("acme-replies: not running, its file has errors"),
+        "{msg}"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn session_start_hides_private_set_ids_outside_private_paths() {
+    let (h, proj) = home_with_private_path("sessionlivepriv");
+    let tmp = Path::new("/tmp");
+    add_set(
+        &h,
+        "secret-notes",
+        "private = true\n[remind]\ntext = \"Keep the launch quiet.\"\n",
+    );
+    approve(&h, "secret-notes", "warn");
+    assert_eq!(start_message(&h, "s1", &proj), "");
+    let f = h.join("dotonce/rules/secret-notes.toml");
+    let mut src = std::fs::read_to_string(&f).unwrap();
+    src.push_str("# edited\n");
+    std::fs::write(&f, &src).unwrap();
+    let msg = start_message(&h, "s2", tmp);
+    assert!(
+        msg.contains("A private rule set") && msg.contains("changed since approval"),
+        "{msg}"
+    );
+    assert!(!msg.contains("secret-notes"), "{msg}");
+    let msg = start_message(&h, "s3", &proj);
+    assert!(msg.contains("secret-notes"), "{msg}");
+    std::fs::remove_file(&f).unwrap();
+    let msg = start_message(&h, "s4", tmp);
+    assert!(
+        msg.contains("A private rule set") && msg.contains("missing"),
+        "{msg}"
+    );
+    assert!(!msg.contains("secret-notes"), "{msg}");
     std::fs::remove_dir_all(&h).unwrap();
 }
