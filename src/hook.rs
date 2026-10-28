@@ -2,6 +2,7 @@
 //! match the prompt; SessionStart adds pinned facts, re-adds reminders after
 //! compaction and reports broken rule files; PostToolUse (Skill) and
 //! UserPromptExpansion turn on the rule sets for a skill.
+//! Stop runs the reply checks (see reply.rs).
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -24,7 +25,7 @@ const SESSION_TITLE: &str = "dotonce is on. Pinned facts for every session:";
 const RULES_TITLE: &str =
     "Rules from your rule sets for what you're doing now. Follow them in this reply:";
 
-const EVENTS: &[&str] = &["prompt", "session-start", "skill", "expansion"];
+const EVENTS: &[&str] = &["prompt", "session-start", "skill", "expansion", "stop"];
 
 /// Handles one Claude Code hook call. Returns the JSON to print, or None when
 /// there is nothing to add.
@@ -42,6 +43,7 @@ pub fn handle(event: &str, input: &str, now: i64) -> Result<Option<String>> {
         "prompt" => prompt(&v, &cwd, now),
         "session-start" => session_start(&v, &cwd, now),
         "skill" => skill(&v, &cwd),
+        "stop" => crate::reply::stop(&v, &cwd, now),
         _ => expansion(&v, &cwd),
     }
 }

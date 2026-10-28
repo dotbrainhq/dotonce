@@ -1,4 +1,5 @@
 pub mod approvals;
+pub mod catches;
 pub mod checks;
 pub mod commands;
 pub mod config;
@@ -10,6 +11,7 @@ pub mod index;
 pub mod model;
 pub mod names;
 pub mod query;
+pub mod reply;
 pub mod retrieve;
 pub mod rules;
 pub mod serve;

@@ -126,11 +126,11 @@ fn hooks_never_fail_and_log_errors() {
 #[test]
 fn unknown_hook_event_is_logged_not_fatal() {
     let h = home("event");
-    let (out, ok) = run(&h, &["hook", "stop"], Some(r#"{"cwd":"/tmp"}"#));
+    let (out, ok) = run(&h, &["hook", "bogus"], Some(r#"{"cwd":"/tmp"}"#));
     assert!(ok);
     assert!(out.trim().is_empty(), "{out}");
     let log = std::fs::read_to_string(h.join("dotonce/errors.log")).unwrap();
-    assert!(log.contains("stop"), "{log}");
+    assert!(log.contains("bogus"), "{log}");
     std::fs::remove_dir_all(&h).unwrap();
 }
 
@@ -1758,5 +1758,281 @@ fn an_unusable_session_id_still_gives_the_notice() {
             serde_json::from_str(&out).unwrap_or_else(|e| panic!("{source}: {e}: {out}"));
         assert_eq!(v["systemMessage"], "Off: acme-replies.", "{source}: {out}");
     }
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+const TICKET: &str = "[when]\nskills = [\"writing-support\"]\n[draft]\nfence = [\"markdown\"]\n[[check]]\nid = \"no-stock-wait-opener\"\nforbid = [\"sorry for the wait\"]\nwhy = \"Open with a line from the thread.\"\n[[check]]\nid = \"inline-links\"\nkind = \"bare-url\"\nwhy = \"Links go inline as anchor text.\"\n";
+const BROKEN: &str = "Here is the draft:\n\n```markdown\nHi Sam,\n\nSorry for the wait. The guide is at https://example.com/guide\n```";
+const BROKEN_AGAIN: &str = "Second try:\n\n```markdown\nHi Sam,\n\nSorry for the wait. More at https://example.com/more\n```";
+const FIXED: &str = "Fixed the opener and the link.\n\n```markdown\nHi Sam,\n\nThanks for the details. The [setup guide](https://example.com/guide) covers it.\n```";
+
+fn ticket_home(name: &str, level: &str) -> PathBuf {
+    let h = home(name);
+    add_set(&h, "ticket-reply", TICKET);
+    approve(&h, "ticket-reply", level);
+    h
+}
+
+fn use_skill(h: &Path, sid: &str, pid: &str) {
+    hook(
+        h,
+        "skill",
+        serde_json::json!({"session_id": sid, "prompt_id": pid, "tool_name": "Skill", "tool_input": {"skill": "writing-support"}, "cwd": "/tmp"}),
+    );
+}
+
+fn stop_with(
+    h: &Path,
+    sid: &str,
+    pid: &str,
+    last: &str,
+    active: bool,
+    transcript: &Path,
+) -> String {
+    hook(
+        h,
+        "stop",
+        serde_json::json!({"session_id": sid, "prompt_id": pid, "hook_event_name": "Stop", "stop_hook_active": active, "last_assistant_message": last, "transcript_path": transcript, "cwd": "/tmp"}),
+    )
+}
+
+fn stop(h: &Path, sid: &str, pid: &str, last: &str, active: bool) -> String {
+    stop_with(h, sid, pid, last, active, &h.join("missing.jsonl"))
+}
+
+fn sent_back(out: &str) -> String {
+    context(out, "Stop")
+}
+
+/// (check id, outcome) of each line in a catch log, oldest first.
+fn outcomes(h: &Path, file: &str) -> Vec<(String, String)> {
+    std::fs::read_to_string(h.join("dotonce").join(file))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            (
+                v["check"].as_str().unwrap().to_string(),
+                v["outcome"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+    list.iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect()
+}
+
+#[test]
+fn fix_set_sends_a_broken_draft_back_once_and_logs_the_fix() {
+    let h = ticket_home("stopfix", "fix");
+    use_skill(&h, "s1", "p1");
+    let msg = sent_back(&stop(&h, "s1", "p1", BROKEN, false));
+    assert!(
+        msg.contains("- no-stock-wait-opener: \"Sorry for the wait. The guide is at https://example.com/guide\". Open with a line from the thread."),
+        "{msg}"
+    );
+    assert!(msg.contains("- inline-links: "), "{msg}");
+    assert!(
+        msg.ends_with(
+            "Write the draft again with these fixed. Add one line saying what you fixed."
+        ),
+        "{msg}"
+    );
+    assert!(stop(&h, "s1", "p1", FIXED, true).trim().is_empty());
+    assert_eq!(
+        outcomes(&h, "catches.jsonl"),
+        pairs(&[
+            ("no-stock-wait-opener", "caught"),
+            ("inline-links", "caught"),
+            ("no-stock-wait-opener", "fixed"),
+            ("inline-links", "fixed"),
+        ])
+    );
+    assert!(
+        stop(&h, "s1", "p1", BROKEN_AGAIN, true).trim().is_empty(),
+        "a turn is sent back once"
+    );
+    assert_eq!(outcomes(&h, "catches.jsonl").len(), 4);
+    let log = std::fs::read_to_string(h.join("dotonce/catches.jsonl")).unwrap();
+    assert!(
+        !log.contains("Sam") && !log.contains("example.com"),
+        "{log}"
+    );
+    assert!(
+        !sent_back(&stop(&h, "s1", "p2", BROKEN, false)).is_empty(),
+        "the next turn is checked again"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn a_second_broken_draft_is_let_through_and_a_missing_one_is_unverified() {
+    let h = ticket_home("stopbroken", "fix");
+    use_skill(&h, "s1", "p1");
+    assert!(!stop(&h, "s1", "p1", BROKEN, false).trim().is_empty());
+    assert!(stop(&h, "s1", "p1", BROKEN_AGAIN, true).trim().is_empty());
+    use_skill(&h, "s2", "p1");
+    assert!(!stop(&h, "s2", "p1", BROKEN, false).trim().is_empty());
+    assert!(stop(&h, "s2", "p1", "Saved.", true).trim().is_empty());
+    assert_eq!(
+        outcomes(&h, "catches.jsonl"),
+        pairs(&[
+            ("no-stock-wait-opener", "caught"),
+            ("inline-links", "caught"),
+            ("no-stock-wait-opener", "still_broken"),
+            ("inline-links", "still_broken"),
+            ("no-stock-wait-opener", "caught"),
+            ("inline-links", "caught"),
+            ("no-stock-wait-opener", "unverified"),
+            ("inline-links", "unverified"),
+        ])
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn another_stop_hook_continuing_the_turn_does_not_count_as_ours() {
+    let h = ticket_home("stopother", "fix");
+    use_skill(&h, "s1", "p1");
+    assert!(!sent_back(&stop(&h, "s1", "p1", BROKEN, true)).is_empty());
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn warn_sets_only_log_and_unused_sets_check_nothing() {
+    let h = ticket_home("stopwarn", "warn");
+    use_skill(&h, "s1", "p1");
+    assert!(stop(&h, "s1", "p1", BROKEN, false).trim().is_empty());
+    assert_eq!(
+        outcomes(&h, "catches.jsonl"),
+        pairs(&[
+            ("no-stock-wait-opener", "caught"),
+            ("inline-links", "caught")
+        ])
+    );
+    assert!(
+        stop(&h, "s9", "p1", BROKEN, false).trim().is_empty(),
+        "no skill, no checks"
+    );
+    assert_eq!(outcomes(&h, "catches.jsonl").len(), 2);
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn stop_reads_earlier_drafts_of_the_turn_from_the_session_record() {
+    let h = ticket_home("stoprecord", "fix");
+    use_skill(&h, "s1", "p1");
+    let lines = [
+        serde_json::json!({"type": "user", "message": {"role": "user", "content": "Draft the old one"}, "promptId": "p0"}).to_string(),
+        serde_json::json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "```markdown\nHi Sam,\nOld link https://example.com/old\n```"}]}}).to_string(),
+        serde_json::json!({"type": "user", "message": {"role": "user", "content": "Draft the reply"}, "promptId": "p1"}).to_string(),
+        "not json".to_string(),
+        serde_json::json!({"type": "assistant", "isSidechain": true, "message": {"content": [{"type": "text", "text": "```markdown\nSide link https://example.com/side\n```"}]}}).to_string(),
+        serde_json::json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "```markdown\nHi Sam,\n\nSorry for the wait.\n```"}]}}).to_string(),
+        serde_json::json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Write", "input": {}}]}}).to_string(),
+        serde_json::json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}, "promptId": "p1"}).to_string(),
+    ];
+    let record = h.join("session.jsonl");
+    std::fs::write(&record, lines.join("\n")).unwrap();
+    let msg = sent_back(&stop_with(&h, "s1", "p1", "Saved.", false, &record));
+    assert!(msg.contains("no-stock-wait-opener"), "{msg}");
+    assert!(
+        !msg.contains("inline-links"),
+        "the old turn and the sidechain aren't checked: {msg}"
+    );
+    use_skill(&h, "s2", "p1");
+    let msg = sent_back(&stop_with(&h, "s2", "p1", BROKEN, false, &h));
+    assert!(
+        msg.contains("inline-links"),
+        "an unreadable record falls back to the last message: {msg}"
+    );
+    use_skill(&h, "s3", "p1");
+    let out = hook(
+        &h,
+        "stop",
+        serde_json::json!({"session_id": "s3", "prompt_id": "p1", "last_assistant_message": BROKEN, "cwd": "/tmp"}),
+    );
+    assert!(sent_back(&out).contains("inline-links"), "{out}");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn private_sets_log_to_their_own_file() {
+    let (h, proj) = home_with_private_path("stoppriv");
+    add_set(
+        &h,
+        "secret-notes",
+        &format!(
+            "private = true\n[when]\nfolders = [{:?}]\n[[check]]\nid = \"quiet\"\nforbid = [\"launch date\"]\nwhy = \"Keep it quiet.\"\n",
+            proj.to_string_lossy()
+        ),
+    );
+    approve(&h, "secret-notes", "warn");
+    let out = hook(
+        &h,
+        "stop",
+        serde_json::json!({"session_id": "s1", "prompt_id": "p1", "last_assistant_message": "The launch date is Friday.", "cwd": proj}),
+    );
+    assert!(out.trim().is_empty(), "{out}");
+    assert_eq!(
+        outcomes(&h, "catches-private.jsonl"),
+        pairs(&[("quiet", "caught")])
+    );
+    assert!(!h.join("dotonce/catches.jsonl").exists());
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn stop_without_a_session_id_fails_open() {
+    let h = ticket_home("stopnosid", "fix");
+    let out = hook(
+        &h,
+        "stop",
+        serde_json::json!({"last_assistant_message": BROKEN, "cwd": "/tmp"}),
+    );
+    assert!(out.trim().is_empty(), "{out}");
+    let log = std::fs::read_to_string(h.join("dotonce/errors.log")).unwrap();
+    assert!(log.contains("session_id"), "{log}");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn the_stop_continuation_in_the_session_record_is_not_a_new_turn() {
+    let h = ticket_home("stopcontinue", "fix");
+    use_skill(&h, "s1", "p1");
+    let user = serde_json::json!({"type": "user", "message": {"role": "user", "content": "Draft the reply"}, "promptId": "p1"}).to_string();
+    let said = |t: &str| {
+        serde_json::json!({"type": "assistant", "message": {"content": [{"type": "text", "text": t}]}}).to_string()
+    };
+    let record = h.join("session.jsonl");
+    std::fs::write(&record, [user.clone(), said(BROKEN)].join("\n")).unwrap();
+    assert!(!sent_back(&stop_with(&h, "s1", "p1", BROKEN, false, &record)).is_empty());
+    let continued = [
+        user,
+        said(BROKEN),
+        serde_json::json!({"type": "attachment", "attachment": {"type": "hook_success", "stdout": "{}"}}).to_string(),
+        serde_json::json!({"type": "attachment", "attachment": {"type": "hook_additional_context", "content": ["dotonce checked the draft"]}}).to_string(),
+        serde_json::json!({"type": "system", "subtype": "stop_hook_summary"}).to_string(),
+        said(FIXED),
+    ];
+    std::fs::write(&record, continued.join("\n")).unwrap();
+    assert!(
+        stop_with(&h, "s1", "p1", FIXED, true, &record)
+            .trim()
+            .is_empty()
+    );
+    assert_eq!(
+        outcomes(&h, "catches.jsonl"),
+        pairs(&[
+            ("no-stock-wait-opener", "caught"),
+            ("inline-links", "caught"),
+            ("no-stock-wait-opener", "fixed"),
+            ("inline-links", "fixed"),
+        ]),
+        "the old draft before the send-back isn't checked again"
+    );
     std::fs::remove_dir_all(&h).unwrap();
 }
