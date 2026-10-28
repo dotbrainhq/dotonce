@@ -765,7 +765,8 @@ fn approve_src(h: &Path, id: &str, src: &str, level: &str) {
         "hash": dotonce::approvals::hash(src),
         "level": level,
         "off": false,
-        "approved": "2026-10-28T00:00:00Z"
+        "approved": "2026-10-28T00:00:00Z",
+        "changed": "2026-10-28T00:00:00Z"
     });
     std::fs::create_dir_all(h.join("dotonce")).unwrap();
     std::fs::write(path, v.to_string()).unwrap();
@@ -814,6 +815,7 @@ fn approval_needs_a_terminal_and_tracks_changes() {
     approve(&h, "acme-replies", "warn");
     let (out, _) = run(&h, &["rules", "list"], None);
     assert!(out.contains("warn") && out.contains("checks: 1"), "{out}");
+    assert!(out.contains("changed 2026-10-28T00:00:00Z"), "{out}");
     let (_, err, ok) = run_full(
         &h,
         &h,
@@ -1000,6 +1002,15 @@ fn run_pty(
     Some((String::from_utf8_lossy(&seen).to_string(), status.success()))
 }
 
+/// A `changed` time that is RFC 3339 and from the last minute.
+#[cfg(unix)]
+fn assert_recent(t: &serde_json::Value) {
+    let s = t.as_str().unwrap_or_else(|| panic!("no changed time: {t}"));
+    let at = chrono::DateTime::parse_from_rfc3339(s).unwrap();
+    let age = chrono::Utc::now().signed_duration_since(at);
+    assert!(age.num_seconds().abs() < 60, "{s}");
+}
+
 #[cfg(unix)]
 #[test]
 fn changes_made_while_a_prompt_waits_are_kept() {
@@ -1021,6 +1032,7 @@ fn changes_made_while_a_prompt_waits_are_kept() {
     assert!(ok && out.contains("approved acme-replies"), "{out}");
     let v = read();
     assert_eq!(v["sets"]["acme-replies"]["level"], "warn", "{v}");
+    assert_recent(&v["sets"]["acme-replies"]["changed"]);
     assert!(v["sets"]["beta"].is_object(), "{v}");
     let (out, ok) = run_pty(
         &h,
@@ -1032,6 +1044,7 @@ fn changes_made_while_a_prompt_waits_are_kept() {
     assert!(ok, "{out}");
     let v = read();
     assert_eq!(v["sets"]["acme-replies"]["level"], "fix", "{v}");
+    assert_recent(&v["sets"]["acme-replies"]["changed"]);
     assert!(v["sets"]["gamma"].is_object(), "{v}");
     let (out, ok) = run_pty(
         &h,
@@ -1043,6 +1056,7 @@ fn changes_made_while_a_prompt_waits_are_kept() {
     assert!(ok, "{out}");
     let v = read();
     assert_eq!(v["sets"]["acme-replies"]["off"], true, "{v}");
+    assert_recent(&v["sets"]["acme-replies"]["changed"]);
     for id in ["beta", "gamma", "delta"] {
         assert!(v["sets"][id].is_object(), "{id}: {v}");
     }

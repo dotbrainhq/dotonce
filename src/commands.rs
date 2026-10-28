@@ -165,7 +165,7 @@ pub fn rules_level(id: &str, level: &str) -> Result<()> {
     let set = find_set(id)?;
     confirmed(id, &format!("set {id} to {}", level.as_str()))?;
     let mut a = approvals::load()?;
-    a.set_level(&set, level)?;
+    a.set_level(&set, level, &now_text())?;
     approvals::save(&a)?;
     println!("{id} is now at level {}", level.as_str());
     Ok(())
@@ -178,7 +178,7 @@ pub fn rules_off(id: &str) -> Result<()> {
     }
     confirmed(id, &format!("turn {id} off"))?;
     let mut a = approvals::load()?;
-    a.turn_off(id)?;
+    a.turn_off(id, &now_text())?;
     approvals::save(&a)?;
     println!("{id} is off. Turn it on again with dotonce rules level {id} <level>");
     Ok(())
@@ -204,8 +204,14 @@ pub fn rules_list() -> Result<()> {
             hidden += 1;
             continue;
         }
+        let changed = a
+            .sets
+            .get(&s.id)
+            .filter(|x| !x.changed.is_empty())
+            .map(|x| format!("  changed {}", x.changed))
+            .unwrap_or_default();
         println!(
-            "{:<24} {:<24} checks: {}",
+            "{:<24} {:<24} checks: {}{changed}",
             s.id,
             a.state(s).label(),
             s.checks.len()

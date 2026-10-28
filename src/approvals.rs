@@ -22,6 +22,9 @@ pub struct Approval {
     #[serde(default)]
     pub off: bool,
     pub approved: String,
+    /// When approve, level or off last wrote this record (RFC 3339).
+    #[serde(default)]
+    pub changed: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -85,12 +88,13 @@ impl Approvals {
                 level,
                 off: false,
                 approved: now.to_string(),
+                changed: now.to_string(),
             },
         );
         level
     }
 
-    pub fn set_level(&mut self, set: &RuleSet, level: Level) -> Result<()> {
+    pub fn set_level(&mut self, set: &RuleSet, level: Level, now: &str) -> Result<()> {
         match self.state(set) {
             State::NotApproved => {
                 bail!(
@@ -109,14 +113,16 @@ impl Approvals {
         if let Some(a) = self.sets.get_mut(&set.id) {
             a.level = level;
             a.off = false;
+            a.changed = now.to_string();
         }
         Ok(())
     }
 
-    pub fn turn_off(&mut self, id: &str) -> Result<()> {
+    pub fn turn_off(&mut self, id: &str, now: &str) -> Result<()> {
         match self.sets.get_mut(id) {
             Some(a) => {
                 a.off = true;
+                a.changed = now.to_string();
                 Ok(())
             }
             None => bail!("{id} isn't approved, so it's already off"),
@@ -256,21 +262,21 @@ mod tests {
         let s = set("id = \"acme\"\nlevel = \"warn\"\n");
         let mut a = Approvals::default();
         assert_eq!(a.state(&s), State::NotApproved);
-        assert!(a.set_level(&s, Level::Fix).is_err());
+        assert!(a.set_level(&s, Level::Fix, "t").is_err());
         assert_eq!(a.approve(&s, "2026-10-28T00:00:00Z"), Level::Warn);
         assert_eq!(a.state(&s), State::On(Level::Warn));
-        a.set_level(&s, Level::Fix).unwrap();
+        a.set_level(&s, Level::Fix, "t").unwrap();
         assert_eq!(a.state(&s), State::On(Level::Fix));
         let edited = set("id = \"acme\"\nlevel = \"remind\"\n");
         assert_eq!(a.state(&edited), State::Changed);
-        let e = a.set_level(&edited, Level::Warn).unwrap_err();
+        let e = a.set_level(&edited, Level::Warn, "t").unwrap_err();
         assert!(format!("{e:#}").contains("changed"), "{e:#}");
         assert_eq!(a.approve(&edited, "2026-10-29T00:00:00Z"), Level::Fix);
-        a.turn_off("acme").unwrap();
+        a.turn_off("acme", "t").unwrap();
         assert_eq!(a.state(&edited), State::Off);
-        a.set_level(&edited, Level::Warn).unwrap();
+        a.set_level(&edited, Level::Warn, "t").unwrap();
         assert_eq!(a.state(&edited), State::On(Level::Warn));
-        assert!(a.turn_off("other").is_err());
+        assert!(a.turn_off("other", "t").is_err());
     }
 
     #[test]
@@ -283,7 +289,7 @@ mod tests {
         assert_eq!(l.len(), 1);
         assert_eq!(l[0].set.id, "acme");
         assert_eq!(l[0].level, Level::Warn);
-        a.turn_off("acme").unwrap();
+        a.turn_off("acme", "t").unwrap();
         assert!(live(vec![on], &a).is_empty());
     }
 
@@ -339,18 +345,35 @@ mod tests {
         assert!(!first.contains("since the last approval"), "{first}");
         assert!(!first.contains("off now"), "{first}");
         a.approve(&s, "t");
-        a.set_level(&s, Level::Remind).unwrap();
+        a.set_level(&s, Level::Remind, "t").unwrap();
         assert!(!summary(&s, &a).contains("since the last approval"));
         let edited = set(&format!("{}# edited\n", s.src));
         let again = summary(&edited, &a);
         assert!(again.starts_with("acme: level remind,"), "{again}");
         assert!(again.contains("changed since the last approval"), "{again}");
-        a.turn_off("acme").unwrap();
+        a.turn_off("acme", "t").unwrap();
         let off = summary(&s, &a);
         assert!(
             off.contains("off now, and approving it turns it back on"),
             "{off}"
         );
+    }
+
+    #[test]
+    fn every_write_records_when_it_changed() {
+        let s = set("id = \"acme\"\n");
+        let mut a = Approvals::default();
+        a.approve(&s, "2026-10-28T00:00:00Z");
+        assert_eq!(a.sets["acme"].changed, "2026-10-28T00:00:00Z");
+        a.set_level(&s, Level::Fix, "2026-10-28T01:00:00Z").unwrap();
+        assert_eq!(a.sets["acme"].changed, "2026-10-28T01:00:00Z");
+        assert_eq!(a.sets["acme"].approved, "2026-10-28T00:00:00Z");
+        a.turn_off("acme", "2026-10-28T02:00:00Z").unwrap();
+        assert_eq!(a.sets["acme"].changed, "2026-10-28T02:00:00Z");
+        let old: Approvals =
+            serde_json::from_str(r#"{"sets":{"acme":{"hash":"h","level":"warn","approved":"t"}}}"#)
+                .unwrap();
+        assert_eq!(old.sets["acme"].changed, "");
     }
 
     #[test]
