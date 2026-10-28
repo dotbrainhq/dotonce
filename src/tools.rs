@@ -223,8 +223,20 @@ fn resolve_links(p: &Path, links: usize) -> PathBuf {
     }
 }
 
+/// The text as the file system compares names. macOS file systems ignore
+/// case by default, so there `APPROVALS.JSON` is approvals.json and the
+/// text is lowercased.
+fn fold(s: &str) -> String {
+    if cfg!(target_os = "macos") {
+        s.to_lowercase()
+    } else {
+        s.to_string()
+    }
+}
+
+/// The path's written and real forms, folded for comparing.
 fn forms(p: &Path) -> [PathBuf; 2] {
-    [lexical_normalize(p), resolve_deep(p)]
+    [lexical_normalize(p), resolve_deep(p)].map(|f| PathBuf::from(fold(&f.to_string_lossy())))
 }
 
 fn guarded_path(p: &Path, home: &Path) -> bool {
@@ -347,19 +359,21 @@ fn can_write(cmd: &str, depth: usize) -> bool {
 /// a guarded name in a command that can write. Paths are matched in the raw
 /// text and in the words with their quotes and backslashes taken off.
 pub fn mentions(cmd: &str, home: &Path, cwd: &Path, user_home: Option<&Path>) -> bool {
+    let cmd = fold(cmd);
+    let cmd = cmd.as_str();
     let mut bases: Vec<String> = forms(home)
         .iter()
         .map(|h| h.to_string_lossy().into_owned())
         .collect();
     let rest = user_home.and_then(|u| {
-        lexical_normalize(home)
-            .strip_prefix(u)
+        PathBuf::from(fold(&lexical_normalize(home).to_string_lossy()))
+            .strip_prefix(fold(&u.to_string_lossy()))
             .ok()
             .map(|r| r.to_string_lossy().into_owned())
     });
     if let Some(rest) = rest {
         for pre in ["~", "$HOME", "${HOME}"] {
-            bases.push(format!("{pre}/{rest}"));
+            bases.push(fold(&format!("{pre}/{rest}")));
         }
     }
     let named = ["rules", GUARDED_FILES[0], GUARDED_FILES[1]];
@@ -1110,6 +1124,41 @@ mod tests {
             user
         ));
         assert!(!mentions("rm rules/a.toml", home, cwd, None));
+    }
+
+    /// macOS file systems ignore case, so `APPROVALS.JSON` is approvals.json.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn guarded_paths_match_in_any_case_on_macos() {
+        let home = Path::new("/fake/sam/.dotonce");
+        let user = Some(Path::new("/fake/sam"));
+        let cwd = Path::new("/fake/sam/code");
+        for cmd in [
+            "echo x > ~/.DOTONCE/APPROVALS.JSON",
+            "echo x > /FAKE/Sam/.dotonce/Last-Live.json",
+            "rm $HOME/.Dotonce/Rules/a.toml",
+            "cp a.toml .DOTONCE/RULES/",
+            "cd ~/.DOTONCE && rm APPROVALS.json",
+            "rm /Fake/Sam/.DotOnce/",
+        ] {
+            assert!(mentions(cmd, home, cwd, user), "{cmd}");
+        }
+        assert!(mentions(
+            "rm Rules/a.toml",
+            home,
+            Path::new("/FAKE/SAM/.DOTONCE"),
+            user
+        ));
+        assert!(!mentions("ls ~/.DOTONCE/NOTES", home, cwd, user));
+        for p in [
+            "/FAKE/SAM/.DOTONCE/APPROVALS.JSON",
+            "/fake/sam/.dotonce/RULES/new.toml",
+        ] {
+            assert!(
+                guard("Write", &json!({"file_path": p}), cwd, home, user),
+                "{p}"
+            );
+        }
     }
 
     #[test]
