@@ -17,7 +17,7 @@ use crate::session::{self, Pending};
 
 pub const SEND_BACK_END: &str =
     "Write the draft again with these fixed. Add one line saying what you fixed.";
-const SEND_BACK_START: &str =
+pub const SEND_BACK_START: &str =
     "dotonce checked the draft in your reply against the user's rule sets. It breaks these rules:";
 const TAIL_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PARTS: usize = 200;
@@ -83,11 +83,22 @@ fn assistant_text(e: &Value) -> String {
     }
 }
 
-/// The record entry Claude Code writes when a Stop hook's additionalContext
-/// continues the turn (task 1, D7).
+/// The record entry Claude Code writes when dotonce's send-back continues
+/// the turn (task 1, D7). Other hooks' added context, such as dotonce's own
+/// prompt hook, is stored the same way, so only content that starts with the
+/// send-back text counts.
 fn continues_turn(e: &Value) -> bool {
-    e.get("type").and_then(Value::as_str) == Some("attachment")
-        && e.pointer("/attachment/type").and_then(Value::as_str) == Some("hook_additional_context")
+    if e.get("type").and_then(Value::as_str) != Some("attachment")
+        || e.pointer("/attachment/type").and_then(Value::as_str) != Some("hook_additional_context")
+    {
+        return false;
+    }
+    let ours = |c: &Value| c.as_str().is_some_and(|t| t.starts_with(SEND_BACK_START));
+    match e.pointer("/attachment/content") {
+        Some(Value::Array(items)) => items.iter().any(ours),
+        Some(c) => ours(c),
+        None => false,
+    }
 }
 
 /// The assistant text of the record's last turn, oldest first, and how many

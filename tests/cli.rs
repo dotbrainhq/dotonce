@@ -2014,7 +2014,7 @@ fn the_stop_continuation_in_the_session_record_is_not_a_new_turn() {
         user,
         said(BROKEN),
         serde_json::json!({"type": "attachment", "attachment": {"type": "hook_success", "stdout": "{}"}}).to_string(),
-        serde_json::json!({"type": "attachment", "attachment": {"type": "hook_additional_context", "content": ["dotonce checked the draft"]}}).to_string(),
+        serde_json::json!({"type": "attachment", "attachment": {"type": "hook_additional_context", "content": [format!("{}\n- inline-links: ...", dotonce::reply::SEND_BACK_START)]}}).to_string(),
         serde_json::json!({"type": "system", "subtype": "stop_hook_summary"}).to_string(),
         said(FIXED),
     ];
@@ -2227,7 +2227,7 @@ fn an_interrupted_draft_shows_with_the_next_message() {
             at("m2", 0, false, "Plain reply.\n```markdown\nHi Sam,\n")
         ),
         Some(format!(
-            "{note}```markdown\nHi Sam,\nSorry for the wa\nPlain reply.\n"
+            "{note}```markdown\nHi Sam,\nSorry for the wa\n```\nPlain reply.\n"
         )),
         "the held lines show first, then the new message, whose draft is held"
     );
@@ -2254,7 +2254,7 @@ fn the_recheck_cuts_at_the_continuation_or_is_unverified() {
     let (intro, draft) = BROKEN.split_once("\n\n").unwrap();
     let continuation = [
         serde_json::json!({"type": "attachment", "attachment": {"type": "hook_success", "stdout": "{}"}}).to_string(),
-        serde_json::json!({"type": "attachment", "attachment": {"type": "hook_additional_context", "content": ["dotonce checked the draft"]}}).to_string(),
+        serde_json::json!({"type": "attachment", "attachment": {"type": "hook_additional_context", "content": [format!("{}\n- inline-links: ...", dotonce::reply::SEND_BACK_START)]}}).to_string(),
         serde_json::json!({"type": "system", "subtype": "stop_hook_summary"}).to_string(),
     ];
     for (name, marker, want) in [
@@ -2656,6 +2656,42 @@ fn an_unreadable_settings_file_means_no_hold() {
         show_draft(&h, &proj, "s2", "p1", "m1"),
         None,
         "a file that can't be read"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn another_hooks_added_context_is_not_the_send_back() {
+    let h = ticket_home("recheckother", "fix");
+    use_skill(&h, "s1", "p1");
+    let user = serde_json::json!({"type": "user", "message": {"role": "user", "content": "Draft the reply"}, "promptId": "p1"}).to_string();
+    // The prompt hook's context, at the start of the turn.
+    let other = serde_json::json!({"type": "attachment", "attachment": {"type": "hook_additional_context", "content": ["<dotonce>\nRules from your rule sets"]}}).to_string();
+    let said = |t: &str| {
+        serde_json::json!({"type": "assistant", "message": {"content": [{"type": "text", "text": t}]}}).to_string()
+    };
+    let (intro, draft) = BROKEN.split_once("\n\n").unwrap();
+    let first = [user, other, said(intro), said(draft)];
+    let record = h.join("session.jsonl");
+    std::fs::write(&record, first.join("\n")).unwrap();
+    assert!(!sent_back(&stop_with(&h, "s1", "p1", BROKEN, false, &record)).is_empty());
+    let mut later = first.to_vec();
+    later.push(said(FIXED));
+    std::fs::write(&record, later.join("\n")).unwrap();
+    assert!(
+        stop_with(&h, "s1", "p1", FIXED, true, &record)
+            .trim()
+            .is_empty()
+    );
+    assert_eq!(
+        outcomes(&h, "catches.jsonl"),
+        pairs(&[
+            ("no-stock-wait-opener", "caught"),
+            ("inline-links", "caught"),
+            ("no-stock-wait-opener", "unverified"),
+            ("inline-links", "unverified"),
+        ]),
+        "the turn's other added context is not where the send-back continued"
     );
     std::fs::remove_dir_all(&h).unwrap();
 }

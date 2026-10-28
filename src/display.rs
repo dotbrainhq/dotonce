@@ -229,6 +229,12 @@ pub fn display(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
             if !early.ends_with('\n') {
                 early.push('\n');
             }
+            // The draft stopped inside its fence: close it, so this
+            // message doesn't show inside the old block.
+            if let Some((ch, len, _)) = held.fence {
+                early.push_str(&ch.to_string().repeat(len));
+                early.push('\n');
+            }
         }
         held = Held {
             message_id: message.to_string(),
