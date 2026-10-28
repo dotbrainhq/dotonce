@@ -600,3 +600,94 @@ fn hook_config_points_at_this_binary() {
     }
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+/// Runs dotonce in `cwd` and returns stdout, stderr and whether it exited 0.
+fn run_full(home: &Path, cwd: &Path, args: &[&str], stdin: Option<&str>) -> (String, String, bool) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dotonce"))
+        .args(args)
+        .current_dir(cwd)
+        .env("DOTONCE_HOME", home.join("dotonce"))
+        .env("HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    if let Some(s) = stdin {
+        let _ = child.stdin.take().unwrap().write_all(s.as_bytes());
+    } else {
+        drop(child.stdin.take());
+    }
+    let out = child.wait_with_output().unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+        out.status.success(),
+    )
+}
+
+/// Writes `<home>/dotonce/rules/<id>.toml` with `id = "<id>"` and then `body`.
+fn add_set(h: &Path, id: &str, body: &str) {
+    let dir = h.join("dotonce/rules");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{id}.toml")),
+        format!("id = \"{id}\"\n{body}"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn rules_new_writes_a_starter_that_checks_clean() {
+    let h = home("rulesnew");
+    let (out, ok) = run(&h, &["rules", "new", "acme-replies", "--drafts"], None);
+    assert!(ok, "{out}");
+    let path = h.join("dotonce/rules/acme-replies.toml");
+    assert_eq!(out.trim().lines().last().unwrap(), path.to_string_lossy());
+    let src = std::fs::read_to_string(&path).unwrap();
+    assert!(src.contains("[draft]\nfence"), "{src}");
+    let (out, ok) = run(&h, &["rules", "check"], None);
+    assert!(ok, "{out}");
+    assert!(out.contains("ok     acme-replies (7 checks)"), "{out}");
+    let (_, err, ok) = run_full(&h, &h, &["rules", "new", "acme-replies", "--drafts"], None);
+    assert!(!ok);
+    assert!(err.contains("already exists"), "{err}");
+    let (_, err, ok) = run_full(&h, &h, &["rules", "new", "Acme Replies"], None);
+    assert!(!ok);
+    assert!(err.contains("a-z"), "{err}");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn rules_new_asks_drafts_or_whole_replies() {
+    let h = home("rulesask");
+    let (out, ok) = run(&h, &["rules", "new", "acme-chat"], Some("w\n"));
+    assert!(ok, "{out}");
+    assert!(out.contains("whole replies"), "{out}");
+    let src = std::fs::read_to_string(h.join("dotonce/rules/acme-chat.toml")).unwrap();
+    assert!(!src.contains("\n[draft]"), "{src}");
+    let (_, ok) = run(&h, &["rules", "new", "acme-notes"], Some("\n"));
+    assert!(ok);
+    let src = std::fs::read_to_string(h.join("dotonce/rules/acme-notes.toml")).unwrap();
+    assert!(src.contains("\n[draft]"), "{src}");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn rules_check_lists_broken_files_and_fails() {
+    let h = home("rulescheck");
+    let (out, ok) = run(&h, &["rules", "check"], None);
+    assert!(ok, "{out}");
+    assert!(out.contains("no rule sets in"), "{out}");
+    add_set(&h, "good", "");
+    add_set(&h, "bad", "[[check]]\nid = \"a\"\nforbid = [\"x\"]\n");
+    let (out, err, ok) = run_full(&h, &h, &["rules", "check"], None);
+    assert!(!ok);
+    assert!(out.contains("ok     good (0 checks)"), "{out}");
+    assert!(
+        out.contains("bad.toml") && out.contains("check a has no why"),
+        "{out}"
+    );
+    assert!(err.contains("1 rule file"), "{err}");
+    std::fs::remove_dir_all(&h).unwrap();
+}

@@ -3,6 +3,7 @@ use std::panic::{self, AssertUnwindSafe};
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
+use dotonce::commands;
 use dotonce::config;
 use dotonce::fact::{Fact, slug};
 use dotonce::facts;
@@ -70,6 +71,49 @@ enum Cmd {
     Hook { event: String },
     /// Print the hooks block to add to Claude Code's settings.json.
     HookConfig,
+    /// Rule sets in ~/.dotonce/rules: create, check, test, approve and manage them.
+    Rules {
+        #[command(subcommand)]
+        cmd: RulesCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum RulesCmd {
+    /// Write a commented starter rule set.
+    New {
+        id: String,
+        /// Check fenced drafts in replies (the default).
+        #[arg(long, conflicts_with = "whole_reply")]
+        drafts: bool,
+        /// Check whole replies instead of fenced drafts.
+        #[arg(long)]
+        whole_reply: bool,
+    },
+    /// Check every rule file and list the errors.
+    Check,
+}
+
+fn rules_cmd(cmd: RulesCmd) -> Result<()> {
+    match cmd {
+        RulesCmd::New {
+            id,
+            drafts,
+            whole_reply,
+        } => {
+            let whole = if whole_reply {
+                Some(true)
+            } else if drafts {
+                Some(false)
+            } else {
+                None
+            };
+            let path = commands::rules_new(&id, whole, &mut io::stdin().lock())?;
+            println!("{}", path.display());
+            Ok(())
+        }
+        RulesCmd::Check => commands::rules_check(),
+    }
 }
 
 fn now() -> i64 {
@@ -183,5 +227,6 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&out)?);
             Ok(())
         }
+        Cmd::Rules { cmd } => rules_cmd(cmd),
     }
 }

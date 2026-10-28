@@ -1,3 +1,4 @@
+pub mod commands;
 pub mod config;
 pub mod fact;
 pub mod facts;
@@ -8,6 +9,7 @@ pub mod model;
 pub mod names;
 pub mod query;
 pub mod retrieve;
+pub mod rules;
 pub mod serve;
 pub mod store;
 pub mod timeq;
