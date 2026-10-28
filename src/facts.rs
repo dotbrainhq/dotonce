@@ -1,7 +1,7 @@
 //! Facts: markdown files in the configured stores, kept in sync with one
 //! search index. Each fact is indexed as a one-turn session for user `facts`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -35,7 +35,8 @@ const BLOCK_RESERVE: usize = 120;
 /// no facts, since any match would be on the filler alone.
 const FILLER: &[&str] = &[
     "ok", "okay", "yeah", "yep", "sure", "thanks", "thank", "please", "hi", "hello", "hey", "fine",
-    "good", "great",
+    "good", "great", "looks", "look", "continue", "go", "ahead", "yes", "nice", "cool", "done",
+    "perfect", "right", "correct", "agree", "lgtm",
 ];
 
 const META: &str = "CREATE TABLE IF NOT EXISTS fact_meta(
@@ -430,8 +431,130 @@ pub fn search(
         }
         ids.push(doc_id);
     }
+    let ids = gate(ix, query, ids, private_ok)?;
     let budget = budget.saturating_sub(BLOCK_RESERVE);
     take_within(ix, ids, private_ok, now, budget)
+}
+
+/// Share of the prompt's weight a fact's title must cover to count as a match.
+const COVER: f64 = 0.3;
+/// The best fact must cover this much of the prompt, or nothing is sent: a
+/// prompt no fact is clearly about (a pasted log, a status line) gets no block.
+const BEST_COVER: f64 = 0.5;
+/// Facts after the best must cover at least this share of what the best covers.
+const NEAR_BEST: f64 = 0.4;
+/// A prompt with one meaningful word only gets facts when that word is in at
+/// most this share of fact titles (or in one title), so "looks" alone
+/// matches nothing.
+const RARE_SHARE: f64 = 0.03;
+/// A prompt word no fact title has still counts toward the prompt's weight, at
+/// this share of the rarest word's weight. A pasted log is mostly such words,
+/// so a fact that matches its few known ones covers little of it.
+const UNSEEN: f64 = 0.5;
+
+/// How one prompt word weighs across fact titles.
+struct Weight {
+    idf: f64,
+    rare: bool,
+}
+
+fn tokens(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() > 1)
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Crude stemming: "repros" and "reproductions", "dash" and "dashes" match.
+fn word_match(term: &str, word: &str) -> bool {
+    if term == word {
+        return true;
+    }
+    let (t, w) = (term.chars().count(), word.chars().count());
+    if t >= 4 && word.starts_with(term) || w >= 4 && term.starts_with(word) {
+        return true;
+    }
+    t >= 5 && w >= 5 && term.chars().take(5).eq(word.chars().take(5))
+}
+
+/// Keeps only facts whose name and description are about the prompt, not
+/// facts that share a few common words with it. Each prompt word is weighted
+/// by how rare it is across fact titles.
+fn gate(ix: &Index, query: &str, ids: Vec<String>, private_ok: bool) -> Result<Vec<String>> {
+    if ids.is_empty() {
+        return Ok(ids);
+    }
+    let titles: HashMap<String, Vec<String>> = {
+        let mut st = ix
+            .conn
+            .prepare("SELECT doc_id, name, description, private FROM fact_meta")?;
+        st.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, bool>(3)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .filter(|(_, _, _, private)| private_ok || !private)
+        .map(|(id, name, desc, _)| (id, tokens(&format!("{name} {desc}"))))
+        .collect()
+    };
+    let n = titles.len().max(1) as f64;
+    let terms: Vec<String> = query::terms(query)
+        .into_iter()
+        .filter(|t| !FILLER.contains(&t.as_str()))
+        .collect();
+    let weights: Vec<Weight> = terms
+        .iter()
+        .map(|t| {
+            let df = titles
+                .values()
+                .filter(|ws| ws.iter().any(|w| word_match(t, w)))
+                .count() as f64;
+            // Smoothed so a word every title has still counts on a small store.
+            let idf = if df == 0.0 { 0.0 } else { (1.0 + n / df).ln() };
+            Weight {
+                idf,
+                rare: df > 0.0 && df <= (n * RARE_SHARE).max(1.0),
+            }
+        })
+        .collect();
+    let seen: f64 = weights.iter().map(|w| w.idf).sum();
+    if seen <= 0.0 {
+        return Ok(Vec::new());
+    }
+    let unseen = weights.iter().filter(|w| w.idf == 0.0).count() as f64;
+    let total = seen + unseen * UNSEEN * (1.0 + n).ln();
+    let useful = weights.iter().filter(|w| w.idf > 0.0).count();
+    if useful == 1 && !weights.iter().any(|w| w.rare) {
+        return Ok(Vec::new());
+    }
+    let scored: Vec<(String, f64, usize)> = ids
+        .into_iter()
+        .filter_map(|id| {
+            let ws = titles.get(&id)?;
+            let (mut got, mut hits) = (0.0, 0);
+            for (t, wt) in terms.iter().zip(&weights) {
+                if wt.idf > 0.0 && ws.iter().any(|w| word_match(t, w)) {
+                    got += wt.idf;
+                    hits += 1;
+                }
+            }
+            Some((id, got / total, hits))
+        })
+        .collect();
+    let best = scored.iter().map(|s| s.1).fold(0.0, f64::max);
+    if best < BEST_COVER {
+        return Ok(Vec::new());
+    }
+    let min_cover = COVER.max(best * NEAR_BEST);
+    Ok(scored
+        .into_iter()
+        .filter(|(_, cover, hits)| *cover >= min_cover && *hits >= useful.min(2))
+        .map(|(id, ..)| id)
+        .collect())
 }
 
 pub fn pinned(
@@ -796,10 +919,140 @@ mod tests {
                 .map(|h| h.name)
                 .collect()
         };
-        assert_eq!(names(Path::new("/tmp")), vec!["weekly-notes"]);
+        // From a public cwd, the private facts must not change the result:
+        // it matches a store that holds only the public fact.
+        let alone = tmp("floor-public-alone");
+        fs::copy(d.join("public.md"), alone.join("public.md")).unwrap();
+        let alone_cfg = cfg_for(&alone, &[]);
+        let mut alone_ix = open_at(":memory:").unwrap();
+        sync(&mut alone_ix, &alone_cfg).unwrap();
+        let expected: Vec<String> = search(
+            &alone_ix,
+            &alone_cfg,
+            "zebra crossing codes",
+            Path::new("/tmp"),
+            NOW,
+            1_500,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|h| h.name)
+        .collect();
+        assert_eq!(names(Path::new("/tmp")), expected);
+        fs::remove_dir_all(&alone).unwrap();
         let inside = names(&root.join("src"));
         assert!(!inside.is_empty());
         assert!(!inside.contains(&"weekly-notes".to_string()), "{inside:?}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    fn gate_store(name: &str) -> (PathBuf, Config, Index) {
+        let d = tmp(name);
+        write(
+            &d,
+            "a.md",
+            &entry(
+                "lint-before-commit",
+                "Run the linter before every commit",
+                "",
+            ),
+        );
+        write(
+            &d,
+            "b.md",
+            &entry(
+                "deploy-day",
+                "Deploys happen on Tuesdays after the review",
+                "",
+            ),
+        );
+        write(
+            &d,
+            "c.md",
+            &entry(
+                "staging-site",
+                "The staging site is staging.example.com",
+                "",
+            ),
+        );
+        for i in 0..40 {
+            write(
+                &d,
+                &format!("n{i}.md"),
+                &entry(
+                    &format!("team-note-{i}"),
+                    &format!("A team note about the weekly plan, part {i}"),
+                    "",
+                ),
+            );
+        }
+        let cfg = cfg_for(&d, &[]);
+        let mut ix = open_at(":memory:").unwrap();
+        sync(&mut ix, &cfg).unwrap();
+        (d, cfg, ix)
+    }
+
+    fn gate_names(ix: &Index, cfg: &Config, q: &str) -> Vec<String> {
+        search(ix, cfg, q, Path::new("/tmp"), NOW, 1_500)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.name)
+            .collect()
+    }
+
+    #[test]
+    fn gate_keeps_a_fact_the_prompt_is_about() {
+        let (d, cfg, ix) = gate_store("gate-keep");
+        assert_eq!(
+            gate_names(&ix, &cfg, "should I run the linter before this commit?")[0],
+            "lint-before-commit"
+        );
+        assert_eq!(
+            gate_names(&ix, &cfg, "which day do deploys happen?")[0],
+            "deploy-day"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn gate_sends_nothing_for_a_pasted_log() {
+        let (d, cfg, ix) = gate_store("gate-log");
+        let log = "user@host % ./build.sh --release\nCompiling widgets v0.3.1\nFinished release in 41s\nwrote /var/tmp/out/widgets.tar.gz (2.1 MB)\nnote: the team plan cache was refreshed";
+        let got = gate_names(&ix, &cfg, log);
+        assert!(got.is_empty(), "{got:?}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn gate_needs_a_rare_word_when_the_prompt_has_one() {
+        let (d, cfg, ix) = gate_store("gate-one-word");
+        let got = gate_names(&ix, &cfg, "team");
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(gate_names(&ix, &cfg, "linter"), vec!["lint-before-commit"]);
+        let got = gate_names(&ix, &cfg, "thanks, looks good");
+        assert!(got.is_empty(), "{got:?}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn gate_works_on_a_store_with_one_fact() {
+        let d = tmp("gate-tiny");
+        write(
+            &d,
+            "a.md",
+            &entry(
+                "staging-site",
+                "The staging site is staging.example.com",
+                "",
+            ),
+        );
+        let cfg = cfg_for(&d, &[]);
+        let mut ix = open_at(":memory:").unwrap();
+        sync(&mut ix, &cfg).unwrap();
+        assert_eq!(
+            gate_names(&ix, &cfg, "where is the staging site?"),
+            vec!["staging-site"]
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 
