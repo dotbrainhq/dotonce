@@ -148,21 +148,30 @@ fn prompt(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
     let file_cfg = config::load_file()?;
     let cfg = file_cfg.clone().unwrap_or_default();
     let (rules_text, used) = reminders_for(v, &cfg, cwd, Event::Prompt(text));
-    let mut facts_block = None;
     // Without a config, dotonce isn't set up yet: leave no index behind.
-    if file_cfg.is_some() {
-        let mut ix = facts::open()?;
-        // A failed sync can leave an old entry in place, such as a fact that
-        // was public before it was marked private, so nothing is shown until
-        // it syncs.
-        facts::sync(&mut ix, &cfg)?;
-        let budget = cfg.prompt_budget.min(MAX_BUDGET.saturating_sub(used));
-        let hits = facts::search(&ix, &cfg, text, cwd, now, budget)?;
-        if !hits.is_empty() {
-            facts_block = Some(facts::render_block(PROMPT_TITLE, &hits, &self_command()));
-        }
-    }
-    Ok(compose(&rules_text, facts_block).map(|b| context("UserPromptSubmit", &b)))
+    let facts_block = file_cfg.is_some().then(|| {
+        facts_or_log(|| {
+            let mut ix = facts::open()?;
+            // A failed sync can leave an old entry in place, such as a fact
+            // that was public before it was marked private, so nothing is
+            // shown until it syncs.
+            facts::sync(&mut ix, &cfg)?;
+            let budget = cfg.prompt_budget.min(MAX_BUDGET.saturating_sub(used));
+            let hits = facts::search(&ix, &cfg, text, cwd, now, budget)?;
+            Ok((!hits.is_empty())
+                .then(|| facts::render_block(PROMPT_TITLE, &hits, &self_command())))
+        })
+    });
+    Ok(compose(&rules_text, facts_block.flatten()).map(|b| context("UserPromptSubmit", &b)))
+}
+
+/// The facts block from `f`. A failure, such as a locked index, is logged
+/// and gives no facts, so the reminders, already marked given, still arrive.
+fn facts_or_log(f: impl FnOnce() -> Result<Option<String>>) -> Option<String> {
+    f().unwrap_or_else(|e| {
+        log_error(&format!("facts: {e:#}"));
+        None
+    })
 }
 
 /// The last session's live sets, kept so the next session can say what
@@ -408,8 +417,8 @@ fn approval_lines(
 }
 
 /// Cleans old session files, reports rule sets that stopped running and rule
-/// files with errors, and after compaction gives back every active set's
-/// reminder.
+/// files with errors, and after compaction gives back the active sets'
+/// reminders.
 fn session_rules(v: &Value, cfg: &Config, cwd: &Path) -> Result<(String, usize, Option<String>)> {
     let dir = session::dir()?;
     session::clean_old(&dir, SystemTime::now());
@@ -417,10 +426,16 @@ fn session_rules(v: &Value, cfg: &Config, cwd: &Path) -> Result<(String, usize, 
     let approved = approvals::load()
         .map_err(|e| log_error(&format!("rules: {e:#}")))
         .ok();
-    let mut state = match session_id(v) {
-        Ok(sid) => Some((sid, session::load(&dir, sid)?)),
-        Err(_) => None,
-    };
+    // A session that can't be loaded still gets the notice, with no paused sets.
+    let state = session_id(v)
+        .ok()
+        .and_then(|sid| match session::load(&dir, sid) {
+            Ok(s) => Some((sid, s)),
+            Err(e) => {
+                log_error(&format!("rules: {e:#}"));
+                None
+            }
+        });
     let paused = state
         .as_ref()
         .map(|(_, s)| s.paused.clone())
@@ -431,18 +446,35 @@ fn session_rules(v: &Value, cfg: &Config, cwd: &Path) -> Result<(String, usize, 
         return Ok((String::new(), 0, system));
     }
     let live = approvals::live(loaded.sets, &approved.unwrap_or_default());
-    if live.is_empty() {
-        return Ok((String::new(), 0, system));
-    }
-    let Some((sid, state)) = state.as_mut() else {
-        bail!("the hook input has no session_id");
-    };
-    session::refresh(state, &live, cfg, cwd, prompt_id(v), Event::Other);
-    let rem = session::compact_reminders(state, &live, prompt_id(v));
-    let (text, used, given) = reminder_section(&rem, MAX_BUDGET);
-    session::mark_reminded(state, &given);
-    session::save(&dir, sid, state)?;
+    let (text, used) = compact(v, cfg, cwd, &dir, &live, state).unwrap_or_else(|e| {
+        log_error(&format!("rules: {e:#}"));
+        (String::new(), 0)
+    });
     Ok((text, used, system))
+}
+
+/// After compaction, the reminders the context lost: skill and folder sets,
+/// and this turn's prompt-word sets.
+fn compact(
+    v: &Value,
+    cfg: &Config,
+    cwd: &Path,
+    dir: &Path,
+    live: &[approvals::Live],
+    state: Option<(&str, session::State)>,
+) -> Result<(String, usize)> {
+    if live.is_empty() {
+        return Ok((String::new(), 0));
+    }
+    let Some((sid, mut state)) = state else {
+        bail!("the hook input has no usable session_id");
+    };
+    session::refresh(&mut state, live, cfg, cwd, prompt_id(v), Event::Other);
+    let rem = session::compact_reminders(&state, live, prompt_id(v));
+    let (text, used, given) = reminder_section(&rem, MAX_BUDGET);
+    session::mark_reminded(&mut state, &given);
+    session::save(dir, sid, &state)?;
+    Ok((text, used))
 }
 
 fn session_start(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
@@ -452,16 +484,17 @@ fn session_start(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
         log_error(&format!("rules: {e:#}"));
         (String::new(), 0, None)
     });
-    let mut facts_block = None;
-    if file_cfg.is_some() {
-        let mut ix = facts::open()?;
-        facts::sync(&mut ix, &cfg)?;
-        let budget = cfg.session_budget.min(MAX_BUDGET.saturating_sub(used));
-        let hits = facts::pinned(&ix, &cfg, cwd, now, budget)?;
-        if !hits.is_empty() {
-            facts_block = Some(facts::render_block(SESSION_TITLE, &hits, &self_command()));
-        }
-    }
+    let facts_block = file_cfg.is_some().then(|| {
+        facts_or_log(|| {
+            let mut ix = facts::open()?;
+            facts::sync(&mut ix, &cfg)?;
+            let budget = cfg.session_budget.min(MAX_BUDGET.saturating_sub(used));
+            let hits = facts::pinned(&ix, &cfg, cwd, now, budget)?;
+            Ok((!hits.is_empty())
+                .then(|| facts::render_block(SESSION_TITLE, &hits, &self_command())))
+        })
+    });
+    let facts_block = facts_block.flatten();
     let mut out = Map::new();
     if let Some(msg) = system {
         out.insert("systemMessage".to_string(), Value::String(msg));

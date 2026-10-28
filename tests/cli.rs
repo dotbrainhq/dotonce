@@ -1700,3 +1700,63 @@ fn compaction_gives_back_only_this_turns_prompt_sets() {
     );
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+#[test]
+fn a_facts_failure_still_gives_the_reminders() {
+    let h = home("factsfail");
+    run(&h, &["init"], None);
+    run(&h, &["save", "The staging site is acme.example.com"], None);
+    add_set(&h, "acme-replies", REPLIES);
+    approve(&h, "acme-replies", "warn");
+    let lock = rusqlite::Connection::open(h.join("dotonce/index.sqlite")).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    // A new file means the hook's sync has to write, and the lock stops it.
+    std::fs::write(
+        h.join("dotonce/notes/second.md"),
+        "---\nname: second\ndescription: The staging site moved to acme2.example.com\n---\n",
+    )
+    .unwrap();
+    let out = hook(
+        &h,
+        "prompt",
+        serde_json::json!({"session_id": "s1", "prompt_id": "p1", "prompt": "draft the staging site reply", "cwd": "/tmp"}),
+    );
+    let ctx = context(&out, "UserPromptSubmit");
+    assert!(ctx.contains("Links go inline"), "{ctx}");
+    assert!(
+        !ctx.contains("example.com"),
+        "no facts until the index syncs: {ctx}"
+    );
+    let out = hook(
+        &h,
+        "session-start",
+        serde_json::json!({"session_id": "s1", "prompt_id": "p1", "source": "compact", "cwd": "/tmp"}),
+    );
+    assert!(
+        context(&out, "SessionStart").contains("Links go inline"),
+        "{out}"
+    );
+    let log = std::fs::read_to_string(h.join("dotonce/errors.log")).unwrap();
+    assert!(log.contains("facts") && log.contains("locked"), "{log}");
+    lock.execute_batch("ROLLBACK").unwrap();
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn an_unusable_session_id_still_gives_the_notice() {
+    let h = home("badsid");
+    add_set(&h, "acme-replies", REPLIES);
+    approve(&h, "acme-replies", "warn");
+    turn_off(&h, "acme-replies");
+    for source in ["startup", "compact"] {
+        let out = hook(
+            &h,
+            "session-start",
+            serde_json::json!({"session_id": "!!!", "source": source, "cwd": "/tmp"}),
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&out).unwrap_or_else(|e| panic!("{source}: {e}: {out}"));
+        assert_eq!(v["systemMessage"], "Off: acme-replies.", "{source}: {out}");
+    }
+    std::fs::remove_dir_all(&h).unwrap();
+}
