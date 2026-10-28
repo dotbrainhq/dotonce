@@ -1,5 +1,6 @@
-//! MessageDisplay: holds a draft back on screen until its checks pass, so a
-//! broken draft never shows. Display only: what Claude sees doesn't change.
+//! MessageDisplay: labels a draft that breaks a fix set's checks, so the user
+//! knows a corrected one follows. Never hides or drops text. Display only:
+//! what Claude sees doesn't change.
 
 use std::fs;
 use std::io;
@@ -14,37 +15,21 @@ use crate::checks::{self, fence_closes, fence_open};
 use crate::hook::{log_error, prompt_id, session_id, str_field};
 use crate::session;
 
-pub const HELD_NOTE: &str =
-    "(dotonce held back a draft that breaks one of your rules. Claude is writing a corrected one.)";
-pub const INTERRUPTED_NOTE: &str =
-    "(dotonce: an earlier draft, not checked because the reply was interrupted)";
-pub const UNFIXED_NOTE: &str = "dotonce held back a draft that wasn't fixed; here it is:";
-/// A withheld draft this old shows at the next hook of any kind.
-const MAX_WITHHELD_AGE: i64 = 60 * 60;
-
-/// A draft that was swapped for the note. Stop clears it when it sends the
-/// turn back, since the corrected draft follows; any other way, it shows.
-/// It holds work text, so it lives only in the session's display file
-/// (swept by `session::clean_old`) and is never logged.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct Withheld {
-    pub turn: String,
-    pub message_id: String,
-    pub text: String,
-    /// When it was held back, in Unix seconds.
-    pub time: i64,
+/// The line shown above a draft that breaks the checks with these ids.
+pub fn label(ids: &[String]) -> String {
+    format!(
+        "dotonce: this draft breaks your {} rule. A corrected one follows below.",
+        ids.join(", ")
+    )
 }
 
-impl Withheld {
-    pub fn is_old(&self, now: i64) -> bool {
-        now - self.time > MAX_WITHHELD_AGE
-    }
-}
-
+/// A message's lines still buffered while a draft streams in, so it can be
+/// checked whole.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct Held {
+pub struct Buffer {
     pub message_id: String,
-    /// The open fence: its character, its length, and whether its lines are held.
+    /// The open fence: its character, its length, and whether its lines are
+    /// buffered.
     pub fence: Option<(char, usize, bool)>,
     pub lines: Vec<String>,
     /// The batch index expected next.
@@ -54,11 +39,6 @@ pub struct Held {
     /// shows as it is.
     #[serde(default)]
     pub pass: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub withheld: Vec<Withheld>,
-    /// Drafts swapped for the note in this call, not yet recorded.
-    #[serde(skip)]
-    pub swapped: Vec<String>,
 }
 
 /// A set marks fenced blocks with this info string as its drafts.
@@ -69,55 +49,59 @@ fn marks_drafts(l: &Live, info: &str) -> bool {
         .is_some_and(|d| d.fence.iter().any(|f| f == info))
 }
 
-/// The held block, or the note when a set that holds its fence fails it. A
-/// whole-reply set checks the full reply at Stop, never one block of it.
-fn release(held: &mut Held, sets: &[&Live]) -> String {
-    let text = held.lines.concat();
-    held.lines.clear();
+/// The buffered block as written, under the label when a set that marks its
+/// fence fails it. A whole-reply set checks the full reply at Stop, never
+/// one block of it.
+fn release(buf: &mut Buffer, sets: &[&Live]) -> String {
+    let text = buf.lines.concat();
+    buf.lines.clear();
     let info = text
         .lines()
         .next()
         .and_then(fence_open)
         .map(|(_, _, info)| info)
         .unwrap_or_default();
-    let broken = sets
-        .iter()
-        .filter(|l| marks_drafts(l, &info))
-        .any(|l| !checks::run_reply(&l.set, &text).is_empty());
-    if broken {
-        held.swapped.push(text);
-        format!("{HELD_NOTE}\n")
-    } else {
+    let mut ids: Vec<String> = Vec::new();
+    for l in sets.iter().filter(|l| marks_drafts(l, &info)) {
+        for f in checks::run_reply(&l.set, &text) {
+            if !ids.contains(&f.check) {
+                ids.push(f.check);
+            }
+        }
+    }
+    if ids.is_empty() {
         text
+    } else {
+        format!("{}\n{text}", label(&ids))
     }
 }
 
-/// What to show in place of one batch of lines. `sets` are the checking fix
-/// sets; `last` is the message's final batch.
-pub fn step(held: &mut Held, delta: &str, last: bool, sets: &[&Live]) -> String {
+/// What to show in place of one batch of lines. `sets` are the fix sets
+/// whose drafts get labeled; `last` is the message's final batch.
+pub fn step(buf: &mut Buffer, delta: &str, last: bool, sets: &[&Live]) -> String {
     let mut shown = String::new();
     for line in delta.split_inclusive('\n') {
         let bare = line.trim_end_matches(['\n', '\r']);
-        match held.fence {
-            Some((ch, len, hold)) => {
-                if hold {
-                    held.lines.push(line.to_string());
+        match buf.fence {
+            Some((ch, len, buffered)) => {
+                if buffered {
+                    buf.lines.push(line.to_string());
                 } else {
                     shown.push_str(line);
                 }
                 if fence_closes(bare, ch, len) {
-                    held.fence = None;
-                    if hold {
-                        shown.push_str(&release(held, sets));
+                    buf.fence = None;
+                    if buffered {
+                        shown.push_str(&release(buf, sets));
                     }
                 }
             }
             None => {
                 if let Some((ch, len, info)) = fence_open(bare) {
-                    let hold = sets.iter().any(|l| marks_drafts(l, &info));
-                    held.fence = Some((ch, len, hold));
-                    if hold {
-                        held.lines.push(line.to_string());
+                    let buffered = sets.iter().any(|l| marks_drafts(l, &info));
+                    buf.fence = Some((ch, len, buffered));
+                    if buffered {
+                        buf.lines.push(line.to_string());
                         continue;
                     }
                 }
@@ -126,82 +110,33 @@ pub fn step(held: &mut Held, delta: &str, last: bool, sets: &[&Live]) -> String 
         }
     }
     if last {
-        shown.push_str(&held.lines.concat());
-        held.lines.clear();
-        held.fence = None;
+        shown.push_str(&buf.lines.concat());
+        buf.lines.clear();
+        buf.fence = None;
     }
     shown
 }
 
-fn load_held(path: &Path) -> Held {
+fn load_buffer(path: &Path) -> Buffer {
     fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
 
-/// Everything held, then the batch as it is.
-fn release_all(held: &mut Held, delta: &str) -> String {
-    let mut shown = held.lines.concat();
+/// Everything buffered, then the batch as it is.
+fn release_all(buf: &mut Buffer, delta: &str) -> String {
+    let mut shown = buf.lines.concat();
     shown.push_str(delta);
-    held.lines.clear();
-    held.fence = None;
+    buf.lines.clear();
+    buf.fence = None;
     shown
 }
 
-/// Each withheld draft under the note that says it wasn't fixed, one after
-/// another, each ending in a newline.
-fn unfixed_text(records: &[Withheld]) -> String {
-    let mut s = String::new();
-    for r in records {
-        s.push_str(UNFIXED_NOTE);
-        s.push('\n');
-        s.push_str(&r.text);
-        if !s.ends_with('\n') {
-            s.push('\n');
-        }
-    }
-    s
-}
-
-/// The withheld drafts as a hook's systemMessage, or None when there are none.
-pub fn unfixed_message(records: &[Withheld]) -> Option<String> {
-    (!records.is_empty()).then(|| unfixed_text(records).trim_end().to_string())
-}
-
-/// Takes the withheld drafts `pick` selects out of the session's display
-/// file and returns them, oldest first, for the caller to show. If the file
-/// can't be saved they are still returned, and may show again later.
-pub fn take_withheld(dir: &Path, sid: &str, pick: impl Fn(&Withheld) -> bool) -> Vec<Withheld> {
-    let Ok(path) = session::display_file(dir, sid) else {
-        return Vec::new();
-    };
-    let mut held = load_held(&path);
-    let (taken, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut held.withheld)
-        .into_iter()
-        .partition(|r| pick(r));
-    if taken.is_empty() {
-        return taken;
-    }
-    held.withheld = kept;
-    let saved = if held.lines.is_empty() && held.withheld.is_empty() {
-        fs::remove_file(&path).map_err(Into::into)
-    } else {
-        save_held(dir, &path, &held)
-    };
-    if let Err(e) = saved {
-        log_error(&format!("display: {e:#}"));
-    }
-    taken
-}
-
-/// Hidden lines only reach the screen through a later batch's output, so
-/// anything that goes wrong after a hold shows the held lines at once and
-/// lets the rest of the message through as it is. A draft swapped for the
-/// note is kept as a withheld record until Stop sends its turn back; it
-/// shows here once a call comes from another turn or message, or once it
-/// is an hour old.
-pub fn display(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
+/// Buffered lines only reach the screen through a later batch's output, so
+/// anything that goes wrong while lines are buffered shows them at once and
+/// lets the rest of the message through as it is.
+pub fn display(v: &Value, cwd: &Path) -> Result<Option<String>> {
     let sid = match session_id(v) {
         Ok(sid) => sid,
         Err(_) if approvals::load_live().is_ok_and(|(l, _)| l.is_empty()) => return Ok(None),
@@ -211,40 +146,34 @@ pub fn display(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
     let path = session::display_file(&dir, sid)?;
     let message = str_field(v, "message_id");
     let state = session::load(&dir, sid).unwrap_or_default();
-    let turn = session::turn_key(&state, prompt_id(v));
-    let mut held = load_held(&path);
-    let (unfixed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut held.withheld)
-        .into_iter()
-        .partition(|r| r.turn != turn || r.message_id != message || r.is_old(now));
-    held.withheld = kept;
-    let mut early = unfixed_text(&unfixed);
-    let same = held.message_id == message;
-    // Lines still held from another message: that message stopped before its
-    // final batch (Esc), so they show now, ahead of this one.
+    let mut buf = load_buffer(&path);
+    let mut early = String::new();
+    let same = buf.message_id == message;
+    // Lines still buffered from another message: that message stopped before
+    // its final batch (Esc), so they show now, ahead of this one.
     if !same {
-        if !held.lines.is_empty() {
-            early.push_str(INTERRUPTED_NOTE);
-            early.push('\n');
-            early.push_str(&held.lines.concat());
+        if !buf.lines.is_empty() {
+            early.push_str(&buf.lines.concat());
             if !early.ends_with('\n') {
                 early.push('\n');
             }
             // The draft stopped inside its fence: close it, so this
             // message doesn't show inside the old block.
-            if let Some((ch, len, _)) = held.fence {
+            if let Some((ch, len, _)) = buf.fence {
                 early.push_str(&ch.to_string().repeat(len));
                 early.push('\n');
             }
         }
-        held = Held {
+        buf = Buffer {
             message_id: message.to_string(),
-            withheld: std::mem::take(&mut held.withheld),
-            ..Held::default()
+            ..Buffer::default()
         };
     }
     let delta = str_field(v, "delta");
-    // Without a final flag, nothing is held past this batch.
+    // Without a final flag, nothing is buffered past this batch.
     let last = v.get("final").and_then(Value::as_bool).unwrap_or(true);
+    // Labeled only when Stop will send the draft back, so a corrected one
+    // follows: a fix set, a turn not sent back yet, and dotonce run at Stop.
     let fix = session::checks_now(&state, cwd, prompt_id(v))
         .map(|now| now.fix().into_iter().cloned().collect::<Vec<_>>())
         .map(|fix| {
@@ -255,45 +184,36 @@ pub fn display(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
             }
         });
     let mut shown = match fix {
-        Ok(fix) if fix.is_empty() && held.lines.is_empty() && early.is_empty() => {
+        Ok(fix) if fix.is_empty() && buf.lines.is_empty() && early.is_empty() => {
             return Ok(None);
         }
         Ok(fix) => {
             if let Some(i) = v.get("index").and_then(Value::as_u64) {
-                held.pass |= i != if same { held.next } else { 0 };
-                held.next = i + 1;
+                buf.pass |= i != if same { buf.next } else { 0 };
+                buf.next = i + 1;
             }
-            if held.pass {
-                release_all(&mut held, delta)
+            if buf.pass {
+                release_all(&mut buf, delta)
             } else {
-                step(&mut held, delta, last, &fix.iter().collect::<Vec<_>>())
+                step(&mut buf, delta, last, &fix.iter().collect::<Vec<_>>())
             }
         }
         Err(e) => {
             log_error(&format!("display: {e:#}"));
-            held.pass = true;
-            release_all(&mut held, delta)
+            buf.pass = true;
+            release_all(&mut buf, delta)
         }
     };
-    for text in std::mem::take(&mut held.swapped) {
-        held.withheld.push(Withheld {
-            turn: turn.clone(),
-            message_id: message.to_string(),
-            text,
-            time: now,
-        });
-    }
-    let saved = if last && held.withheld.is_empty() {
+    let saved = if last {
         let _ = fs::remove_file(&path);
         Ok(())
     } else {
-        save_held(&dir, &path, &held)
+        save_buffer(&dir, &path, &buf)
     };
     if let Err(e) = saved {
         // What isn't saved can't show later, so it shows now.
         log_error(&format!("display: {e:#}"));
-        shown.push_str(&held.lines.concat());
-        shown.push_str(&unfixed_text(&held.withheld));
+        shown.push_str(&buf.lines.concat());
         let _ = fs::remove_file(&path);
     }
     shown.insert_str(0, &early);
@@ -306,9 +226,9 @@ pub fn display(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
     ))
 }
 
-/// Whether Claude Code runs `dotonce hook stop` at Stop. Without it nothing
-/// follows a held draft, so display never holds. Read once per session and
-/// kept in the session state.
+/// Whether Claude Code runs `dotonce hook stop` at Stop. Without it no
+/// corrected draft follows, so display never labels. Read once per session
+/// and kept in the session state.
 fn stop_registered(dir: &Path, sid: &str, state: &session::State, cwd: &Path) -> bool {
     if let Some(found) = state.stop_hook {
         return found;
@@ -366,10 +286,10 @@ fn runs_stop(settings: &Value) -> bool {
 
 /// Written to a temp file and renamed, like `session::save`, so a hook that
 /// stops halfway never leaves a broken file.
-fn save_held(dir: &Path, path: &Path, held: &Held) -> Result<()> {
+fn save_buffer(dir: &Path, path: &Path, buf: &Buffer) -> Result<()> {
     fs::create_dir_all(dir)?;
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-    fs::write(&tmp, serde_json::to_string(held)?)?;
+    fs::write(&tmp, serde_json::to_string(buf)?)?;
     fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -403,41 +323,57 @@ mod tests {
     }
 
     #[test]
-    fn a_broken_draft_is_held_and_swapped_for_a_note() {
+    fn a_broken_draft_shows_in_full_under_a_label() {
         let l = live();
         let sets = vec![&l];
-        let mut held = Held::default();
+        let mut buf = Buffer::default();
         assert_eq!(
             step(
-                &mut held,
+                &mut buf,
                 "Here it is:\n```markdown\nHi Sam,\n",
                 false,
                 &sets
             ),
             "Here it is:\n"
         );
-        assert_eq!(held.lines.len(), 2);
+        assert_eq!(buf.lines.len(), 2);
         assert_eq!(
-            step(&mut held, "Sorry for the wait.\n```\nDone.\n", false, &sets),
-            format!("{HELD_NOTE}\nDone.\n")
+            step(&mut buf, "Sorry for the wait.\n```\nDone.\n", false, &sets),
+            "dotonce: this draft breaks your stock rule. A corrected one follows below.\n```markdown\nHi Sam,\nSorry for the wait.\n```\nDone.\n"
         );
-        assert!(held.lines.is_empty() && held.fence.is_none());
+        assert!(buf.lines.is_empty() && buf.fence.is_none());
+    }
+
+    #[test]
+    fn the_label_names_only_the_failing_checks() {
+        let src = "id = \"t\"\n[draft]\nfence = [\"markdown\"]\n[[check]]\nid = \"stock\"\nforbid = [\"sorry for the wait\"]\nwhy = \"w\"\n[[check]]\nid = \"links\"\nkind = \"bare-url\"\nwhy = \"w\"\n[[check]]\nid = \"tone\"\nforbid = [\"asap\"]\nwhy = \"w\"\n";
+        let l = Live {
+            set: parse(src, Path::new("/r/t.toml")).unwrap(),
+            level: Level::Fix,
+        };
+        let draft = "```markdown\nSorry for the wait.\nSee https://example.com\n```\n";
+        assert_eq!(
+            step(&mut Buffer::default(), draft, true, &[&l]),
+            format!(
+                "dotonce: this draft breaks your stock, links rule. A corrected one follows below.\n{draft}"
+            )
+        );
     }
 
     #[test]
     fn a_passing_draft_shows_in_full_at_its_closing_fence() {
         let l = live();
         let sets = vec![&l];
-        let mut held = Held::default();
-        assert_eq!(step(&mut held, "```markdown\nHi Sam,\n", false, &sets), "");
+        let mut buf = Buffer::default();
+        assert_eq!(step(&mut buf, "```markdown\nHi Sam,\n", false, &sets), "");
         assert_eq!(
-            step(&mut held, "Thanks for the details.\n```\n", false, &sets),
+            step(&mut buf, "Thanks for the details.\n```\n", false, &sets),
             "```markdown\nHi Sam,\nThanks for the details.\n```\n"
         );
     }
 
     #[test]
-    fn a_whole_reply_set_never_hides_a_passing_draft() {
+    fn a_whole_reply_set_never_labels_a_passing_draft() {
         let l = live();
         let whole = Live {
             set: parse(
@@ -448,10 +384,10 @@ mod tests {
             level: Level::Fix,
         };
         let sets = vec![&l, &whole];
-        let mut held = Held::default();
+        let mut buf = Buffer::default();
         assert_eq!(
             step(
-                &mut held,
+                &mut buf,
                 "Here:\n```markdown\nHi Sam,\nThanks for the details.\n```\nCheers\n",
                 true,
                 &sets
@@ -464,25 +400,20 @@ mod tests {
     fn other_fences_and_unclosed_drafts_show_as_they_are() {
         let l = live();
         let sets = vec![&l];
-        let mut held = Held::default();
+        let mut buf = Buffer::default();
         assert_eq!(
-            step(
-                &mut held,
-                "```bash\nsorry for the wait\n```\n",
-                false,
-                &sets
-            ),
+            step(&mut buf, "```bash\nsorry for the wait\n```\n", false, &sets),
             "```bash\nsorry for the wait\n```\n"
         );
         assert_eq!(
-            step(&mut held, "```markdown\nSorry for the wait.", true, &sets),
+            step(&mut buf, "```markdown\nSorry for the wait.", true, &sets),
             "```markdown\nSorry for the wait."
         );
-        assert!(held.lines.is_empty());
-        let mut held = Held::default();
+        assert!(buf.lines.is_empty());
+        let mut buf = Buffer::default();
         assert_eq!(
             step(
-                &mut held,
+                &mut buf,
                 "```markdown\nSorry for the wait.\n```\n",
                 false,
                 &[]

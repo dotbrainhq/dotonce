@@ -11,8 +11,7 @@ use serde_json::{Value, json};
 use crate::approvals::{self, Live};
 use crate::catches::{self, Catch, Outcome};
 use crate::checks::{self, Failure};
-use crate::display;
-use crate::hook::{log_error, prompt_id, session_id, with_message};
+use crate::hook::{log_error, prompt_id, session_id};
 use crate::session::{self, Pending};
 
 pub const SEND_BACK_END: &str =
@@ -214,10 +213,8 @@ fn recheck(p: &Pending, live: &[Live], turn: &Turn, log: &dyn Fn(&Live, &str, Ou
     }
 }
 
-/// Sends a failing draft back, or not, and shows every withheld draft that
-/// won't be followed by a corrected one: all of them, unless the turn is
-/// sent back, and then the ones from other turns. Whatever stops the send-back
-/// (an error, a failed save, a set no longer at fix) leaves the draft shown.
+/// Sends a failing draft back, or not. Whatever stops the send-back (an
+/// error, a failed save, a set no longer at fix) sends nothing.
 pub fn stop(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
     let sid = session_id(v)?;
     let dir = session::dir()?;
@@ -225,28 +222,13 @@ pub fn stop(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
         log_error(&format!("hook stop: {e:#}"));
         None
     });
-    let turn = sent.as_ref().map(|(turn, _)| turn.as_str());
-    let shown: Vec<_> = display::take_withheld(&dir, sid, |_| true)
-        .into_iter()
-        .filter(|r| Some(r.turn.as_str()) != turn)
-        .collect();
-    let out = sent.map(|(_, text)| stop_output(&text));
-    Ok(match display::unfixed_message(&shown) {
-        Some(msg) => with_message(out, msg),
-        None => out,
-    })
+    Ok(sent.map(|text| stop_output(&text)))
 }
 
-/// The turn and the send-back text when this turn's drafts go back. An
-/// error, including a failed save of the state that records the send-back,
-/// means nothing goes back.
-fn send_back(
-    v: &Value,
-    cwd: &Path,
-    now: i64,
-    sid: &str,
-    dir: &Path,
-) -> Result<Option<(String, String)>> {
+/// The send-back text when this turn's drafts go back. An error, including
+/// a failed save of the state that records the send-back, means nothing
+/// goes back.
+fn send_back(v: &Value, cwd: &Path, now: i64, sid: &str, dir: &Path) -> Result<Option<String>> {
     let checks = session::checks_now(&session::load(dir, sid)?, cwd, prompt_id(v))?;
     if checks.live.is_empty() {
         return Ok(None);
@@ -316,7 +298,7 @@ fn send_back(
                     .map(|f| (f.set.clone(), f.check.clone()))
                     .collect(),
             });
-            Some((turn.clone(), send_back_text(&send)))
+            Some(send_back_text(&send))
         }
     };
     session::save(dir, sid, &state)?;

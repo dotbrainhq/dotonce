@@ -160,7 +160,8 @@ pub fn save(dir: &Path, session_id: &str, state: &State) -> Result<()> {
     Ok(())
 }
 
-/// Where the MessageDisplay hook keeps the lines it holds back.
+/// Where the MessageDisplay hook keeps the lines it buffers while a draft
+/// streams in.
 pub fn display_file(dir: &Path, session_id: &str) -> Result<PathBuf> {
     Ok(dir.join(format!("{}.display.json", safe_name(session_id)?)))
 }
@@ -482,7 +483,7 @@ pub struct Now {
 
 impl Now {
     /// The fix sets that check drafts right now. None once the turn was sent
-    /// back: Stop sends a turn back once, so a draft held after that would
+    /// back: Stop sends a turn back once, so a draft labeled after that would
     /// never be followed by a corrected one.
     pub fn fix(&self) -> Vec<&Live> {
         if self.state.sent_back(&self.turn) {
@@ -497,7 +498,7 @@ impl Now {
 
 /// Which sets check drafts right now, worked out the way Stop does: the live
 /// sets, the config, and `refresh` with the hook's cwd and turn on a copy of
-/// `state`. Display and Stop both use it, so display never holds a draft
+/// `state`. Display and Stop both use it, so display never labels a draft
 /// for a set Stop would drop. An error means no sets: display then shows
 /// the text as it is, and Stop sends nothing back.
 pub fn checks_now(state: &State, cwd: &Path, prompt_id: Option<&str>) -> Result<Now> {

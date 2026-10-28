@@ -2038,7 +2038,7 @@ fn the_stop_continuation_in_the_session_record_is_not_a_new_turn() {
 }
 
 #[test]
-fn display_hook_holds_a_broken_draft_back() {
+fn display_hook_labels_a_broken_draft() {
     let h = ticket_home("display", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
@@ -2069,20 +2069,26 @@ fn display_hook_holds_a_broken_draft_back() {
     assert_eq!(
         shown(&batch("m1", 1, true, "Sorry for the wait.\n```\n")).as_deref(),
         Some(
-            "(dotonce held back a draft that breaks one of your rules. Claude is writing a corrected one.)\n"
-        )
+            "dotonce: this draft breaks your no-stock-wait-opener rule. A corrected one follows below.\n```markdown\nHi Sam,\nSorry for the wait.\n```\n"
+        ),
+        "the whole draft shows, under the label"
     );
     assert_eq!(
-        shown(&batch("m2", 0, true, "Plain reply.\n")).as_deref(),
-        Some(format!("{UNFIXED}\nPlain reply.\n").as_str()),
-        "no Stop sent m1's turn back, so the next message shows the draft"
+        shown(&batch(
+            "m2",
+            0,
+            true,
+            "Draft:\n```markdown\nHi Sam,\nThanks for the details.\n```\n"
+        )),
+        None,
+        "a passing draft shows as written"
     );
     assert_eq!(batch("m3", 0, true, "Plain reply.\n"), "");
     std::fs::remove_dir_all(&h).unwrap();
 }
 
 #[test]
-fn display_hook_never_loses_held_lines() {
+fn display_hook_never_loses_buffered_lines() {
     let h = ticket_home("displaysafe", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
@@ -2101,7 +2107,7 @@ fn display_hook_never_loses_held_lines() {
     };
     let at = |mid: &str, i: u32, last: bool, delta: &str| serde_json::json!({"session_id": "s1", "message_id": mid, "index": i, "final": last, "delta": delta});
     let open = "Draft:\n```markdown\nHi Sam,\n";
-    let held = "```markdown\nHi Sam,\nSorry for the wait.\n";
+    let buffered = "```markdown\nHi Sam,\nSorry for the wait.\n";
 
     assert_eq!(batch(at("m1", 0, false, open)).as_deref(), Some("Draft:\n"));
     let approvals = h.join("dotonce/approvals.json");
@@ -2109,8 +2115,8 @@ fn display_hook_never_loses_held_lines() {
     std::fs::write(&approvals, "not json").unwrap();
     assert_eq!(
         batch(at("m1", 1, false, "Sorry for the wait.\n")).as_deref(),
-        Some(held),
-        "a hook error shows what was held"
+        Some(buffered),
+        "a hook error shows the buffered lines"
     );
     std::fs::write(&approvals, saved).unwrap();
     assert_eq!(
@@ -2127,17 +2133,24 @@ fn display_hook_never_loses_held_lines() {
     assert_eq!(batch(at("m2", 0, false, open)).as_deref(), Some("Draft:\n"));
     assert_eq!(
         batch(at("m2", 2, false, "Sorry for the wait.\n")).as_deref(),
-        Some(held),
-        "a skipped batch shows what was held"
+        Some(buffered),
+        "a skipped batch shows the buffered lines"
     );
     assert_eq!(batch(at("m2", 3, true, "```\n")), None);
+
+    assert_eq!(batch(at("m4", 0, false, open)).as_deref(), Some("Draft:\n"));
+    assert_eq!(
+        batch(at("m4", 1, true, "Sorry for the wait.\n")).as_deref(),
+        Some(buffered),
+        "a fence still open at the last batch shows as written, unlabeled"
+    );
 
     let no_final =
         |delta: &str| serde_json::json!({"session_id": "s1", "message_id": "m3", "delta": delta});
     assert_eq!(
         batch(no_final(open)),
         None,
-        "without a final flag nothing is held past the batch"
+        "without a final flag nothing is buffered past the batch"
     );
     assert_eq!(batch(no_final("Sorry for the wait.\n```\n")), None);
     std::fs::remove_dir_all(&h).unwrap();
@@ -2160,7 +2173,7 @@ fn display_out(h: &Path, input: serde_json::Value) -> Option<String> {
 }
 
 #[test]
-fn a_draft_after_the_send_back_always_shows() {
+fn no_label_after_the_turn_was_sent_back() {
     let h = ticket_home("displayagain", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
@@ -2172,7 +2185,7 @@ fn a_draft_after_the_send_back_always_shows() {
             serde_json::json!({"session_id": "s1", "prompt_id": "p1", "message_id": "m2", "index": 0, "final": true, "delta": again})
         ),
         None,
-        "Stop won't send this draft back, so it shows in full"
+        "Stop won't send this draft back, so it shows unlabeled"
     );
     assert_eq!(
         display_out(
@@ -2188,17 +2201,20 @@ fn a_draft_after_the_send_back_always_shows() {
         serde_json::json!({"session_id": "s1", "prompt_id": "p2", "message_id": "m4", "index": 0, "final": true, "delta": again}),
     )
     .unwrap();
-    assert!(out.contains("(dotonce held back a draft"), "{out}");
+    assert_eq!(
+        out,
+        "Second try:\ndotonce: this draft breaks your no-stock-wait-opener rule. A corrected one follows below.\n```markdown\nHi Sam,\nSorry for the wait.\n```\n",
+        "a new turn labels again"
+    );
     std::fs::remove_dir_all(&h).unwrap();
 }
 
 #[test]
-fn an_interrupted_draft_shows_with_the_next_message() {
+fn a_new_message_shows_the_lines_still_buffered() {
     let h = ticket_home("displaystop", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
     let at = |mid: &str, i: u32, last: bool, delta: &str| serde_json::json!({"session_id": "s1", "prompt_id": "p1", "message_id": mid, "index": i, "final": last, "delta": delta});
-    let note = "(dotonce: an earlier draft, not checked because the reply was interrupted)\n";
     assert_eq!(
         display_out(
             &h,
@@ -2219,17 +2235,15 @@ fn an_interrupted_draft_shows_with_the_next_message() {
     assert!(
         files.contains(&"s1.display.json".to_string())
             && !files.iter().any(|f| f.ends_with(".tmp")),
-        "the held lines are saved through a renamed temp file: {files:?}"
+        "the buffered lines are saved through a renamed temp file: {files:?}"
     );
     assert_eq!(
         display_out(
             &h,
             at("m2", 0, false, "Plain reply.\n```markdown\nHi Sam,\n")
         ),
-        Some(format!(
-            "{note}```markdown\nHi Sam,\nSorry for the wa\n```\nPlain reply.\n"
-        )),
-        "the held lines show first, then the new message, whose draft is held"
+        Some("```markdown\nHi Sam,\nSorry for the wa\n```\nPlain reply.\n".to_string()),
+        "the buffered lines show first, then the new message, whose draft is buffered"
     );
     assert_eq!(
         display_out(&h, at("m2", 1, true, "Thanks for the details.\n```\n")).as_deref(),
@@ -2319,7 +2333,7 @@ fn a_warn_catch_is_logged_once_per_turn() {
 }
 
 /// Registers `dotonce hook stop` as a Stop hook in the test home's Claude
-/// Code user settings, so the display hook may hold drafts back.
+/// Code user settings, so the display hook may label drafts.
 fn register_stop(h: &Path) {
     let dir = h.join(".claude");
     std::fs::create_dir_all(&dir).unwrap();
@@ -2327,29 +2341,32 @@ fn register_stop(h: &Path) {
     std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
 }
 
-const HELD_DRAFT: &str = "Draft:\n```markdown\nHi Sam,\nSorry for the wait.\n```\n";
+const STOCK_DRAFT: &str = "Draft:\n```markdown\nHi Sam,\nSorry for the wait.\n```\n";
 
-/// Shows `HELD_DRAFT` as one whole message and returns what went on screen,
+/// Shows `STOCK_DRAFT` as one whole message and returns what went on screen,
 /// or None when it showed as it is.
 fn show_draft(h: &Path, cwd: &Path, sid: &str, pid: &str, mid: &str) -> Option<String> {
     display_out(
         h,
-        serde_json::json!({"session_id": sid, "prompt_id": pid, "message_id": mid, "index": 0, "final": true, "delta": HELD_DRAFT, "cwd": cwd}),
+        serde_json::json!({"session_id": sid, "prompt_id": pid, "message_id": mid, "index": 0, "final": true, "delta": STOCK_DRAFT, "cwd": cwd}),
     )
 }
 
-/// What the screen shows when `HELD_DRAFT` is held back.
-fn held_back() -> Option<String> {
-    Some(format!("Draft:\n{}\n", dotonce::display::HELD_NOTE))
+/// What the screen shows when `STOCK_DRAFT` is labeled.
+fn labeled() -> Option<String> {
+    Some(
+        "Draft:\ndotonce: this draft breaks your no-stock-wait-opener rule. A corrected one follows below.\n```markdown\nHi Sam,\nSorry for the wait.\n```\n"
+            .to_string(),
+    )
 }
 
 #[test]
-fn a_broken_config_never_holds_a_draft() {
+fn a_broken_config_never_labels_a_draft() {
     let h = ticket_home("displaycfg", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
     use_skill(&h, "s2", "p1");
-    assert_eq!(show_draft(&h, &h, "s2", "p1", "m1"), held_back(), "setup");
+    assert_eq!(show_draft(&h, &h, "s2", "p1", "m1"), labeled(), "setup");
     std::fs::write(h.join("dotonce/config.toml"), "not = [toml").unwrap();
     assert_eq!(
         show_draft(&h, &h, "s1", "p1", "m1"),
@@ -2362,7 +2379,7 @@ fn a_broken_config_never_holds_a_draft() {
 const STOCK_CHECK: &str = "[draft]\nfence = [\"markdown\"]\n[[check]]\nid = \"no-stock-wait-opener\"\nforbid = [\"sorry for the wait\"]\nwhy = \"Open with a line from the thread.\"\n";
 
 #[test]
-fn a_folder_set_is_not_held_once_the_cwd_left_the_folder() {
+fn a_folder_set_is_not_labeled_once_the_cwd_left_the_folder() {
     let check = STOCK_CHECK;
     let h = home("displayfolder");
     register_stop(&h);
@@ -2381,11 +2398,7 @@ fn a_folder_set_is_not_held_once_the_cwd_left_the_folder() {
             serde_json::json!({"session_id": sid, "prompt_id": "p1", "prompt": "hello", "cwd": work}),
         );
     }
-    assert_eq!(
-        show_draft(&h, &work, "s2", "p1", "m1"),
-        held_back(),
-        "setup"
-    );
+    assert_eq!(show_draft(&h, &work, "s2", "p1", "m1"), labeled(), "setup");
     assert_eq!(
         show_draft(&h, &h, "s1", "p1", "m1"),
         None,
@@ -2395,7 +2408,7 @@ fn a_folder_set_is_not_held_once_the_cwd_left_the_folder() {
 }
 
 #[test]
-fn a_private_set_is_not_held_outside_the_private_paths() {
+fn a_private_set_is_not_labeled_outside_the_private_paths() {
     let check = STOCK_CHECK;
     let (h, proj) = home_with_private_path("displayprivate");
     register_stop(&h);
@@ -2412,11 +2425,7 @@ fn a_private_set_is_not_held_outside_the_private_paths() {
             serde_json::json!({"session_id": sid, "prompt_id": "p1", "tool_name": "Skill", "tool_input": {"skill": "writing-support"}, "cwd": proj}),
         );
     }
-    assert_eq!(
-        show_draft(&h, &proj, "s2", "p1", "m1"),
-        held_back(),
-        "setup"
-    );
+    assert_eq!(show_draft(&h, &proj, "s2", "p1", "m1"), labeled(), "setup");
     assert_eq!(
         show_draft(&h, &h, "s1", "p1", "m1"),
         None,
@@ -2426,12 +2435,12 @@ fn a_private_set_is_not_held_outside_the_private_paths() {
 }
 
 #[test]
-fn a_paused_set_is_not_held() {
+fn a_paused_set_is_not_labeled() {
     let h = ticket_home("displaypaused", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
     use_skill(&h, "s2", "p1");
-    assert_eq!(show_draft(&h, &h, "s2", "p1", "m1"), held_back(), "setup");
+    assert_eq!(show_draft(&h, &h, "s2", "p1", "m1"), labeled(), "setup");
     let file = h.join("dotonce/sessions/s1.json");
     let mut state: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
@@ -2445,161 +2454,87 @@ fn a_paused_set_is_not_held() {
     std::fs::remove_dir_all(&h).unwrap();
 }
 
-/// What the screen shows for `HELD_DRAFT` when it was held back and nothing
-/// followed it.
-const UNFIXED: &str = "dotonce held back a draft that wasn't fixed; here it is:\n```markdown\nHi Sam,\nSorry for the wait.\n```";
-
-/// The systemMessage of a hook's output, if any.
-fn system_message(out: &str) -> Option<String> {
-    if out.trim().is_empty() {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_str(out).unwrap_or_else(|e| panic!("{e}: {out}"));
-    v["systemMessage"].as_str().map(String::from)
-}
-
-fn prompt_in(h: &Path, sid: &str, pid: &str) -> String {
-    hook(
-        h,
-        "prompt",
-        serde_json::json!({"session_id": sid, "prompt_id": pid, "prompt": "Thanks", "cwd": h}),
-    )
-}
-
-/// A home with the ticket set at fix, Stop registered, and `HELD_DRAFT`
-/// held back in session s1, turn p1, message m1.
-fn held_home(name: &str) -> PathBuf {
-    let h = ticket_home(name, "fix");
+#[test]
+fn a_warn_set_never_labels_a_draft() {
+    let h = ticket_home("displaywarn", "warn");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
-    assert_eq!(show_draft(&h, &h, "s1", "p1", "m1"), held_back(), "setup");
-    h
-}
-
-#[test]
-fn an_unfixed_draft_shows_at_the_next_prompt() {
-    let h = held_home("unfixedprompt");
-    // Esc or an API error: Stop never runs for p1.
     assert_eq!(
-        system_message(&prompt_in(&h, "s1", "p2")).as_deref(),
-        Some(UNFIXED)
-    );
-    assert_eq!(
-        system_message(&prompt_in(&h, "s1", "p3")),
+        show_draft(&h, &h, "s1", "p1", "m1"),
         None,
-        "shown once"
+        "Stop only logs a warn set, so no corrected draft follows"
     );
     std::fs::remove_dir_all(&h).unwrap();
 }
 
 #[test]
-fn an_unfixed_draft_shows_with_the_next_message() {
-    let h = held_home("unfixednext");
-    let next = |mid: &str, pid: &str| {
+fn the_label_names_every_failing_check() {
+    let h = ticket_home("displayids", "fix");
+    register_stop(&h);
+    use_skill(&h, "s1", "p1");
+    let draft = "```markdown\nHi Sam,\nSorry for the wait. The guide is at https://example.com/guide\n```\n";
+    assert_eq!(
         display_out(
             &h,
-            serde_json::json!({"session_id": "s1", "prompt_id": pid, "message_id": mid, "index": 0, "final": true, "delta": "Plain reply.\n", "cwd": h}),
-        )
-    };
-    assert_eq!(next("m2", "p2"), Some(format!("{UNFIXED}\nPlain reply.\n")));
-    assert_eq!(next("m3", "p2"), None, "shown once");
-    assert_eq!(system_message(&prompt_in(&h, "s1", "p3")), None);
-    std::fs::remove_dir_all(&h).unwrap();
-}
-
-#[test]
-fn an_unfixed_draft_older_than_an_hour_shows_at_any_hook() {
-    let h = held_home("unfixedold");
-    let skill = || {
-        hook(
-            &h,
-            "skill",
-            serde_json::json!({"session_id": "s1", "prompt_id": "p1", "tool_name": "Skill", "tool_input": {"skill": "writing-support"}, "cwd": h}),
-        )
-    };
-    assert_eq!(
-        system_message(&skill()),
-        None,
-        "a new record waits for Stop"
+            serde_json::json!({"session_id": "s1", "prompt_id": "p1", "message_id": "m1", "index": 0, "final": true, "delta": draft, "cwd": h}),
+        ),
+        Some(format!(
+            "dotonce: this draft breaks your no-stock-wait-opener, inline-links rule. A corrected one follows below.\n{draft}"
+        ))
     );
-    let file = h.join("dotonce/sessions/s1.display.json");
-    let mut held: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
-    let time = held["withheld"][0]["time"].as_i64().unwrap();
-    held["withheld"][0]["time"] = serde_json::json!(time - 2 * 3600);
-    std::fs::write(&file, held.to_string()).unwrap();
-    assert_eq!(system_message(&skill()).as_deref(), Some(UNFIXED));
-    assert_eq!(system_message(&skill()), None, "then dropped");
     std::fs::remove_dir_all(&h).unwrap();
 }
 
 #[test]
-fn a_config_broken_before_stop_still_shows_the_draft() {
-    let h = held_home("unfixedcfg");
+fn a_config_broken_before_stop_sends_nothing_back() {
+    let h = ticket_home("stopcfg", "fix");
+    use_skill(&h, "s1", "p1");
     std::fs::write(h.join("dotonce/config.toml"), "not = [toml").unwrap();
-    let out = stop(&h, "s1", "p1", HELD_DRAFT, false);
-    assert_eq!(system_message(&out).as_deref(), Some(UNFIXED), "{out}");
+    let out = stop(&h, "s1", "p1", STOCK_DRAFT, false);
+    assert!(out.trim().is_empty(), "{out}");
     std::fs::remove_dir_all(&h).unwrap();
 }
 
 #[test]
-fn a_draft_stop_wont_send_back_shows_at_stop() {
+fn stop_sends_nothing_back_for_a_set_no_longer_at_fix() {
     for change in ["warn", "edited", "unapproved"] {
-        let h = held_home(&format!("unfixed{change}"));
+        let h = ticket_home(&format!("stopleft{change}"), "fix");
+        use_skill(&h, "s1", "p1");
         match change {
             "warn" => approve(&h, "ticket-reply", "warn"),
             "edited" => edit_set(&h, "ticket-reply"),
             _ => std::fs::write(h.join("dotonce/approvals.json"), "{\"sets\": {}}").unwrap(),
         }
-        let out = stop(&h, "s1", "p1", HELD_DRAFT, false);
+        let out = stop(&h, "s1", "p1", STOCK_DRAFT, false);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_default();
-        assert!(v.get("hookSpecificOutput").is_none(), "{change}: {out}");
-        assert_eq!(system_message(&out).as_deref(), Some(UNFIXED), "{change}");
-        assert_eq!(system_message(&prompt_in(&h, "s1", "p2")), None, "{change}");
+        assert!(
+            v.get("hookSpecificOutput").is_none() && v.get("systemMessage").is_none(),
+            "{change}: {out}"
+        );
         std::fs::remove_dir_all(&h).unwrap();
     }
 }
 
 #[test]
-fn a_failed_stop_save_still_shows_the_draft() {
+fn a_failed_stop_save_sends_nothing_back() {
     use std::os::unix::fs::PermissionsExt;
-    let h = held_home("unfixedsave");
+    let h = ticket_home("stopsave", "fix");
+    use_skill(&h, "s1", "p1");
     let sessions = h.join("dotonce/sessions");
     std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o555)).unwrap();
-    let out = stop(&h, "s1", "p1", HELD_DRAFT, false);
+    let out = stop(&h, "s1", "p1", STOCK_DRAFT, false);
     std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_default();
     assert!(
-        v.get("hookSpecificOutput").is_none(),
+        out.trim().is_empty(),
         "without its state saved, Stop sends nothing back: {out}"
     );
-    assert_eq!(system_message(&out).as_deref(), Some(UNFIXED), "{out}");
     let log = std::fs::read_to_string(h.join("dotonce/errors.log")).unwrap();
     assert!(!log.contains("Sam"), "the draft is never logged: {log}");
     std::fs::remove_dir_all(&h).unwrap();
 }
 
 #[test]
-fn a_sent_back_draft_is_followed_by_the_corrected_one_only() {
-    let h = held_home("unfixedsent");
-    let out = stop(&h, "s1", "p1", HELD_DRAFT, false);
-    assert!(!sent_back(&out).is_empty());
-    assert_eq!(system_message(&out), None, "{out}");
-    let fixed = "Fixed the opener.\n```markdown\nHi Sam,\nThanks for the details.\n```\n";
-    assert_eq!(
-        display_out(
-            &h,
-            serde_json::json!({"session_id": "s1", "prompt_id": "p1", "message_id": "m2", "index": 0, "final": true, "delta": fixed, "cwd": h}),
-        ),
-        None
-    );
-    assert_eq!(system_message(&stop(&h, "s1", "p1", fixed, true)), None);
-    assert_eq!(system_message(&prompt_in(&h, "s1", "p2")), None);
-    std::fs::remove_dir_all(&h).unwrap();
-}
-
-#[test]
-fn display_holds_only_when_dotonce_runs_at_stop() {
+fn display_labels_only_when_dotonce_runs_at_stop() {
     let h = ticket_home("displaynostop", "fix");
     for sid in ["s1", "s2", "s3"] {
         use_skill(&h, sid, "p1");
@@ -2607,7 +2542,7 @@ fn display_holds_only_when_dotonce_runs_at_stop() {
     assert_eq!(
         show_draft(&h, &h, "s1", "p1", "m1"),
         None,
-        "no Stop hook: nothing would follow the note, so the draft shows"
+        "no Stop hook: no corrected draft follows, so no label"
     );
     let settings = |dir: &Path, file: &str, command: &str| {
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
@@ -2624,7 +2559,7 @@ fn display_holds_only_when_dotonce_runs_at_stop() {
     settings(&proj, "settings.local.json", "dotonce hook stop");
     assert_eq!(
         show_draft(&h, &proj, "s3", "p1", "m1"),
-        held_back(),
+        labeled(),
         "the project's local settings count"
     );
     register_stop(&h);
@@ -2637,7 +2572,7 @@ fn display_holds_only_when_dotonce_runs_at_stop() {
 }
 
 #[test]
-fn an_unreadable_settings_file_means_no_hold() {
+fn an_unreadable_settings_file_means_no_label() {
     let h = ticket_home("displaybadsettings", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
