@@ -2071,7 +2071,12 @@ fn display_hook_holds_a_broken_draft_back() {
             "(dotonce held back a draft that breaks one of your rules. Claude is writing a corrected one.)\n"
         )
     );
-    assert_eq!(batch("m2", 0, true, "Plain reply.\n"), "");
+    assert_eq!(
+        shown(&batch("m2", 0, true, "Plain reply.\n")).as_deref(),
+        Some(format!("{UNFIXED}\nPlain reply.\n").as_str()),
+        "no Stop sent m1's turn back, so the next message shows the draft"
+    );
+    assert_eq!(batch("m3", 0, true, "Plain reply.\n"), "");
     std::fs::remove_dir_all(&h).unwrap();
 }
 
@@ -2433,5 +2438,158 @@ fn a_paused_set_is_not_held() {
         None,
         "Stop drops a paused set"
     );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+/// What the screen shows for `HELD_DRAFT` when it was held back and nothing
+/// followed it.
+const UNFIXED: &str = "dotonce held back a draft that wasn't fixed; here it is:\n```markdown\nHi Sam,\nSorry for the wait.\n```";
+
+/// The systemMessage of a hook's output, if any.
+fn system_message(out: &str) -> Option<String> {
+    if out.trim().is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    v["systemMessage"].as_str().map(String::from)
+}
+
+fn prompt_in(h: &Path, sid: &str, pid: &str) -> String {
+    hook(
+        h,
+        "prompt",
+        serde_json::json!({"session_id": sid, "prompt_id": pid, "prompt": "Thanks", "cwd": h}),
+    )
+}
+
+/// A home with the ticket set at fix, Stop registered, and `HELD_DRAFT`
+/// held back in session s1, turn p1, message m1.
+fn held_home(name: &str) -> PathBuf {
+    let h = ticket_home(name, "fix");
+    register_stop(&h);
+    use_skill(&h, "s1", "p1");
+    assert_eq!(show_draft(&h, &h, "s1", "p1", "m1"), held_back(), "setup");
+    h
+}
+
+#[test]
+fn an_unfixed_draft_shows_at_the_next_prompt() {
+    let h = held_home("unfixedprompt");
+    // Esc or an API error: Stop never runs for p1.
+    assert_eq!(
+        system_message(&prompt_in(&h, "s1", "p2")).as_deref(),
+        Some(UNFIXED)
+    );
+    assert_eq!(
+        system_message(&prompt_in(&h, "s1", "p3")),
+        None,
+        "shown once"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn an_unfixed_draft_shows_with_the_next_message() {
+    let h = held_home("unfixednext");
+    let next = |mid: &str, pid: &str| {
+        display_out(
+            &h,
+            serde_json::json!({"session_id": "s1", "prompt_id": pid, "message_id": mid, "index": 0, "final": true, "delta": "Plain reply.\n", "cwd": h}),
+        )
+    };
+    assert_eq!(next("m2", "p2"), Some(format!("{UNFIXED}\nPlain reply.\n")));
+    assert_eq!(next("m3", "p2"), None, "shown once");
+    assert_eq!(system_message(&prompt_in(&h, "s1", "p3")), None);
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn an_unfixed_draft_older_than_an_hour_shows_at_any_hook() {
+    let h = held_home("unfixedold");
+    let skill = || {
+        hook(
+            &h,
+            "skill",
+            serde_json::json!({"session_id": "s1", "prompt_id": "p1", "tool_name": "Skill", "tool_input": {"skill": "writing-support"}, "cwd": h}),
+        )
+    };
+    assert_eq!(
+        system_message(&skill()),
+        None,
+        "a new record waits for Stop"
+    );
+    let file = h.join("dotonce/sessions/s1.display.json");
+    let mut held: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let time = held["withheld"][0]["time"].as_i64().unwrap();
+    held["withheld"][0]["time"] = serde_json::json!(time - 2 * 3600);
+    std::fs::write(&file, held.to_string()).unwrap();
+    assert_eq!(system_message(&skill()).as_deref(), Some(UNFIXED));
+    assert_eq!(system_message(&skill()), None, "then dropped");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn a_config_broken_before_stop_still_shows_the_draft() {
+    let h = held_home("unfixedcfg");
+    std::fs::write(h.join("dotonce/config.toml"), "not = [toml").unwrap();
+    let out = stop(&h, "s1", "p1", HELD_DRAFT, false);
+    assert_eq!(system_message(&out).as_deref(), Some(UNFIXED), "{out}");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn a_draft_stop_wont_send_back_shows_at_stop() {
+    for change in ["warn", "edited", "unapproved"] {
+        let h = held_home(&format!("unfixed{change}"));
+        match change {
+            "warn" => approve(&h, "ticket-reply", "warn"),
+            "edited" => edit_set(&h, "ticket-reply"),
+            _ => std::fs::write(h.join("dotonce/approvals.json"), "{\"sets\": {}}").unwrap(),
+        }
+        let out = stop(&h, "s1", "p1", HELD_DRAFT, false);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_default();
+        assert!(v.get("hookSpecificOutput").is_none(), "{change}: {out}");
+        assert_eq!(system_message(&out).as_deref(), Some(UNFIXED), "{change}");
+        assert_eq!(system_message(&prompt_in(&h, "s1", "p2")), None, "{change}");
+        std::fs::remove_dir_all(&h).unwrap();
+    }
+}
+
+#[test]
+fn a_failed_stop_save_still_shows_the_draft() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = held_home("unfixedsave");
+    let sessions = h.join("dotonce/sessions");
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let out = stop(&h, "s1", "p1", HELD_DRAFT, false);
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_default();
+    assert!(
+        v.get("hookSpecificOutput").is_none(),
+        "without its state saved, Stop sends nothing back: {out}"
+    );
+    assert_eq!(system_message(&out).as_deref(), Some(UNFIXED), "{out}");
+    let log = std::fs::read_to_string(h.join("dotonce/errors.log")).unwrap();
+    assert!(!log.contains("Sam"), "the draft is never logged: {log}");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn a_sent_back_draft_is_followed_by_the_corrected_one_only() {
+    let h = held_home("unfixedsent");
+    let out = stop(&h, "s1", "p1", HELD_DRAFT, false);
+    assert!(!sent_back(&out).is_empty());
+    assert_eq!(system_message(&out), None, "{out}");
+    let fixed = "Fixed the opener.\n```markdown\nHi Sam,\nThanks for the details.\n```\n";
+    assert_eq!(
+        display_out(
+            &h,
+            serde_json::json!({"session_id": "s1", "prompt_id": "p1", "message_id": "m2", "index": 0, "final": true, "delta": fixed, "cwd": h}),
+        ),
+        None
+    );
+    assert_eq!(system_message(&stop(&h, "s1", "p1", fixed, true)), None);
+    assert_eq!(system_message(&prompt_in(&h, "s1", "p2")), None);
     std::fs::remove_dir_all(&h).unwrap();
 }

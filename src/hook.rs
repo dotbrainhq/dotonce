@@ -47,14 +47,53 @@ pub fn handle(event: &str, input: &str, now: i64) -> Result<Option<String>> {
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    match event {
+    let out = match event {
+        "stop" => return crate::reply::stop(&v, &cwd, now),
+        "display" => return crate::display::display(&v, &cwd, now),
         "prompt" => prompt(&v, &cwd, now),
         "session-start" => session_start(&v, &cwd, now),
         "skill" => skill(&v, &cwd),
-        "stop" => crate::reply::stop(&v, &cwd, now),
-        "display" => crate::display::display(&v, &cwd),
         _ => expansion(&v, &cwd),
-    }
+    };
+    // A new prompt starts a new turn, so every draft still withheld shows;
+    // any other hook shows the ones over an hour old.
+    let all = event == "prompt";
+    show_withheld(event, &v, out, |r| all || r.is_old(now))
+}
+
+/// Adds the withheld drafts `pick` selects to a hook's output as a
+/// systemMessage. They show even when the hook itself failed.
+fn show_withheld(
+    event: &str,
+    v: &Value,
+    out: Result<Option<String>>,
+    pick: impl Fn(&crate::display::Withheld) -> bool,
+) -> Result<Option<String>> {
+    let taken = match (session_id(v), session::dir()) {
+        (Ok(sid), Ok(dir)) => crate::display::take_withheld(&dir, sid, pick),
+        _ => Vec::new(),
+    };
+    let Some(msg) = crate::display::unfixed_message(&taken) else {
+        return out;
+    };
+    let out = out.unwrap_or_else(|e| {
+        log_error(&format!("hook {event}: {e:#}"));
+        None
+    });
+    Ok(with_message(out, msg))
+}
+
+/// The hook output with `msg` added as its systemMessage, after any it has.
+pub fn with_message(out: Option<String>, msg: String) -> Option<String> {
+    let mut map = out
+        .and_then(|o| serde_json::from_str::<Map<String, Value>>(&o).ok())
+        .unwrap_or_default();
+    let text = match map.get("systemMessage").and_then(Value::as_str) {
+        Some(s) => format!("{s}\n\n{msg}"),
+        None => msg,
+    };
+    map.insert("systemMessage".to_string(), Value::String(text));
+    Some(Value::Object(map).to_string())
 }
 
 pub fn str_field<'a>(v: &'a Value, key: &str) -> &'a str {

@@ -17,6 +17,28 @@ pub const HELD_NOTE: &str =
     "(dotonce held back a draft that breaks one of your rules. Claude is writing a corrected one.)";
 pub const INTERRUPTED_NOTE: &str =
     "(dotonce: an earlier draft, not checked because the reply was interrupted)";
+pub const UNFIXED_NOTE: &str = "dotonce held back a draft that wasn't fixed; here it is:";
+/// A withheld draft this old shows at the next hook of any kind.
+const MAX_WITHHELD_AGE: i64 = 60 * 60;
+
+/// A draft that was swapped for the note. Stop clears it when it sends the
+/// turn back, since the corrected draft follows; any other way, it shows.
+/// It holds work text, so it lives only in the session's display file
+/// (swept by `session::clean_old`) and is never logged.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Withheld {
+    pub turn: String,
+    pub message_id: String,
+    pub text: String,
+    /// When it was held back, in Unix seconds.
+    pub time: i64,
+}
+
+impl Withheld {
+    pub fn is_old(&self, now: i64) -> bool {
+        now - self.time > MAX_WITHHELD_AGE
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Held {
@@ -31,6 +53,11 @@ pub struct Held {
     /// shows as it is.
     #[serde(default)]
     pub pass: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withheld: Vec<Withheld>,
+    /// Drafts swapped for the note in this call, not yet recorded.
+    #[serde(skip)]
+    pub swapped: Vec<String>,
 }
 
 /// A set marks fenced blocks with this info string as its drafts.
@@ -57,6 +84,7 @@ fn release(held: &mut Held, sets: &[&Live]) -> String {
         .filter(|l| marks_drafts(l, &info))
         .any(|l| !checks::run_reply(&l.set, &text).is_empty());
     if broken {
+        held.swapped.push(text);
         format!("{HELD_NOTE}\n")
     } else {
         text
@@ -120,10 +148,59 @@ fn release_all(held: &mut Held, delta: &str) -> String {
     shown
 }
 
+/// Each withheld draft under the note that says it wasn't fixed, one after
+/// another, each ending in a newline.
+fn unfixed_text(records: &[Withheld]) -> String {
+    let mut s = String::new();
+    for r in records {
+        s.push_str(UNFIXED_NOTE);
+        s.push('\n');
+        s.push_str(&r.text);
+        if !s.ends_with('\n') {
+            s.push('\n');
+        }
+    }
+    s
+}
+
+/// The withheld drafts as a hook's systemMessage, or None when there are none.
+pub fn unfixed_message(records: &[Withheld]) -> Option<String> {
+    (!records.is_empty()).then(|| unfixed_text(records).trim_end().to_string())
+}
+
+/// Takes the withheld drafts `pick` selects out of the session's display
+/// file and returns them, oldest first, for the caller to show. If the file
+/// can't be saved they are still returned, and may show again later.
+pub fn take_withheld(dir: &Path, sid: &str, pick: impl Fn(&Withheld) -> bool) -> Vec<Withheld> {
+    let Ok(path) = session::display_file(dir, sid) else {
+        return Vec::new();
+    };
+    let mut held = load_held(&path);
+    let (taken, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut held.withheld)
+        .into_iter()
+        .partition(|r| pick(r));
+    if taken.is_empty() {
+        return taken;
+    }
+    held.withheld = kept;
+    let saved = if held.lines.is_empty() && held.withheld.is_empty() {
+        fs::remove_file(&path).map_err(Into::into)
+    } else {
+        save_held(dir, &path, &held)
+    };
+    if let Err(e) = saved {
+        log_error(&format!("display: {e:#}"));
+    }
+    taken
+}
+
 /// Hidden lines only reach the screen through a later batch's output, so
 /// anything that goes wrong after a hold shows the held lines at once and
-/// lets the rest of the message through as it is.
-pub fn display(v: &Value, cwd: &Path) -> Result<Option<String>> {
+/// lets the rest of the message through as it is. A draft swapped for the
+/// note is kept as a withheld record until Stop sends its turn back; it
+/// shows here once a call comes from another turn or message, or once it
+/// is an hour old.
+pub fn display(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
     let sid = match session_id(v) {
         Ok(sid) => sid,
         Err(_) if approvals::load_live().is_ok_and(|(l, _)| l.is_empty()) => return Ok(None),
@@ -132,31 +209,39 @@ pub fn display(v: &Value, cwd: &Path) -> Result<Option<String>> {
     let dir = session::dir()?;
     let path = session::display_file(&dir, sid)?;
     let message = str_field(v, "message_id");
+    let state = session::load(&dir, sid).unwrap_or_default();
+    let turn = session::turn_key(&state, prompt_id(v));
     let mut held = load_held(&path);
+    let (unfixed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut held.withheld)
+        .into_iter()
+        .partition(|r| r.turn != turn || r.message_id != message || r.is_old(now));
+    held.withheld = kept;
+    let mut early = unfixed_text(&unfixed);
     let same = held.message_id == message;
     // Lines still held from another message: that message stopped before its
     // final batch (Esc), so they show now, ahead of this one.
-    let mut stale = String::new();
     if !same {
         if !held.lines.is_empty() {
-            stale = format!("{INTERRUPTED_NOTE}\n{}", held.lines.concat());
-            if !stale.ends_with('\n') {
-                stale.push('\n');
+            early.push_str(INTERRUPTED_NOTE);
+            early.push('\n');
+            early.push_str(&held.lines.concat());
+            if !early.ends_with('\n') {
+                early.push('\n');
             }
         }
         held = Held {
             message_id: message.to_string(),
+            withheld: std::mem::take(&mut held.withheld),
             ..Held::default()
         };
     }
     let delta = str_field(v, "delta");
     // Without a final flag, nothing is held past this batch.
     let last = v.get("final").and_then(Value::as_bool).unwrap_or(true);
-    let fix = session::load(&dir, sid)
-        .and_then(|state| session::checks_now(&state, cwd, prompt_id(v)))
+    let fix = session::checks_now(&state, cwd, prompt_id(v))
         .map(|now| now.fix().into_iter().cloned().collect::<Vec<_>>());
     let mut shown = match fix {
-        Ok(fix) if fix.is_empty() && held.lines.is_empty() && stale.is_empty() => {
+        Ok(fix) if fix.is_empty() && held.lines.is_empty() && early.is_empty() => {
             return Ok(None);
         }
         Ok(fix) => {
@@ -176,14 +261,28 @@ pub fn display(v: &Value, cwd: &Path) -> Result<Option<String>> {
             release_all(&mut held, delta)
         }
     };
-    if last {
+    for text in std::mem::take(&mut held.swapped) {
+        held.withheld.push(Withheld {
+            turn: turn.clone(),
+            message_id: message.to_string(),
+            text,
+            time: now,
+        });
+    }
+    let saved = if last && held.withheld.is_empty() {
         let _ = fs::remove_file(&path);
-    } else if let Err(e) = save_held(&dir, &path, &held) {
+        Ok(())
+    } else {
+        save_held(&dir, &path, &held)
+    };
+    if let Err(e) = saved {
+        // What isn't saved can't show later, so it shows now.
         log_error(&format!("display: {e:#}"));
         shown.push_str(&held.lines.concat());
+        shown.push_str(&unfixed_text(&held.withheld));
         let _ = fs::remove_file(&path);
     }
-    shown.insert_str(0, &stale);
+    shown.insert_str(0, &early);
     if shown == delta {
         return Ok(None);
     }
