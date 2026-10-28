@@ -176,15 +176,35 @@ pub fn run_tool(set: &RuleSet, tool: &str, path: Option<&str>, body: &str) -> Ve
         .collect()
 }
 
+/// How many dangling symlinks `resolve_deep` follows before it stops.
+const MAX_LINKS: usize = 40;
+
 /// The real path of the longest existing part of `p`, with the rest as
 /// written, so a new file under a symlinked folder still matches the folder.
+/// A symlink whose target does not exist yet is followed to that target.
 fn resolve_deep(p: &Path) -> PathBuf {
+    resolve_links(p, MAX_LINKS)
+}
+
+fn resolve_links(p: &Path, links: usize) -> PathBuf {
     let p = lexical_normalize(p);
     let mut base = p.as_path();
     let mut rest = Vec::new();
     loop {
-        if base.exists() {
-            let mut out = resolve(base);
+        let dangling = !base.exists()
+            && std::fs::symlink_metadata(base).is_ok_and(|m| m.file_type().is_symlink());
+        let target = dangling
+            .then(|| std::fs::read_link(base).ok())
+            .flatten()
+            .filter(|_| links > 0);
+        if base.exists() || target.is_some() {
+            let mut out = match target {
+                Some(t) => {
+                    let t = base.parent().map_or(t.clone(), |d| d.join(&t));
+                    resolve_links(&t, links - 1)
+                }
+                None => resolve(base),
+            };
             for r in rest.iter().rev() {
                 out.push(r);
             }
@@ -1328,5 +1348,32 @@ mod tests {
         }
         assert!(mentions("rm rules/a.toml", home, home, user));
         assert!(!mentions("cat rules/a.toml", home, home, user));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_is_checked_where_it_points() {
+        use std::os::unix::fs::symlink;
+        let tmp = std::env::temp_dir().join(format!("dotonce-dangle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let home = tmp.join("dot");
+        let proj = tmp.join("proj");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
+        symlink("../dot/last-live.json", proj.join("ll.json")).unwrap();
+        symlink(home.join("approvals.json"), proj.join("ap.json")).unwrap();
+        symlink("../dot/rules", proj.join("rl")).unwrap();
+        symlink("ll.json", proj.join("hop.json")).unwrap();
+        symlink("../elsewhere/notes.md", proj.join("notes.md")).unwrap();
+        symlink("loop-b", proj.join("loop-a")).unwrap();
+        symlink("loop-a", proj.join("loop-b")).unwrap();
+        let write = |p: &str| json!({"file_path": p, "content": "x"});
+        for p in ["ll.json", "ap.json", "rl/acme.toml", "hop.json"] {
+            assert!(guard("Write", &write(p), &proj, &home, None), "{p}");
+        }
+        for p in ["notes.md", "loop-a"] {
+            assert!(!guard("Write", &write(p), &proj, &home, None), "{p}");
+        }
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 }
