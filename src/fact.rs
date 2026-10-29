@@ -11,6 +11,8 @@ pub struct Fact {
     pub body: String,
     pub source: Vec<String>,
     pub tags: Vec<String>,
+    /// Other wordings for the fact, matched like its title.
+    pub aliases: Vec<String>,
     pub learned: Option<String>,
     pub updated: Option<String>,
     pub private: bool,
@@ -221,6 +223,7 @@ pub fn parse(src: &str) -> Fact {
         body: body.trim().to_string(),
         source: many("sources").into_iter().chain(many("source")).collect(),
         tags: many("tags"),
+        aliases: many("aliases"),
         learned: one("learned"),
         updated: one("updated"),
         private,
@@ -259,6 +262,12 @@ pub fn to_markdown(f: &Fact) -> String {
         s.push_str("tags:\n");
         for t in &f.tags {
             s.push_str(&format!("  - {}\n", scalar(t)));
+        }
+    }
+    if !f.aliases.is_empty() {
+        s.push_str("aliases:\n");
+        for a in &f.aliases {
+            s.push_str(&format!("  - {}\n", scalar(a)));
         }
     }
     if let Some(l) = &f.learned {
@@ -357,6 +366,7 @@ Second paragraph.
             tags: vec!["setup".into()],
             learned: Some("2026-10-27".into()),
             updated: Some("2026-10-27".into()),
+            aliases: vec!["test server".into(), "preview site".into()],
             private: true,
             pinned: true,
             replaced_by: Some("staging-site-2".into()),
@@ -437,6 +447,7 @@ Second paragraph.
                 "it's #1".into(),
             ],
             tags: vec!["a, b".into(), "[x]".into(), "plain".into()],
+            aliases: vec!["- dashed".into(), "\"quoted\" alias".into()],
             learned: Some("'odd' date".into()),
             updated: Some("2026-10-27".into()),
             private: false,
@@ -470,6 +481,23 @@ Second paragraph.
         };
         assert!(to_markdown(&f).contains("tags:\n  - a\n  - b\n"));
         assert_eq!(parse("---\ntags: [a, b]\n---\n").tags, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn aliases_are_read_as_a_list_and_written_as_a_block_list() {
+        let f = Fact {
+            aliases: vec!["test server".into(), "preview site".into()],
+            ..Fact::default()
+        };
+        assert!(to_markdown(&f).contains("aliases:\n  - test server\n  - preview site\n"));
+        assert_eq!(
+            parse("---\naliases: [test server, preview site]\n---\n").aliases,
+            vec!["test server", "preview site"]
+        );
+        assert_eq!(
+            parse("---\naliases: test server\n---\n").aliases,
+            vec!["test server"]
+        );
     }
 
     #[test]

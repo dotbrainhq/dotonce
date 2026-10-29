@@ -44,6 +44,9 @@ enum Cmd {
         sources: Vec<String>,
         #[arg(long, value_delimiter = ',')]
         tags: Vec<String>,
+        /// Other words for the fact, comma separated. Prompts that use them find it too.
+        #[arg(long, value_delimiter = ',')]
+        aliases: Vec<String>,
         #[arg(long)]
         store: Option<String>,
         /// Only show this fact inside a private path. The default when saving from inside one.
@@ -237,6 +240,7 @@ fn run(cmd: Cmd) -> Result<()> {
             name,
             sources,
             tags,
+            aliases,
             store,
             private,
             public,
@@ -257,6 +261,11 @@ fn run(cmd: Cmd) -> Result<()> {
                 description: text,
                 source: sources,
                 tags,
+                aliases: aliases
+                    .iter()
+                    .map(|a| a.trim().to_string())
+                    .filter(|a| !a.is_empty())
+                    .collect(),
                 learned: Some(today.clone()),
                 updated: Some(today),
                 private,
