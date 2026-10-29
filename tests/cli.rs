@@ -4369,3 +4369,61 @@ fn path_hint_writes_home_when_the_binary_is_under_home() {
     assert!(!on_path.contains("not on your PATH"), "{on_path}");
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+/// Prompts Claude Code sends itself, one of each kind, each with words that
+/// turn on `REPLIES` and match the staging site fact.
+const FROM_CLAUDE_CODE: [&str; 5] = [
+    "<task-notification>\n<task-id>t1</task-id>\n<status>completed</status>\n<summary>draft the staging site reply</summary>\n</task-notification>",
+    "[Subagent hand-back] draft the staging site reply is ready",
+    "<agent-message from=\"acme\">draft the staging site reply</agent-message>",
+    "[SYSTEM NOTIFICATION] draft the staging site reply",
+    "<system-reminder>draft the staging site reply</system-reminder>",
+];
+
+#[test]
+fn claude_codes_own_messages_get_no_reminders_or_facts() {
+    let h = home("ownmsg");
+    run(&h, &["init"], None);
+    run(&h, &["save", "The staging site is acme.example.com"], None);
+    add_set(&h, "acme-replies", REPLIES);
+    approve(&h, "acme-replies", "warn");
+    for (i, text) in FROM_CLAUDE_CODE.iter().enumerate() {
+        let out = hook(
+            &h,
+            "prompt",
+            serde_json::json!({"session_id": format!("s{i}"), "prompt_id": "p1", "prompt": text, "cwd": "/tmp"}),
+        );
+        assert!(out.trim().is_empty(), "{text}: {out}");
+        let exp = serde_json::json!({"session_id": format!("e{i}"), "prompt_id": "p1", "hook_event_name": "UserPromptExpansion", "expansion_type": "slash_command", "command_name": "acme-writer", "command_args": "", "command_source": "user", "prompt": format!("/acme-writer {text}"), "cwd": "/tmp"});
+        let out = hook(&h, "expansion", exp);
+        assert!(out.trim().is_empty(), "{text}: {out}");
+    }
+    let typed = serde_json::json!({"session_id": "s9", "prompt_id": "p1", "prompt": "draft the staging site reply", "cwd": "/tmp"});
+    let ctx = context(&hook(&h, "prompt", typed), "UserPromptSubmit");
+    assert!(
+        ctx.contains("Links go inline") && ctx.contains("acme.example.com"),
+        "a typed prompt still gets both: {ctx}"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn a_turn_claude_code_started_is_not_sent_back_or_labeled() {
+    let h = acme_home("ownstop", "fix");
+    register_stop(&h);
+    use_skill(&h, "s1", "p1");
+    let note = serde_json::json!({"session_id": "s1", "prompt_id": "p2", "prompt": FROM_CLAUDE_CODE[0], "cwd": "/tmp"});
+    assert!(hook(&h, "prompt", note).trim().is_empty());
+    assert_eq!(show_draft(&h, &h, "s1", "p2", "m1"), None);
+    assert!(stop(&h, "s1", "p2", BROKEN, false).trim().is_empty());
+    assert!(outcomes(&h, "catches.jsonl").is_empty());
+    let typed = serde_json::json!({"session_id": "s1", "prompt_id": "p3", "prompt": "what now?", "cwd": "/tmp"});
+    hook(&h, "prompt", typed);
+    assert_eq!(
+        show_draft(&h, &h, "s1", "p3", "m2"),
+        labeled(),
+        "the next typed turn is checked"
+    );
+    assert!(!sent_back(&stop(&h, "s1", "p3", BROKEN, false)).is_empty());
+    std::fs::remove_dir_all(&h).unwrap();
+}
