@@ -498,9 +498,43 @@ const PROGRESS: &[&str] = &[
 ];
 /// Common past forms that don't end in "ed".
 const IRREGULAR_PAST: &[&str] = &[
-    "ran", "sent", "went", "made", "got", "built", "broke", "wrote", "did", "gave", "took",
-    "found", "saw", "began", "came", "fell", "held", "kept", "lost", "met", "paid", "said", "sold",
-    "spent", "stood", "told", "won",
+    "ran", "sent", "went", "made", "built", "wrote", "did", "gave", "took", "saw", "began", "came",
+    "fell", "held", "kept", "lost", "met", "paid", "said", "sold", "spent", "stood", "told", "won",
+];
+/// Words that report trouble. A line with one is a bug report, not progress,
+/// even when it ends in a past form, like "lint failed" or "found a 429".
+/// "timed out" counts as well.
+const TROUBLE: &[&str] = &[
+    "fail",
+    "fails",
+    "failed",
+    "failing",
+    "failure",
+    "failures",
+    "crash",
+    "crashes",
+    "crashed",
+    "crashing",
+    "broke",
+    "broken",
+    "breaks",
+    "breaking",
+    "found",
+    "got",
+    "rejected",
+    "rejects",
+    "rejecting",
+    "expired",
+    "expires",
+    "expiring",
+    "stuck",
+    "missing",
+    "error",
+    "errors",
+    "errored",
+    "erroring",
+    "timeout",
+    "timeouts",
 ];
 /// Words that stand in for a topic without naming one.
 const GENERIC: &[&str] = &[
@@ -539,15 +573,30 @@ fn reports(w: &str) -> bool {
         || (n >= 4 && PROGRESS.iter().any(|p| swapped_pair(w, p)))
 }
 
-/// Whether typed text is a status line: it asks nothing, and one of its
-/// clauses starts or ends with a word that reports progress. Lines that look
-/// like code don't count, so a pasted `<pasted_content>` tag is no report.
+fn has_trouble(line: &str) -> bool {
+    let ws: Vec<String> = line
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    ws.iter().any(|w| TROUBLE.contains(&w.as_str()))
+        || ws.windows(2).any(|p| p[0] == "timed" && p[1] == "out")
+}
+
+/// Whether typed text is a status line: it asks nothing, reports no trouble,
+/// and one of its clauses starts or ends with a word that reports progress.
+/// Lines that look like code don't count, so a pasted `<pasted_content>` tag
+/// is no report.
 fn is_status(text: &str) -> bool {
     if asks(text) {
         return false;
     }
-    let prose = text.lines().filter(|l| !looks_like_code(l));
+    let prose: Vec<&str> = text.lines().filter(|l| !looks_like_code(l)).collect();
+    if prose.iter().any(|l| has_trouble(l)) {
+        return false;
+    }
     prose
+        .into_iter()
         .flat_map(|l| l.split([',', ';', '.', '!']))
         .any(|clause| {
             let ws: Vec<String> = query::terms(clause)
@@ -1871,6 +1920,29 @@ mod tests {
                 .map(String::as_str),
             Some("branch-names")
         );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn trouble_reports_are_not_status_lines() {
+        let (d, cfg, ix) = small_store("small-trouble");
+        for (q, want) in [
+            ("found a bug in the request quota", "request-quota"),
+            ("found a 429 above the request quota", "request-quota"),
+            ("the schema change crashed", "schema-changes"),
+            ("release tagging failed", "release-tags"),
+            ("the session keys expired again", "session-keys"),
+            ("renewing session keys timed out", "session-keys"),
+            ("our session keys got rejected", "session-keys"),
+            ("schema change broke after the update", "schema-changes"),
+        ] {
+            let got = gate_names(&ix, &cfg, q);
+            assert_eq!(
+                got.first().map(String::as_str),
+                Some(want),
+                "{q:?}: {got:?}"
+            );
+        }
         fs::remove_dir_all(&d).unwrap();
     }
 
