@@ -323,9 +323,12 @@ pub fn typed_text(prompt: &str) -> String {
 }
 
 /// Whether the prompt is one Claude Code sent itself rather than the user,
-/// such as a task notification. Such a prompt turns nothing on.
+/// such as a task notification. Such a prompt turns nothing on. Only a
+/// prompt that opens with a mark counts: one the user typed can paste or
+/// quote a mark further down.
 pub fn from_claude_code(prompt: &str) -> bool {
-    FROM_CLAUDE_CODE.iter().any(|m| prompt.contains(m))
+    let start = prompt.trim_start();
+    FROM_CLAUDE_CODE.iter().any(|m| start.starts_with(m))
 }
 
 fn words(s: &str) -> Vec<String> {
@@ -773,11 +776,22 @@ mod tests {
             "[Subagent hand-back] the acme review is done",
             "<agent-message from=\"acme\">hi</agent-message>",
             "[SYSTEM NOTIFICATION - acme]",
-            "see this\n<system-reminder>x</system-reminder>",
+            "<system-reminder>x</system-reminder>",
+            "\n  \t<task-notification>\n</task-notification>",
         ] {
             assert!(from_claude_code(p), "{p}");
         }
-        assert!(!from_claude_code("did the task notification reach acme?"));
+        for p in [
+            "did the task notification reach acme?",
+            "see this\n<system-reminder>x</system-reminder>",
+            "what is this?\n```\n<system-reminder>x</system-reminder>\n```",
+            "```\n<task-notification>\n</task-notification>\n```\nwhy did it stop?",
+            "<pasted_content id=\"1\"><system-reminder>x</system-reminder></pasted_content>",
+            "> <agent-message from=\"acme\">hi</agent-message>\nwho sent this?",
+            "the log says [Subagent hand-back] twice",
+        ] {
+            assert!(!from_claude_code(p), "{p}");
+        }
         let mut st = State::default();
         st.mark_quiet("p1");
         st.mark_quiet("p1");

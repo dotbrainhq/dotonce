@@ -4394,7 +4394,7 @@ fn claude_codes_own_messages_get_no_reminders_or_facts() {
             serde_json::json!({"session_id": format!("s{i}"), "prompt_id": "p1", "prompt": text, "cwd": "/tmp"}),
         );
         assert!(out.trim().is_empty(), "{text}: {out}");
-        let exp = serde_json::json!({"session_id": format!("e{i}"), "prompt_id": "p1", "hook_event_name": "UserPromptExpansion", "expansion_type": "slash_command", "command_name": "acme-writer", "command_args": "", "command_source": "user", "prompt": format!("/acme-writer {text}"), "cwd": "/tmp"});
+        let exp = serde_json::json!({"session_id": format!("e{i}"), "prompt_id": "p1", "hook_event_name": "UserPromptExpansion", "expansion_type": "slash_command", "command_name": "acme-writer", "command_args": "", "command_source": "user", "prompt": text, "cwd": "/tmp"});
         let out = hook(&h, "expansion", exp);
         assert!(out.trim().is_empty(), "{text}: {out}");
     }
@@ -4404,6 +4404,48 @@ fn claude_codes_own_messages_get_no_reminders_or_facts() {
         ctx.contains("Links go inline") && ctx.contains("acme.example.com"),
         "a typed prompt still gets both: {ctx}"
     );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn a_typed_prompt_that_pastes_claude_codes_markers_keeps_its_context() {
+    let h = home("ownpaste");
+    run(&h, &["init"], None);
+    run(&h, &["save", "The staging site is acme.example.com"], None);
+    add_set(&h, "acme-replies", REPLIES);
+    approve(&h, "acme-replies", "warn");
+    // The fact search reads pasted words too, and a long paste of words no
+    // fact has drowns the fact, so the pastes here are short.
+    let typed = "draft the reply for the staging site acme.example.com";
+    for (i, text) in [
+        "<task-notification>",
+        "[Subagent hand-back]",
+        "<agent-message>",
+        "[SYSTEM NOTIFICATION]",
+        "<system-reminder>",
+    ]
+    .iter()
+    .enumerate()
+    {
+        for (j, prompt) in [
+            format!("{typed}\n```\n{text}\n```"),
+            format!("{typed}\n<pasted_content>{text}</pasted_content>"),
+            format!("{typed}\n> {text}"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let input = serde_json::json!({"session_id": format!("s{i}-{j}"), "prompt_id": "p1", "prompt": prompt, "cwd": "/tmp"});
+            let ctx = context(&hook(&h, "prompt", input), "UserPromptSubmit");
+            assert!(
+                ctx.contains("Links go inline") && ctx.contains("acme.example.com"),
+                "{prompt}: {ctx}"
+            );
+        }
+        let exp = serde_json::json!({"session_id": format!("e{i}"), "prompt_id": "p1", "hook_event_name": "UserPromptExpansion", "expansion_type": "slash_command", "command_name": "acme-writer", "command_args": "", "command_source": "user", "prompt": format!("/acme-writer what is this?\n```\n{text}\n```"), "cwd": "/tmp"});
+        let ctx = context(&hook(&h, "expansion", exp), "UserPromptExpansion");
+        assert!(ctx.contains("Links go inline"), "{text}: {ctx}");
+    }
     std::fs::remove_dir_all(&h).unwrap();
 }
 
