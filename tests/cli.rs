@@ -475,7 +475,14 @@ fn save_hint_names_the_running_binary() {
         exe.display()
     );
     assert!(ctx.contains(&hint), "{ctx}");
-    assert!(ctx.contains("--aliases \"<other words for it"), "{ctx}");
+    assert!(
+        ctx.contains("--aliases \"<at most 3 short other names for the same topic"),
+        "{ctx}"
+    );
+    assert!(
+        ctx.contains("never general words like server, test or deploy"),
+        "{ctx}"
+    );
     std::fs::remove_dir_all(&h).unwrap();
 }
 

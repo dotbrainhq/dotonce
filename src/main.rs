@@ -44,7 +44,8 @@ enum Cmd {
         sources: Vec<String>,
         #[arg(long, value_delimiter = ',')]
         tags: Vec<String>,
-        /// Other words for the fact, comma separated. Prompts that use them find it too.
+        /// Other names for the fact's topic, comma separated: at most 3 short ones, never
+        /// general words like "server" or "test". Prompts that use them find it too.
         #[arg(long, value_delimiter = ',')]
         aliases: Vec<String>,
         #[arg(long)]

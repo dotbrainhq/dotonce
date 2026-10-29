@@ -987,9 +987,10 @@ pub fn pinned(
 }
 
 /// How to save a fact, with `{bin}` for the command that runs dotonce.
-/// Aliases are the other words someone might use for the fact; the prompt
-/// filter matches them like the fact's title.
-const SAVE_HINT: &str = "To keep something for next time, run: {bin} save \"<one line: the rule or fact>\" --source \"<where it came from>\" --aliases \"<other words for it, comma separated>\"";
+/// Aliases are other names for the fact's topic; the prompt filter matches
+/// them like the fact's title, so a plain word there pulls the fact into any
+/// prompt that uses it.
+const SAVE_HINT: &str = "To keep something for next time, run: {bin} save \"<one line: the rule or fact>\" --source \"<where it came from>\" --aliases \"<at most 3 short other names for the same topic, comma separated, like: sev1, incident, on-call; never general words like server, test or deploy>\"";
 
 /// The block ends with how to save a fact, run as `bin`: the command that
 /// starts this dotonce, since it may not be on PATH.
