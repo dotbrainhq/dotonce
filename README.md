@@ -66,6 +66,14 @@ cargo install --path .
 dotonce init
 ```
 
+If `dotonce` then says "command not found", `~/.cargo/bin` isn't on your PATH (this happens with rustup from Homebrew). Add it once, then open a new terminal:
+
+```
+echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.zshrc
+```
+
+On bash, use `~/.bashrc`. `dotonce doctor` checks this for you and prints the line to use. The hooks use absolute paths, so they work either way.
+
 Save a fact and find it again:
 
 ```

@@ -165,6 +165,68 @@ name = \"notes\"
 path = \"NOTES_PATH\"
 ";
 
+/// The folder of the running binary, when no entry of `PATH` resolves to it.
+/// A missing `PATH` counts as not found.
+pub fn folder_missing_from_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    missing_from(exe.parent()?, std::env::var_os("PATH").as_deref())
+}
+
+fn missing_from(folder: &Path, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let real = fs::canonicalize(folder).unwrap_or_else(|_| folder.to_path_buf());
+    let found = path.is_some_and(|p| {
+        std::env::split_paths(p)
+            .filter(|e| !e.as_os_str().is_empty())
+            .any(|e| fs::canonicalize(e).is_ok_and(|e| e == real))
+    });
+    (!found).then(|| folder.to_path_buf())
+}
+
+/// The shell line that adds `folder` to `PATH`, written with `$HOME` when the
+/// folder is under `home`.
+fn path_export_line(folder: &Path, home: Option<&Path>) -> String {
+    let under = |f: &Path, h: &Path| f.strip_prefix(h).ok().map(Path::to_path_buf);
+    let home = home.filter(|h| !h.as_os_str().is_empty());
+    let rel = home.and_then(|h| {
+        let (rf, rh) = (
+            fs::canonicalize(folder).unwrap_or_else(|_| folder.to_path_buf()),
+            fs::canonicalize(h).unwrap_or_else(|_| h.to_path_buf()),
+        );
+        under(folder, h).or_else(|| under(&rf, &rh))
+    });
+    let text = match rel {
+        Some(r) if r.as_os_str().is_empty() => "$HOME".to_string(),
+        Some(r) => format!("$HOME/{}", dq_escape(&r.to_string_lossy())),
+        None => dq_escape(&folder.to_string_lossy()),
+    };
+    let line = format!("export PATH=\"{text}:$PATH\"");
+    format!("echo '{}' >> ~/.zshrc", line.replace('\'', "'\\''"))
+}
+
+/// Escapes what a double-quoted shell string would expand, and drops control
+/// characters so a folder name can't rewrite the terminal.
+fn dq_escape(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars().filter(|c| !c.is_control()) {
+        if matches!(c, '\\' | '"' | '$' | '`') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The PATH hint `init` and `doctor` print, or nothing when the binary's
+/// folder is already on `PATH`. Never edits a shell file.
+pub fn path_hint() -> Option<String> {
+    let folder = folder_missing_from_path()?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    Some(format!(
+        "dotonce is not on your PATH, so the short `dotonce` command won't work in a new terminal. Add its folder once:\n{}\nthen open a new terminal (or run `source ~/.zshrc`). On bash, use ~/.bashrc.",
+        path_export_line(&folder, home.as_deref())
+    ))
+}
+
 /// Creates the home folder, a notes store and a config file if there isn't one.
 pub fn init() -> Result<PathBuf> {
     let home = home_dir()?;
@@ -183,6 +245,43 @@ pub fn init() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_line_uses_home_and_quotes_odd_folders() {
+        let home = Path::new("/nonexistent-home/user");
+        assert_eq!(
+            path_export_line(Path::new("/nonexistent-home/user/.cargo/bin"), Some(home)),
+            "echo 'export PATH=\"$HOME/.cargo/bin:$PATH\"' >> ~/.zshrc"
+        );
+        assert_eq!(
+            path_export_line(Path::new("/opt/tools/bin"), Some(home)),
+            "echo 'export PATH=\"/opt/tools/bin:$PATH\"' >> ~/.zshrc"
+        );
+        assert_eq!(
+            path_export_line(Path::new("/opt/tools/bin"), None),
+            "echo 'export PATH=\"/opt/tools/bin:$PATH\"' >> ~/.zshrc"
+        );
+        assert_eq!(
+            path_export_line(Path::new("/opt/it's $x/bin"), None),
+            "echo 'export PATH=\"/opt/it'\\''s \\$x/bin:$PATH\"' >> ~/.zshrc"
+        );
+    }
+
+    #[test]
+    fn missing_from_needs_an_entry_that_resolves_to_the_folder() {
+        let d = std::env::temp_dir().join(format!("dotonce-pathunit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let (bin, other) = (d.join("bin"), d.join("other"));
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let join = |v: &[&Path]| std::env::join_paths(v).unwrap();
+        assert_eq!(missing_from(&bin, None), Some(bin.clone()));
+        assert!(missing_from(&bin, Some(&join(&[&other]))).is_some());
+        assert!(missing_from(&bin, Some(&join(&[&other, &bin]))).is_none());
+        let dotted = bin.join("..").join("bin");
+        assert!(missing_from(&bin, Some(&join(&[&dotted]))).is_none());
+        fs::remove_dir_all(&d).unwrap();
+    }
 
     #[test]
     fn parses_stores_and_privacy() {
