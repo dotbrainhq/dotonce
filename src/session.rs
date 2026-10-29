@@ -78,10 +78,6 @@ pub struct State {
     pub logged: Vec<(String, String, String)>,
     #[serde(default)]
     pub prompt_id: Option<String>,
-    /// Turns Claude Code started itself (see `from_claude_code`): Stop
-    /// checks nothing in them and display labels nothing.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub quiet: Vec<String>,
     /// (set id, hash of its file) of each reminder given since the session
     /// started or was last compacted. A prompt-word set ends with its turn,
     /// so this keeps its reminder from coming back every turn.
@@ -90,18 +86,6 @@ pub struct State {
 }
 
 impl State {
-    pub fn quiet(&self, turn: &str) -> bool {
-        self.quiet.iter().any(|t| t == turn)
-    }
-
-    pub fn mark_quiet(&mut self, turn: &str) {
-        self.quiet.retain(|t| t != turn);
-        self.quiet.push(turn.to_string());
-        while self.quiet.len() > MAX_SENT_BACK {
-            self.quiet.remove(0);
-        }
-    }
-
     pub fn sent_back(&self, turn: &str) -> bool {
         self.sent_back.iter().any(|t| t == turn)
     }
@@ -594,10 +578,9 @@ pub struct Now {
 impl Now {
     /// The fix sets that check drafts right now. None once the turn was sent
     /// back: Stop sends a turn back once, so a draft labeled after that would
-    /// never be followed by a corrected one. None in a turn Claude Code
-    /// started, where Stop checks nothing.
+    /// never be followed by a corrected one.
     pub fn fix(&self) -> Vec<&Live> {
-        if self.state.sent_back(&self.turn) || self.state.quiet(&self.turn) {
+        if self.state.sent_back(&self.turn) {
             return Vec::new();
         }
         checking(&self.state, &self.live)
@@ -792,10 +775,6 @@ mod tests {
         ] {
             assert!(!from_claude_code(p), "{p}");
         }
-        let mut st = State::default();
-        st.mark_quiet("p1");
-        st.mark_quiet("p1");
-        assert!(st.quiet("p1") && !st.quiet("p2") && st.quiet.len() == 1);
     }
 
     #[test]

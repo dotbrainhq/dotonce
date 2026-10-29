@@ -4450,23 +4450,37 @@ fn a_typed_prompt_that_pastes_claude_codes_markers_keeps_its_context() {
 }
 
 #[test]
-fn a_turn_claude_code_started_is_not_sent_back_or_labeled() {
+fn a_turn_claude_code_started_is_still_checked_and_sent_back() {
     let h = acme_home("ownstop", "fix");
     register_stop(&h);
     use_skill(&h, "s1", "p1");
     let note = serde_json::json!({"session_id": "s1", "prompt_id": "p2", "prompt": FROM_CLAUDE_CODE[0], "cwd": "/tmp"});
-    assert!(hook(&h, "prompt", note).trim().is_empty());
-    assert_eq!(show_draft(&h, &h, "s1", "p2", "m1"), None);
-    assert!(stop(&h, "s1", "p2", BROKEN, false).trim().is_empty());
-    assert!(outcomes(&h, "catches.jsonl").is_empty());
-    let typed = serde_json::json!({"session_id": "s1", "prompt_id": "p3", "prompt": "what now?", "cwd": "/tmp"});
-    hook(&h, "prompt", typed);
-    assert_eq!(
-        show_draft(&h, &h, "s1", "p3", "m2"),
-        labeled(),
-        "the next typed turn is checked"
+    assert!(
+        hook(&h, "prompt", note).trim().is_empty(),
+        "no reminder or fact"
     );
-    assert!(!sent_back(&stop(&h, "s1", "p3", BROKEN, false)).is_empty());
+    assert_eq!(show_draft(&h, &h, "s1", "p2", "m1"), labeled());
+    let back = sent_back(&stop(&h, "s1", "p2", BROKEN, false));
+    assert!(back.contains("no-stock-wait-opener"), "{back}");
+    assert!(
+        outcomes(&h, "catches.jsonl")
+            .iter()
+            .any(|(c, o)| c == "no-stock-wait-opener" && o == "caught"),
+        "the catch is logged"
+    );
+    assert!(
+        stop(&h, "s1", "p2", BROKEN_AGAIN, true).trim().is_empty(),
+        "sent back once"
+    );
+    for (i, text) in FROM_CLAUDE_CODE.iter().enumerate() {
+        let pid = format!("q{i}");
+        let note = serde_json::json!({"session_id": "s1", "prompt_id": pid, "prompt": text, "cwd": "/tmp"});
+        assert!(hook(&h, "prompt", note).trim().is_empty(), "{text}");
+        assert!(
+            !sent_back(&stop(&h, "s1", &pid, BROKEN, false)).is_empty(),
+            "{text}"
+        );
+    }
     std::fs::remove_dir_all(&h).unwrap();
 }
 

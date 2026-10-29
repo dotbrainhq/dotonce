@@ -164,12 +164,6 @@ fn turn_on(
     let dir = session::dir()?;
     let mut state = session::load(&dir, sid)?;
     session::refresh(&mut state, &live, cfg, cwd, prompt_id(v), event);
-    if let Event::Prompt(_) = event {
-        // A typed prompt starts a turn of the user's, even under a key an
-        // earlier turn Claude Code started had.
-        let turn = session::turn_key(&state, prompt_id(v));
-        state.quiet.retain(|t| t != &turn);
-    }
     let mut out = (String::new(), 0);
     if let Some(budget) = budget {
         let (text, used, given) =
@@ -190,27 +184,11 @@ fn reminders_for(v: &Value, cfg: &Config, cwd: &Path, event: Event) -> (String, 
     })
 }
 
-/// Records the hook call's turn as one Claude Code started, so Stop and
-/// display leave it alone. Nothing to record without rule sets.
-fn mark_quiet(v: &Value) -> Result<()> {
-    let (live, _) = approvals::load_live()?;
-    if live.is_empty() {
-        return Ok(());
-    }
-    let sid = session_id(v)?;
-    let dir = session::dir()?;
-    let mut state = session::load(&dir, sid)?;
-    let turn = session::turn_key(&state, prompt_id(v));
-    state.mark_quiet(&turn);
-    session::save(&dir, sid, &state)
-}
-
 fn prompt(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
     let text = str_field(v, "prompt");
     if session::from_claude_code(text) {
-        if let Err(e) = mark_quiet(v) {
-            log_error(&format!("rules: {e:#}"));
-        }
+        // No reminders or facts, and no prompt-word set turns on. Stop and
+        // display still check the turn like any other.
         return Ok(None);
     }
     let file_cfg = config::load_file()?;

@@ -230,7 +230,7 @@ pub fn stop(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
 /// goes back.
 fn send_back(v: &Value, cwd: &Path, now: i64, sid: &str, dir: &Path) -> Result<Option<String>> {
     let checks = session::checks_now(&session::load(dir, sid)?, cwd, prompt_id(v))?;
-    if checks.live.is_empty() || checks.state.quiet(&checks.turn) {
+    if checks.live.is_empty() {
         return Ok(None);
     }
     let fix: Vec<String> = checks.fix().iter().map(|l| l.set.id.clone()).collect();
