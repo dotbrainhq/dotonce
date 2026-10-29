@@ -163,7 +163,7 @@ fn turn_on(
     if let Some(budget) = budget {
         let (text, used, given) =
             reminder_section(&session::pending_reminders(&state, &live), budget);
-        session::mark_reminded(&mut state, &given);
+        session::mark_reminded(&mut state, &live, &given);
         out = (text, used);
     }
     session::save(&dir, sid, &state)?;
@@ -574,7 +574,8 @@ fn compact(
     session::refresh(&mut state, live, cfg, cwd, prompt_id(v), Event::Other);
     let rem = session::compact_reminders(&state, live, prompt_id(v));
     let (text, used, given) = reminder_section(&rem, MAX_BUDGET);
-    session::mark_reminded(&mut state, &given);
+    session::compacted(&mut state);
+    session::mark_reminded(&mut state, live, &given);
     session::save(dir, sid, &state)?;
     Ok((text, used))
 }

@@ -4427,3 +4427,49 @@ fn a_turn_claude_code_started_is_not_sent_back_or_labeled() {
     assert!(!sent_back(&stop(&h, "s1", "p3", BROKEN, false)).is_empty());
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+const CHAT: &str = "[when]\nprompt = [\"draft\"]\ncheck_on_prompt = true\n[remind]\ntext = \"Keep chat replies short.\"\n[draft]\nfence = [\"markdown\"]\n[[check]]\nid = \"no-stock-wait-opener\"\nforbid = [\"sorry for the wait\"]\nwhy = \"Open with a line from the thread.\"\n";
+
+#[test]
+fn a_prompt_word_reminder_comes_once_per_session_and_checks_run_every_turn() {
+    let h = home("remindonce");
+    add_set(&h, "acme-chat", CHAT);
+    approve(&h, "acme-chat", "fix");
+    let prompt = |sid: &str, pid: &str, text: &str| {
+        hook(
+            &h,
+            "prompt",
+            serde_json::json!({"session_id": sid, "prompt_id": pid, "prompt": text, "cwd": "/tmp"}),
+        )
+    };
+    let reminded = |out: &str| out.contains("Keep chat replies short.");
+    assert!(reminded(&prompt("s1", "p1", "draft it")));
+    let out = prompt("s1", "p2", "draft the next one");
+    assert!(!reminded(&out), "the second turn gets no reminder: {out}");
+    assert!(
+        !sent_back(&stop(&h, "s1", "p2", BROKEN, false)).is_empty(),
+        "the set still checks this turn"
+    );
+    assert!(
+        reminded(&prompt("s2", "p1", "draft it")),
+        "a new session gets it"
+    );
+    hook(
+        &h,
+        "session-start",
+        serde_json::json!({"session_id": "s1", "source": "compact", "cwd": "/tmp"}),
+    );
+    assert!(
+        reminded(&prompt("s1", "p3", "draft a third")),
+        "after compaction it comes again"
+    );
+    assert!(!reminded(&prompt("s1", "p4", "draft a fourth")));
+    edit_set(&h, "acme-chat");
+    approve(&h, "acme-chat", "fix");
+    assert!(
+        reminded(&prompt("s1", "p5", "draft a fifth")),
+        "a changed file comes again"
+    );
+    assert!(!reminded(&prompt("s1", "p6", "draft a sixth")));
+    std::fs::remove_dir_all(&h).unwrap();
+}

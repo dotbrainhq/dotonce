@@ -82,6 +82,11 @@ pub struct State {
     /// checks nothing in them and display labels nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quiet: Vec<String>,
+    /// (set id, hash of its file) of each reminder given since the session
+    /// started or was last compacted. A prompt-word set ends with its turn,
+    /// so this keeps its reminder from coming back every turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub given: Vec<(String, String)>,
 }
 
 impl State {
@@ -451,23 +456,51 @@ fn reminder(live: &[Live], id: &str) -> Option<(String, String)> {
     Some((id.to_string(), text))
 }
 
-/// The reminders of active sets that haven't had theirs yet. Mark the ones
-/// actually given with `mark_reminded`, so one left out at the token cap
-/// comes with the next hook that can add context.
+/// The hash of a live set's file, which changes when the file does.
+fn file_hash(live: &[Live], id: &str) -> Option<String> {
+    live.iter()
+        .find(|l| l.set.id == id)
+        .map(|l| approvals::hash(&l.set.src))
+}
+
+/// Whether this set's reminder, as its file is now, was given since the
+/// session started or was last compacted.
+fn given(state: &State, live: &[Live], id: &str) -> bool {
+    file_hash(live, id).is_some_and(|h| state.given.iter().any(|(i, g)| i == id && *g == h))
+}
+
+/// The reminders of active sets that haven't had theirs yet. A prompt-word
+/// set gets its reminder once per session, again after compaction or when
+/// its file changes. Mark the ones actually given with `mark_reminded`, so
+/// one left out at the token cap comes with the next hook that can add
+/// context.
 pub fn pending_reminders(state: &State, live: &[Live]) -> Vec<(String, String)> {
     state
         .active
         .iter()
         .filter(|a| !a.reminded)
+        .filter(|a| a.by != Trigger::Prompt || !given(state, live, &a.id))
         .filter_map(|a| reminder(live, &a.id))
         .collect()
 }
 
 /// Records that these sets' reminders were given.
-pub fn mark_reminded(state: &mut State, ids: &[String]) {
+pub fn mark_reminded(state: &mut State, live: &[Live], ids: &[String]) {
     for a in state.active.iter_mut().filter(|a| ids.contains(&a.id)) {
         a.reminded = true;
     }
+    for id in ids {
+        if let Some(h) = file_hash(live, id) {
+            state.given.retain(|(i, _)| i != id);
+            state.given.push((id.clone(), h));
+        }
+    }
+}
+
+/// Forgets which reminders were given: after compaction the context no
+/// longer holds them.
+pub fn compacted(state: &mut State) {
+    state.given.clear();
 }
 
 /// The reminders to give again after the context was compacted: skill and
@@ -585,7 +618,7 @@ mod tests {
     fn take(st: &mut State, live: &[Live]) -> Vec<(String, String)> {
         let r = pending_reminders(st, live);
         let ids: Vec<String> = r.iter().map(|(id, _)| id.clone()).collect();
-        mark_reminded(st, &ids);
+        mark_reminded(st, live, &ids);
         r
     }
 
@@ -1059,7 +1092,7 @@ mod tests {
             Event::Other,
         );
         assert_eq!(pending_reminders(&st, &sets).len(), 2);
-        mark_reminded(&mut st, &["a".to_string()]);
+        mark_reminded(&mut st, &sets, &["a".to_string()]);
         let left = pending_reminders(&st, &sets);
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].0, "b");
