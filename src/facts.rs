@@ -453,6 +453,11 @@ const SHORT_WORDS: usize = 6;
 /// The best cover such a status line needs: a weaker match is on words that
 /// say how the work goes, not what it is about.
 const STATUS_COVER: f64 = 0.75;
+/// `UNSEEN` for such a prompt. A word no title has is weaker evidence in a
+/// few words than in a pasted log: on a small store most words are new, so
+/// "draft the staging site reply" still finds the staging site fact, while a
+/// typo in a status line still counts.
+const SHORT_UNSEEN: f64 = 0.25;
 /// Facts after the best must cover at least this share of what the best covers.
 const NEAR_BEST: f64 = 0.4;
 /// A prompt with one meaningful word only gets facts when that word is in at
@@ -578,7 +583,8 @@ fn gate(ix: &Index, query: &str, ids: Vec<String>, private_ok: bool) -> Result<V
         // A status line's words sit in many titles alike, so more of them
         // tie for the best match than one block could show.
         let ties = titles.values().filter(|ws| cover(ws).0 >= best).count();
-        if best < STATUS_COVER || ties > MAX_FACTS {
+        let short_total = seen + unseen * SHORT_UNSEEN * (1.0 + n).ln();
+        if best * total / short_total < STATUS_COVER || ties > MAX_FACTS {
             return Ok(Vec::new());
         }
     } else if best < BEST_COVER {
@@ -1143,6 +1149,11 @@ mod tests {
         sync(&mut ix, &cfg).unwrap();
         assert_eq!(
             gate_names(&ix, &cfg, "where is the staging site?"),
+            vec!["staging-site"]
+        );
+        // A short request whose other words no fact has yet.
+        assert_eq!(
+            gate_names(&ix, &cfg, "draft the staging site reply"),
             vec!["staging-site"]
         );
         fs::remove_dir_all(&d).unwrap();
