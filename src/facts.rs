@@ -38,6 +38,17 @@ const FILLER: &[&str] = &[
     "good", "great", "looks", "look", "continue", "go", "ahead", "yes", "nice", "cool", "done",
     "perfect", "right", "correct", "agree", "lgtm",
 ];
+/// Words about the flow of work, not its topic: a status line like "done
+/// plugin update, next batch" is made of them. They still count, but a
+/// prompt whose known words are all of these needs a fact that covers
+/// `WORKFLOW_COVER` of it, since any weaker match is on the status words alone.
+const WORKFLOW: &[&str] = &[
+    "update", "updated", "updates", "updating", "next", "done", "batch", "batches", "plugin",
+    "plugins", "fix", "fixed", "fixes", "fixing", "check", "checked", "checks", "checking", "run",
+    "ran", "running", "runs", "step", "steps", "task", "tasks", "start", "started", "finish",
+    "finished", "now", "again", "later", "first", "last", "item", "items", "part", "work",
+    "working", "change", "changes", "changed", "move", "moving", "keep", "try", "test", "tests",
+];
 
 const META: &str = "CREATE TABLE IF NOT EXISTS fact_meta(
     doc_id TEXT PRIMARY KEY,
@@ -441,6 +452,8 @@ const COVER: f64 = 0.3;
 /// The best fact must cover this much of the prompt, or nothing is sent: a
 /// prompt no fact is clearly about (a pasted log, a status line) gets no block.
 const BEST_COVER: f64 = 0.5;
+/// The best cover a prompt of workflow words alone needs (see `WORKFLOW`).
+const WORKFLOW_COVER: f64 = 0.75;
 /// Facts after the best must cover at least this share of what the best covers.
 const NEAR_BEST: f64 = 0.4;
 /// A prompt with one meaningful word only gets facts when that word is in at
@@ -546,7 +559,16 @@ fn gate(ix: &Index, query: &str, ids: Vec<String>, private_ok: bool) -> Result<V
         })
         .collect();
     let best = scored.iter().map(|s| s.1).fold(0.0, f64::max);
-    if best < BEST_COVER {
+    let status_only = terms
+        .iter()
+        .zip(&weights)
+        .all(|(t, w)| w.idf == 0.0 || WORKFLOW.contains(&t.as_str()));
+    let need = if status_only {
+        WORKFLOW_COVER
+    } else {
+        BEST_COVER
+    };
+    if best < need {
         return Ok(Vec::new());
     }
     let min_cover = COVER.max(best * NEAR_BEST);
@@ -1031,6 +1053,38 @@ mod tests {
         assert_eq!(gate_names(&ix, &cfg, "linter"), vec!["lint-before-commit"]);
         let got = gate_names(&ix, &cfg, "thanks, looks good");
         assert!(got.is_empty(), "{got:?}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn gate_sends_nothing_for_a_status_line_of_workflow_words() {
+        let (d, cfg, ix) = gate_store("gate-status");
+        for (n, desc) in [
+            ("next-batch-window", "The next batch export runs at noon"),
+            (
+                "plugin-update-review",
+                "Each plugin update gets a second review",
+            ),
+        ] {
+            write(&d, &format!("{n}.md"), &entry(n, desc, ""));
+        }
+        let mut ix = ix;
+        sync(&mut ix, &cfg).unwrap();
+        for q in [
+            "done plugin update, next batch",
+            "okay done plugin udapte nad next",
+        ] {
+            let got = gate_names(&ix, &cfg, q);
+            assert!(got.is_empty(), "{q:?}: {got:?}");
+        }
+        assert_eq!(
+            gate_names(&ix, &cfg, "when does the next batch export run?").first(),
+            Some(&"next-batch-window".to_string())
+        );
+        assert_eq!(
+            gate_names(&ix, &cfg, "should I run the linter before this commit?")[0],
+            "lint-before-commit"
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 
