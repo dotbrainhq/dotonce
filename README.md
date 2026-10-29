@@ -77,9 +77,11 @@ On bash, use `~/.bashrc`. `dotonce doctor` checks this for you and prints the li
 Save a fact and find it again:
 
 ```
-dotonce save "The staging site is staging.example.com" --source "team wiki"
+dotonce save "The staging site is staging.example.com" --source "team wiki" --aliases "test server, preview site"
 dotonce search "staging site"
 ```
+
+`--aliases` takes other words for the same fact. A prompt that says "test server" finds this fact too. In a fact file they go in an `aliases:` list in the frontmatter.
 
 Print the hooks block, then add its entries to the `hooks` section of `~/.claude/settings.json`:
 
