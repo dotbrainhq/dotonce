@@ -41,8 +41,8 @@ const FILLER: &[&str] = &[
 /// Words about the flow of work, not its topic: a status line like "done
 /// plugin update, next batch" is made of them. They still count, but a
 /// prompt whose known words are all of these needs a fact that covers
-/// `WORKFLOW_COVER` of it, since any weaker match is on the status words alone.
-const WORKFLOW: &[&str] = &[
+/// `STATUS_COVER` of it, since any weaker match is on the status words alone.
+const STATUS_WORDS: &[&str] = &[
     "update", "updated", "updates", "updating", "next", "done", "batch", "batches", "plugin",
     "plugins", "fix", "fixed", "fixes", "fixing", "check", "checked", "checks", "checking", "run",
     "ran", "running", "runs", "step", "steps", "task", "tasks", "start", "started", "finish",
@@ -452,8 +452,8 @@ const COVER: f64 = 0.3;
 /// The best fact must cover this much of the prompt, or nothing is sent: a
 /// prompt no fact is clearly about (a pasted log, a status line) gets no block.
 const BEST_COVER: f64 = 0.5;
-/// The best cover a prompt of workflow words alone needs (see `WORKFLOW`).
-const WORKFLOW_COVER: f64 = 0.75;
+/// The best cover a prompt of status words alone needs (see `STATUS_WORDS`).
+const STATUS_COVER: f64 = 0.75;
 /// Facts after the best must cover at least this share of what the best covers.
 const NEAR_BEST: f64 = 0.4;
 /// A prompt with one meaningful word only gets facts when that word is in at
@@ -562,9 +562,9 @@ fn gate(ix: &Index, query: &str, ids: Vec<String>, private_ok: bool) -> Result<V
     let status_only = terms
         .iter()
         .zip(&weights)
-        .all(|(t, w)| w.idf == 0.0 || WORKFLOW.contains(&t.as_str()));
+        .all(|(t, w)| w.idf == 0.0 || STATUS_WORDS.contains(&t.as_str()));
     let need = if status_only {
-        WORKFLOW_COVER
+        STATUS_COVER
     } else {
         BEST_COVER
     };
@@ -1058,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_sends_nothing_for_a_status_line_of_workflow_words() {
+    fn gate_sends_nothing_for_a_status_line_of_status_words() {
         let (d, cfg, ix) = gate_store("gate-status");
         for (n, desc) in [
             ("next-batch-window", "The next batch export runs at noon"),
