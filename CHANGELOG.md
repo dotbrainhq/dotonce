@@ -6,7 +6,7 @@ Every release of dotonce is listed here. Versions follow semantic versioning.
 
 ### Added
 
-- An `aliases:` frontmatter list and `dotonce save --aliases`: other words for a fact, matched like its title. The save hint in each facts block asks for them.
+- An `aliases:` frontmatter list and `dotonce save --aliases`: other names for a fact's topic, matched like its title. The save hint in each facts block asks for at most three short ones and no general words.
 - `ignore_paths` in the config: inside those folders the hooks add nothing, check nothing and change nothing. The guard that keeps rule files out of Claude's reach still runs there.
 - `dotonce init` and `dotonce doctor` print the line to add to your shell config when dotonce's folder isn't on your PATH. They never edit a shell file.
 - Each conversation in the results shows its weekday and how many days before the question it happened, so the agent doesn't have to do date math.
@@ -31,13 +31,13 @@ Every release of dotonce is listed here. Versions follow semantic versioning.
 
 ### Changed
 
-- The prompt hook sends at most three facts, and only those close to the best match. A status line, like "fixed the login redirect, moving on", gets none. A short request on a small store, like "tag a release", now finds its fact. When a prompt pastes a log, code or an email, the typed lines and the pasted text are matched apart, so a pasted 429 response can find the rate limit fact.
+- The prompt hook sends at most three facts, and only those close to the best match. A status line, like "fixed the login redirect, moving on", gets none. A bug report, like "lint failed" or "found a 429 from the API", still gets its facts. A short request on a small store, like "check the logs for this request", now finds its fact. When a prompt pastes a log, code or an email, the typed lines and the pasted text are matched apart, so a pasted 429 response can find the rate limit fact.
 - `dotonce hook-config` prints all seven hooks dotonce needs, up from two.
 - The default budget is now 40,000 tokens with up to 60 conversations. On LongMemEval this keeps the right conversations for every question in our 102-question sample, while still sending fewer tokens than Hindsight.
 
 ### Fixed
 
-- A short status message, like "done, next batch", no longer pulls in facts that share only common words with it. A short prompt that asks nothing now needs a fact that covers most of it.
+- A short status message, like "done, next batch", stops pulling in facts that share only common words with it.
 - Hooks ignore Claude Code's own messages (task notifications, agent reports, system reminders), so they add no facts or reminders there. Only a prompt that starts with one counts, so a prompt you type that pastes one keeps its facts and reminders. Reply checks still run in those turns.
 - A rule set's reminder comes once per session, and again after compaction or when its file changes, instead of on every turn.
 - Prompt-word triggers read only text the user typed, and a trigger of several words matches only as the whole phrase.
