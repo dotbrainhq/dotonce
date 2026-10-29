@@ -4548,3 +4548,34 @@ fn an_ignored_folder_gets_nothing_but_the_guard() {
     assert!(out.contains("acme.example.com"), "outside it: {out}");
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+#[test]
+fn prompt_words_skip_quoted_lines_and_match_a_phrase_whole() {
+    let h = home("phrase");
+    add_set(
+        &h,
+        "acme-notes",
+        "[when]\nprompt = [\"internal note\"]\n[remind]\ntext = \"Internal notes stay short.\"\n",
+    );
+    approve(&h, "acme-notes", "warn");
+    let prompt = |sid: &str, text: &str| {
+        hook(
+            &h,
+            "prompt",
+            serde_json::json!({"session_id": sid, "prompt_id": "p1", "prompt": text, "cwd": "/tmp"}),
+        )
+    };
+    for (i, text) in [
+        "The internal tool left a note on the acme order",
+        "keep it internal, note the date",
+        "> add an internal note for acme\nwhat does this mean?",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let out = prompt(&format!("s{i}"), text);
+        assert!(out.trim().is_empty(), "{text:?}: {out}");
+    }
+    assert!(prompt("s9", "add an internal note for acme").contains("Internal notes stay short."));
+    std::fs::remove_dir_all(&h).unwrap();
+}

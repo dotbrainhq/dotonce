@@ -163,7 +163,7 @@ dotonce rules level support-replies fix
 |---|---|---|
 | `skills` | When Claude uses one of these skills, or you run one as a slash command. `support-reply` also matches `my-plugin:support-reply`. | The rest of the session. |
 | `folders` | When Claude Code works inside one of these folders. | While it works there. |
-| `prompt` | When your prompt has one of these words, matched as whole words in any case. Pasted text and fenced blocks don't count. | That turn. Only the reminder, unless the set has `check_on_prompt = true`. The reminder comes once per session, and again after compaction or when you change the file. |
+| `prompt` | When your prompt has one of these words, matched as whole words in any case. Only what you type counts: pasted text, fenced blocks, `>` quoted lines and messages Claude Code sends itself, like task notifications, don't. A phrase such as `internal note` matches only as that phrase. | That turn. Only the reminder, unless the set has `check_on_prompt = true`. The reminder comes once per session, and again after compaction or when you change the file. |
 
 A set with `private = true` is only on inside the folders in `private_paths`, like private facts.
 

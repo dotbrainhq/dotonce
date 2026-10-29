@@ -292,8 +292,8 @@ fn strip_pasted(line: &str, pasted: &mut bool, out: &mut String) {
     }
 }
 
-/// The prompt without pasted material: fenced blocks and
-/// `<pasted_content ...>` blocks.
+/// The prompt without pasted or quoted material: fenced blocks,
+/// `<pasted_content ...>` blocks and `>` quoted lines.
 pub fn typed_text(prompt: &str) -> String {
     let mut out = String::new();
     let mut fence: Option<(char, usize)> = None;
@@ -310,6 +310,11 @@ pub fn typed_text(prompt: &str) -> String {
                 fence = Some((ch, len));
                 continue;
             }
+        }
+        if !pasted && line.trim_start().starts_with('>') {
+            // Read only to follow a paste that opens on the quoted line.
+            strip_pasted(line, &mut pasted, &mut String::new());
+            continue;
         }
         strip_pasted(line, &mut pasted, &mut out);
         out.push('\n');
@@ -330,21 +335,52 @@ fn words(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// The words of `s`, each with whether only spaces, tabs, hyphens or
+/// apostrophes part it from the word before. A phrase never spans a comma,
+/// a full stop or a line break.
+fn joined_words(s: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut word = String::new();
+    let mut joined = false;
+    for c in s.chars() {
+        if c.is_alphanumeric() {
+            word.push(c);
+            continue;
+        }
+        if !word.is_empty() {
+            out.push((word.to_lowercase(), joined));
+            word.clear();
+            joined = true;
+        }
+        if !matches!(c, ' ' | '\t' | '-' | '\'' | '\u{2019}') {
+            joined = false;
+        }
+    }
+    if !word.is_empty() {
+        out.push((word.to_lowercase(), joined));
+    }
+    out
+}
+
 /// The first entry whose words all appear next to each other, in order, in
-/// the typed part of the prompt, with the search's light stemming.
+/// the typed part of the prompt, with the search's light stemming. An entry
+/// of several words matches only as that phrase, never its words apart.
 pub fn prompt_match(entries: &[String], prompt: &str) -> Option<String> {
     if entries.is_empty() {
         return None;
     }
-    let typed = words(&typed_text(prompt));
+    let typed = joined_words(&typed_text(prompt));
     entries
         .iter()
         .find(|e| {
             let want = words(e);
             !want.is_empty()
-                && typed
-                    .windows(want.len())
-                    .any(|w| w.iter().zip(&want).all(|(t, x)| word_match(x, t)))
+                && typed.windows(want.len()).any(|w| {
+                    w.iter()
+                        .zip(&want)
+                        .enumerate()
+                        .all(|(k, ((t, joined), x))| (k == 0 || *joined) && word_match(x, t))
+                })
         })
         .cloned()
 }
@@ -683,6 +719,51 @@ mod tests {
         let entries = vec!["later".to_string()];
         let p = "<pasted_content id=\"1\">x</pasted_contents> later";
         assert_eq!(prompt_match(&entries, p), None);
+    }
+
+    #[test]
+    fn quoted_lines_are_not_typed_text() {
+        let entries = vec!["chat".to_string()];
+        for p in [
+            "> chat with the acme team\nwhat do you think?",
+            "Look at this:\n>chat log from acme\n  > > nested chat\nthoughts?",
+        ] {
+            assert_eq!(prompt_match(&entries, p), None, "{p:?}");
+        }
+        assert_eq!(
+            prompt_match(&entries, "> quoted line\nlet's chat about it").as_deref(),
+            Some("chat")
+        );
+        assert_eq!(
+            prompt_match(&entries, "a > b, so chat later").as_deref(),
+            Some("chat")
+        );
+    }
+
+    #[test]
+    fn a_phrase_matches_only_as_the_whole_phrase() {
+        let entries = vec!["internal note".to_string()];
+        for p in [
+            "The internal tool left a note on the order",
+            "keep it internal, note the date",
+            "keep it internal.\nNote the date",
+            "note the internal state",
+            "internal",
+            "note",
+        ] {
+            assert_eq!(prompt_match(&entries, p), None, "{p:?}");
+        }
+        for p in [
+            "add an internal note for acme",
+            "Add an Internal  Note",
+            "two internal notes, please",
+        ] {
+            assert_eq!(
+                prompt_match(&entries, p).as_deref(),
+                Some("internal note"),
+                "{p:?}"
+            );
+        }
     }
 
     #[test]
