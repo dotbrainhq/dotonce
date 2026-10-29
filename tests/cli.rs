@@ -1149,7 +1149,7 @@ fn prompt_hook_adds_reminders_before_facts() {
     run(&h, &["save", "The staging site is acme.example.com"], None);
     add_set(&h, "acme-replies", REPLIES);
     approve(&h, "acme-replies", "warn");
-    let input = serde_json::json!({"session_id": "s1", "prompt_id": "p1", "prompt": "draft the staging site reply", "cwd": "/tmp"});
+    let input = serde_json::json!({"session_id": "s1", "prompt_id": "p1", "prompt": "where is the staging site for the draft reply?", "cwd": "/tmp"});
     let ctx = context(&hook(&h, "prompt", input.clone()), "UserPromptSubmit");
     let rule = ctx
         .find("[acme-replies]\nLinks go inline as anchor text.")
@@ -1733,7 +1733,7 @@ fn a_facts_failure_still_gives_the_reminders() {
     let out = hook(
         &h,
         "prompt",
-        serde_json::json!({"session_id": "s1", "prompt_id": "p1", "prompt": "draft the staging site reply", "cwd": "/tmp"}),
+        serde_json::json!({"session_id": "s1", "prompt_id": "p1", "prompt": "where is the staging site for the draft reply?", "cwd": "/tmp"}),
     );
     let ctx = context(&out, "UserPromptSubmit");
     assert!(ctx.contains("Links go inline"), "{ctx}");
@@ -4373,11 +4373,11 @@ fn path_hint_writes_home_when_the_binary_is_under_home() {
 /// Prompts Claude Code sends itself, one of each kind, each with words that
 /// turn on `REPLIES` and match the staging site fact.
 const FROM_CLAUDE_CODE: [&str; 5] = [
-    "<task-notification>\n<task-id>t1</task-id>\n<status>completed</status>\n<summary>draft the staging site reply</summary>\n</task-notification>",
-    "[Subagent hand-back] draft the staging site reply is ready",
-    "<agent-message from=\"acme\">draft the staging site reply</agent-message>",
-    "[SYSTEM NOTIFICATION] draft the staging site reply",
-    "<system-reminder>draft the staging site reply</system-reminder>",
+    "<task-notification>\n<task-id>t1</task-id>\n<status>completed</status>\n<summary>where is the staging site for the draft reply?</summary>\n</task-notification>",
+    "[Subagent hand-back] where is the staging site for the draft reply?",
+    "<agent-message from=\"acme\">where is the staging site for the draft reply?</agent-message>",
+    "[SYSTEM NOTIFICATION] where is the staging site for the draft reply?",
+    "<system-reminder>where is the staging site for the draft reply?</system-reminder>",
 ];
 
 #[test]
@@ -4398,7 +4398,7 @@ fn claude_codes_own_messages_get_no_reminders_or_facts() {
         let out = hook(&h, "expansion", exp);
         assert!(out.trim().is_empty(), "{text}: {out}");
     }
-    let typed = serde_json::json!({"session_id": "s9", "prompt_id": "p1", "prompt": "draft the staging site reply", "cwd": "/tmp"});
+    let typed = serde_json::json!({"session_id": "s9", "prompt_id": "p1", "prompt": "where is the staging site for the draft reply?", "cwd": "/tmp"});
     let ctx = context(&hook(&h, "prompt", typed), "UserPromptSubmit");
     assert!(
         ctx.contains("Links go inline") && ctx.contains("acme.example.com"),
@@ -4559,7 +4559,7 @@ fn an_ignored_folder_gets_nothing_but_the_guard() {
     let quiet = [
         (
             "prompt",
-            at(serde_json::json!({"prompt": "draft the staging site reply"})),
+            at(serde_json::json!({"prompt": "where is the staging site for the draft reply?"})),
         ),
         (
             "session-start",
@@ -4599,7 +4599,7 @@ fn an_ignored_folder_gets_nothing_but_the_guard() {
     let out = hook(
         &h,
         "prompt",
-        serde_json::json!({"session_id": "s2", "prompt_id": "p1", "prompt": "draft the staging site reply", "cwd": "/tmp"}),
+        serde_json::json!({"session_id": "s2", "prompt_id": "p1", "prompt": "where is the staging site for the draft reply?", "cwd": "/tmp"}),
     );
     assert!(out.contains("acme.example.com"), "outside it: {out}");
     std::fs::remove_dir_all(&h).unwrap();
