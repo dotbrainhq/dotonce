@@ -21,6 +21,15 @@ const MAX_SENT_BACK: usize = 50;
 const MAX_LOGGED: usize = 200;
 const PASTE_OPEN: &str = "<pasted_content";
 const PASTE_CLOSE: &str = "</pasted_content";
+/// Marks of a prompt Claude Code sends itself: a background task's notice, a
+/// subagent's hand-back, a message from another agent, a system notice.
+const FROM_CLAUDE_CODE: [&str; 5] = [
+    "<task-notification>",
+    "[Subagent hand-back]",
+    "<agent-message",
+    "[SYSTEM NOTIFICATION",
+    "<system-reminder>",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -69,6 +78,11 @@ pub struct State {
     pub logged: Vec<(String, String, String)>,
     #[serde(default)]
     pub prompt_id: Option<String>,
+    /// (set id, hash of its file) of each reminder given since the session
+    /// started or was last compacted. A prompt-word set ends with its turn,
+    /// so this keeps its reminder from coming back every turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub given: Vec<(String, String)>,
 }
 
 impl State {
@@ -262,8 +276,8 @@ fn strip_pasted(line: &str, pasted: &mut bool, out: &mut String) {
     }
 }
 
-/// The prompt without pasted material: fenced blocks and
-/// `<pasted_content ...>` blocks.
+/// The prompt without pasted or quoted material: fenced blocks,
+/// `<pasted_content ...>` blocks and `>` quoted lines.
 pub fn typed_text(prompt: &str) -> String {
     let mut out = String::new();
     let mut fence: Option<(char, usize)> = None;
@@ -281,10 +295,24 @@ pub fn typed_text(prompt: &str) -> String {
                 continue;
             }
         }
+        if !pasted && line.trim_start().starts_with('>') {
+            // Read only to follow a paste that opens on the quoted line.
+            strip_pasted(line, &mut pasted, &mut String::new());
+            continue;
+        }
         strip_pasted(line, &mut pasted, &mut out);
         out.push('\n');
     }
     out
+}
+
+/// Whether the prompt is one Claude Code sent itself rather than the user,
+/// such as a task notification. Such a prompt turns nothing on. Only a
+/// prompt that opens with a mark counts: one the user typed can paste or
+/// quote a mark further down.
+pub fn from_claude_code(prompt: &str) -> bool {
+    let start = prompt.trim_start();
+    FROM_CLAUDE_CODE.iter().any(|m| start.starts_with(m))
 }
 
 fn words(s: &str) -> Vec<String> {
@@ -294,21 +322,52 @@ fn words(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// The words of `s`, each with whether only spaces, tabs, hyphens or
+/// apostrophes part it from the word before. A phrase never spans a comma,
+/// a full stop or a line break.
+fn joined_words(s: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut word = String::new();
+    let mut joined = false;
+    for c in s.chars() {
+        if c.is_alphanumeric() {
+            word.push(c);
+            continue;
+        }
+        if !word.is_empty() {
+            out.push((word.to_lowercase(), joined));
+            word.clear();
+            joined = true;
+        }
+        if !matches!(c, ' ' | '\t' | '-' | '\'' | '\u{2019}') {
+            joined = false;
+        }
+    }
+    if !word.is_empty() {
+        out.push((word.to_lowercase(), joined));
+    }
+    out
+}
+
 /// The first entry whose words all appear next to each other, in order, in
-/// the typed part of the prompt, with the search's light stemming.
+/// the typed part of the prompt, with the search's light stemming. An entry
+/// of several words matches only as that phrase, never its words apart.
 pub fn prompt_match(entries: &[String], prompt: &str) -> Option<String> {
     if entries.is_empty() {
         return None;
     }
-    let typed = words(&typed_text(prompt));
+    let typed = joined_words(&typed_text(prompt));
     entries
         .iter()
         .find(|e| {
             let want = words(e);
             !want.is_empty()
-                && typed
-                    .windows(want.len())
-                    .any(|w| w.iter().zip(&want).all(|(t, x)| word_match(x, t)))
+                && typed.windows(want.len()).any(|w| {
+                    w.iter()
+                        .zip(&want)
+                        .enumerate()
+                        .all(|(k, ((t, joined), x))| (k == 0 || *joined) && word_match(x, t))
+                })
         })
         .cloned()
 }
@@ -420,23 +479,51 @@ fn reminder(live: &[Live], id: &str) -> Option<(String, String)> {
     Some((id.to_string(), text))
 }
 
-/// The reminders of active sets that haven't had theirs yet. Mark the ones
-/// actually given with `mark_reminded`, so one left out at the token cap
-/// comes with the next hook that can add context.
+/// The hash of a live set's file, which changes when the file does.
+fn file_hash(live: &[Live], id: &str) -> Option<String> {
+    live.iter()
+        .find(|l| l.set.id == id)
+        .map(|l| approvals::hash(&l.set.src))
+}
+
+/// Whether this set's reminder, as its file is now, was given since the
+/// session started or was last compacted.
+fn given(state: &State, live: &[Live], id: &str) -> bool {
+    file_hash(live, id).is_some_and(|h| state.given.iter().any(|(i, g)| i == id && *g == h))
+}
+
+/// The reminders of active sets that haven't had theirs yet. A prompt-word
+/// set gets its reminder once per session, again after compaction or when
+/// its file changes. Mark the ones actually given with `mark_reminded`, so
+/// one left out at the token cap comes with the next hook that can add
+/// context.
 pub fn pending_reminders(state: &State, live: &[Live]) -> Vec<(String, String)> {
     state
         .active
         .iter()
         .filter(|a| !a.reminded)
+        .filter(|a| a.by != Trigger::Prompt || !given(state, live, &a.id))
         .filter_map(|a| reminder(live, &a.id))
         .collect()
 }
 
 /// Records that these sets' reminders were given.
-pub fn mark_reminded(state: &mut State, ids: &[String]) {
+pub fn mark_reminded(state: &mut State, live: &[Live], ids: &[String]) {
     for a in state.active.iter_mut().filter(|a| ids.contains(&a.id)) {
         a.reminded = true;
     }
+    for id in ids {
+        if let Some(h) = file_hash(live, id) {
+            state.given.retain(|(i, _)| i != id);
+            state.given.push((id.clone(), h));
+        }
+    }
+}
+
+/// Forgets which reminders were given: after compaction the context no
+/// longer holds them.
+pub fn compacted(state: &mut State) {
+    state.given.clear();
 }
 
 /// The reminders to give again after the context was compacted: skill and
@@ -553,7 +640,7 @@ mod tests {
     fn take(st: &mut State, live: &[Live]) -> Vec<(String, String)> {
         let r = pending_reminders(st, live);
         let ids: Vec<String> = r.iter().map(|(id, _)| id.clone()).collect();
-        mark_reminded(st, &ids);
+        mark_reminded(st, live, &ids);
         r
     }
 
@@ -618,6 +705,76 @@ mod tests {
         let entries = vec!["later".to_string()];
         let p = "<pasted_content id=\"1\">x</pasted_contents> later";
         assert_eq!(prompt_match(&entries, p), None);
+    }
+
+    #[test]
+    fn quoted_lines_are_not_typed_text() {
+        let entries = vec!["chat".to_string()];
+        for p in [
+            "> chat with the acme team\nwhat do you think?",
+            "Look at this:\n>chat log from acme\n  > > nested chat\nthoughts?",
+        ] {
+            assert_eq!(prompt_match(&entries, p), None, "{p:?}");
+        }
+        assert_eq!(
+            prompt_match(&entries, "> quoted line\nlet's chat about it").as_deref(),
+            Some("chat")
+        );
+        assert_eq!(
+            prompt_match(&entries, "a > b, so chat later").as_deref(),
+            Some("chat")
+        );
+    }
+
+    #[test]
+    fn a_phrase_matches_only_as_the_whole_phrase() {
+        let entries = vec!["internal note".to_string()];
+        for p in [
+            "The internal tool left a note on the order",
+            "keep it internal, note the date",
+            "keep it internal.\nNote the date",
+            "note the internal state",
+            "internal",
+            "note",
+        ] {
+            assert_eq!(prompt_match(&entries, p), None, "{p:?}");
+        }
+        for p in [
+            "add an internal note for acme",
+            "Add an Internal  Note",
+            "two internal notes, please",
+        ] {
+            assert_eq!(
+                prompt_match(&entries, p).as_deref(),
+                Some("internal note"),
+                "{p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_codes_own_prompts_are_told_apart_from_typed_ones() {
+        for p in [
+            "<task-notification>\n<status>completed</status>\n</task-notification>",
+            "[Subagent hand-back] the acme review is done",
+            "<agent-message from=\"acme\">hi</agent-message>",
+            "[SYSTEM NOTIFICATION - acme]",
+            "<system-reminder>x</system-reminder>",
+            "\n  \t<task-notification>\n</task-notification>",
+        ] {
+            assert!(from_claude_code(p), "{p}");
+        }
+        for p in [
+            "did the task notification reach acme?",
+            "see this\n<system-reminder>x</system-reminder>",
+            "what is this?\n```\n<system-reminder>x</system-reminder>\n```",
+            "```\n<task-notification>\n</task-notification>\n```\nwhy did it stop?",
+            "<pasted_content id=\"1\"><system-reminder>x</system-reminder></pasted_content>",
+            "> <agent-message from=\"acme\">hi</agent-message>\nwho sent this?",
+            "the log says [Subagent hand-back] twice",
+        ] {
+            assert!(!from_claude_code(p), "{p}");
+        }
     }
 
     #[test]
@@ -1009,7 +1166,7 @@ mod tests {
             Event::Other,
         );
         assert_eq!(pending_reminders(&st, &sets).len(), 2);
-        mark_reminded(&mut st, &["a".to_string()]);
+        mark_reminded(&mut st, &sets, &["a".to_string()]);
         let left = pending_reminders(&st, &sets);
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].0, "b");

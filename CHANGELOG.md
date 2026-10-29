@@ -6,6 +6,7 @@ Every release of dotonce is listed here. Versions follow semantic versioning.
 
 ### Added
 
+- `ignore_paths` in the config: inside those folders the hooks add nothing, check nothing and change nothing. The guard that keeps rule files out of Claude's reach still runs there.
 - `dotonce init` and `dotonce doctor` print the line to add to your shell config when dotonce's folder isn't on your PATH. They never edit a shell file.
 - Each conversation in the results shows its weekday and how many days before the question it happened, so the agent doesn't have to do date math.
 - `bench-serve` accepts `max_sessions` and `fill` per request, and the benchmark adapter passes them from `DOTONCE_MAX_SESSIONS` and `DOTONCE_FILL`.
@@ -34,4 +35,8 @@ Every release of dotonce is listed here. Versions follow semantic versioning.
 
 ### Fixed
 
+- A short status message, like "done, next batch", no longer pulls in facts that share only common words with it. A short prompt that asks nothing now needs a fact that covers most of it.
+- Hooks ignore Claude Code's own messages (task notifications, agent reports, system reminders), so they add no facts or reminders there. Only a prompt that starts with one counts, so a prompt you type that pastes one keeps its facts and reminders. Reply checks still run in those turns.
+- A rule set's reminder comes once per session, and again after compaction or when its file changes, instead of on every turn.
+- Prompt-word triggers read only text the user typed, and a trigger of several words matches only as the whole phrase.
 - A hook could panic while writing to a stderr that Claude Code had closed. The hook path never writes to stderr now, even for bad arguments.

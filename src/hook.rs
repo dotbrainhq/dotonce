@@ -65,6 +65,17 @@ pub fn handle(event: &str, input: &str, now: i64) -> Result<Option<String>> {
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    // A config that can't be read is left to each hook, which logs it.
+    if config::load_file()
+        .ok()
+        .flatten()
+        .is_some_and(|c| c.ignored(&cwd))
+    {
+        return match event {
+            "pre-tool" => crate::tools::guard_call(&v, &cwd),
+            _ => Ok(None),
+        };
+    }
     match event {
         "prompt" => prompt(&v, &cwd, now),
         "session-start" => session_start(&v, &cwd, now),
@@ -157,7 +168,7 @@ fn turn_on(
     if let Some(budget) = budget {
         let (text, used, given) =
             reminder_section(&session::pending_reminders(&state, &live), budget);
-        session::mark_reminded(&mut state, &given);
+        session::mark_reminded(&mut state, &live, &given);
         out = (text, used);
     }
     session::save(&dir, sid, &state)?;
@@ -175,6 +186,11 @@ fn reminders_for(v: &Value, cfg: &Config, cwd: &Path, event: Event) -> (String, 
 
 fn prompt(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
     let text = str_field(v, "prompt");
+    if session::from_claude_code(text) {
+        // No reminders or facts, and no prompt-word set turns on. Stop and
+        // display still check the turn like any other.
+        return Ok(None);
+    }
     let file_cfg = config::load_file()?;
     let cfg = file_cfg.clone().unwrap_or_default();
     let (rules_text, used) = reminders_for(v, &cfg, cwd, Event::Prompt(text));
@@ -547,7 +563,8 @@ fn compact(
     session::refresh(&mut state, live, cfg, cwd, prompt_id(v), Event::Other);
     let rem = session::compact_reminders(&state, live, prompt_id(v));
     let (text, used, given) = reminder_section(&rem, MAX_BUDGET);
-    session::mark_reminded(&mut state, &given);
+    session::compacted(&mut state);
+    session::mark_reminded(&mut state, live, &given);
     session::save(dir, sid, &state)?;
     Ok((text, used))
 }
@@ -608,6 +625,9 @@ fn skill(v: &Value, cwd: &Path) -> Result<Option<String>> {
 }
 
 fn expansion(v: &Value, cwd: &Path) -> Result<Option<String>> {
+    if session::from_claude_code(str_field(v, "prompt")) {
+        return Ok(None);
+    }
     skill_named(v, cwd, str_field(v, "command_name"), "UserPromptExpansion")
 }
 

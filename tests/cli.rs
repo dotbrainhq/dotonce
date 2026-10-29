@@ -1149,7 +1149,7 @@ fn prompt_hook_adds_reminders_before_facts() {
     run(&h, &["save", "The staging site is acme.example.com"], None);
     add_set(&h, "acme-replies", REPLIES);
     approve(&h, "acme-replies", "warn");
-    let input = serde_json::json!({"session_id": "s1", "prompt_id": "p1", "prompt": "draft the staging site reply", "cwd": "/tmp"});
+    let input = serde_json::json!({"session_id": "s1", "prompt_id": "p1", "prompt": "where is the staging site for the draft reply?", "cwd": "/tmp"});
     let ctx = context(&hook(&h, "prompt", input.clone()), "UserPromptSubmit");
     let rule = ctx
         .find("[acme-replies]\nLinks go inline as anchor text.")
@@ -1733,7 +1733,7 @@ fn a_facts_failure_still_gives_the_reminders() {
     let out = hook(
         &h,
         "prompt",
-        serde_json::json!({"session_id": "s1", "prompt_id": "p1", "prompt": "draft the staging site reply", "cwd": "/tmp"}),
+        serde_json::json!({"session_id": "s1", "prompt_id": "p1", "prompt": "where is the staging site for the draft reply?", "cwd": "/tmp"}),
     );
     let ctx = context(&out, "UserPromptSubmit");
     assert!(ctx.contains("Links go inline"), "{ctx}");
@@ -4367,5 +4367,271 @@ fn path_hint_writes_home_when_the_binary_is_under_home() {
     }
     let on_path = run_with_path(&h, &exe, Some(bin.as_os_str()), &["doctor"]);
     assert!(!on_path.contains("not on your PATH"), "{on_path}");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+/// Prompts Claude Code sends itself, one of each kind, each with words that
+/// turn on `REPLIES` and match the staging site fact.
+const FROM_CLAUDE_CODE: [&str; 5] = [
+    "<task-notification>\n<task-id>t1</task-id>\n<status>completed</status>\n<summary>where is the staging site for the draft reply?</summary>\n</task-notification>",
+    "[Subagent hand-back] where is the staging site for the draft reply?",
+    "<agent-message from=\"acme\">where is the staging site for the draft reply?</agent-message>",
+    "[SYSTEM NOTIFICATION] where is the staging site for the draft reply?",
+    "<system-reminder>where is the staging site for the draft reply?</system-reminder>",
+];
+
+#[test]
+fn claude_codes_own_messages_get_no_reminders_or_facts() {
+    let h = home("ownmsg");
+    run(&h, &["init"], None);
+    run(&h, &["save", "The staging site is acme.example.com"], None);
+    add_set(&h, "acme-replies", REPLIES);
+    approve(&h, "acme-replies", "warn");
+    for (i, text) in FROM_CLAUDE_CODE.iter().enumerate() {
+        let out = hook(
+            &h,
+            "prompt",
+            serde_json::json!({"session_id": format!("s{i}"), "prompt_id": "p1", "prompt": text, "cwd": "/tmp"}),
+        );
+        assert!(out.trim().is_empty(), "{text}: {out}");
+        let exp = serde_json::json!({"session_id": format!("e{i}"), "prompt_id": "p1", "hook_event_name": "UserPromptExpansion", "expansion_type": "slash_command", "command_name": "acme-writer", "command_args": "", "command_source": "user", "prompt": text, "cwd": "/tmp"});
+        let out = hook(&h, "expansion", exp);
+        assert!(out.trim().is_empty(), "{text}: {out}");
+    }
+    let typed = serde_json::json!({"session_id": "s9", "prompt_id": "p1", "prompt": "where is the staging site for the draft reply?", "cwd": "/tmp"});
+    let ctx = context(&hook(&h, "prompt", typed), "UserPromptSubmit");
+    assert!(
+        ctx.contains("Links go inline") && ctx.contains("acme.example.com"),
+        "a typed prompt still gets both: {ctx}"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn a_typed_prompt_that_pastes_claude_codes_markers_keeps_its_context() {
+    let h = home("ownpaste");
+    run(&h, &["init"], None);
+    run(&h, &["save", "The staging site is acme.example.com"], None);
+    add_set(&h, "acme-replies", REPLIES);
+    approve(&h, "acme-replies", "warn");
+    // The fact search reads pasted words too, and a long paste of words no
+    // fact has drowns the fact, so the pastes here are short.
+    let typed = "draft the reply for the staging site acme.example.com";
+    for (i, text) in [
+        "<task-notification>",
+        "[Subagent hand-back]",
+        "<agent-message>",
+        "[SYSTEM NOTIFICATION]",
+        "<system-reminder>",
+    ]
+    .iter()
+    .enumerate()
+    {
+        for (j, prompt) in [
+            format!("{typed}\n```\n{text}\n```"),
+            format!("{typed}\n<pasted_content>{text}</pasted_content>"),
+            format!("{typed}\n> {text}"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let input = serde_json::json!({"session_id": format!("s{i}-{j}"), "prompt_id": "p1", "prompt": prompt, "cwd": "/tmp"});
+            let ctx = context(&hook(&h, "prompt", input), "UserPromptSubmit");
+            assert!(
+                ctx.contains("Links go inline") && ctx.contains("acme.example.com"),
+                "{prompt}: {ctx}"
+            );
+        }
+        let exp = serde_json::json!({"session_id": format!("e{i}"), "prompt_id": "p1", "hook_event_name": "UserPromptExpansion", "expansion_type": "slash_command", "command_name": "acme-writer", "command_args": "", "command_source": "user", "prompt": format!("/acme-writer what is this?\n```\n{text}\n```"), "cwd": "/tmp"});
+        let ctx = context(&hook(&h, "expansion", exp), "UserPromptExpansion");
+        assert!(ctx.contains("Links go inline"), "{text}: {ctx}");
+    }
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn a_turn_claude_code_started_is_still_checked_and_sent_back() {
+    let h = acme_home("ownstop", "fix");
+    register_stop(&h);
+    use_skill(&h, "s1", "p1");
+    let note = serde_json::json!({"session_id": "s1", "prompt_id": "p2", "prompt": FROM_CLAUDE_CODE[0], "cwd": "/tmp"});
+    assert!(
+        hook(&h, "prompt", note).trim().is_empty(),
+        "no reminder or fact"
+    );
+    assert_eq!(show_draft(&h, &h, "s1", "p2", "m1"), labeled());
+    let back = sent_back(&stop(&h, "s1", "p2", BROKEN, false));
+    assert!(back.contains("no-stock-wait-opener"), "{back}");
+    assert!(
+        outcomes(&h, "catches.jsonl")
+            .iter()
+            .any(|(c, o)| c == "no-stock-wait-opener" && o == "caught"),
+        "the catch is logged"
+    );
+    assert!(
+        stop(&h, "s1", "p2", BROKEN_AGAIN, true).trim().is_empty(),
+        "sent back once"
+    );
+    for (i, text) in FROM_CLAUDE_CODE.iter().enumerate() {
+        let pid = format!("q{i}");
+        let note = serde_json::json!({"session_id": "s1", "prompt_id": pid, "prompt": text, "cwd": "/tmp"});
+        assert!(hook(&h, "prompt", note).trim().is_empty(), "{text}");
+        assert!(
+            !sent_back(&stop(&h, "s1", &pid, BROKEN, false)).is_empty(),
+            "{text}"
+        );
+    }
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+const CHAT: &str = "[when]\nprompt = [\"draft\"]\ncheck_on_prompt = true\n[remind]\ntext = \"Keep chat replies short.\"\n[draft]\nfence = [\"markdown\"]\n[[check]]\nid = \"no-stock-wait-opener\"\nforbid = [\"sorry for the wait\"]\nwhy = \"Open with a line from the thread.\"\n";
+
+#[test]
+fn a_prompt_word_reminder_comes_once_per_session_and_checks_run_every_turn() {
+    let h = home("remindonce");
+    add_set(&h, "acme-chat", CHAT);
+    approve(&h, "acme-chat", "fix");
+    let prompt = |sid: &str, pid: &str, text: &str| {
+        hook(
+            &h,
+            "prompt",
+            serde_json::json!({"session_id": sid, "prompt_id": pid, "prompt": text, "cwd": "/tmp"}),
+        )
+    };
+    let reminded = |out: &str| out.contains("Keep chat replies short.");
+    assert!(reminded(&prompt("s1", "p1", "draft it")));
+    let out = prompt("s1", "p2", "draft the next one");
+    assert!(!reminded(&out), "the second turn gets no reminder: {out}");
+    assert!(
+        !sent_back(&stop(&h, "s1", "p2", BROKEN, false)).is_empty(),
+        "the set still checks this turn"
+    );
+    assert!(
+        reminded(&prompt("s2", "p1", "draft it")),
+        "a new session gets it"
+    );
+    hook(
+        &h,
+        "session-start",
+        serde_json::json!({"session_id": "s1", "source": "compact", "cwd": "/tmp"}),
+    );
+    assert!(
+        reminded(&prompt("s1", "p3", "draft a third")),
+        "after compaction it comes again"
+    );
+    assert!(!reminded(&prompt("s1", "p4", "draft a fourth")));
+    edit_set(&h, "acme-chat");
+    approve(&h, "acme-chat", "fix");
+    assert!(
+        reminded(&prompt("s1", "p5", "draft a fifth")),
+        "a changed file comes again"
+    );
+    assert!(!reminded(&prompt("s1", "p6", "draft a sixth")));
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn an_ignored_folder_gets_nothing_but_the_guard() {
+    let (h, proj) = code_home("ignore", "fix");
+    run(&h, &["init"], None);
+    run(&h, &["save", "The staging site is acme.example.com"], None);
+    add_set(&h, "acme-mail", ACME_MAIL);
+    approve(&h, "acme-mail", "fix");
+    add_set(&h, "acme-replies", REPLIES);
+    approve(&h, "acme-replies", "warn");
+    register_stop(&h);
+    let notes = h.join("dotonce/notes");
+    std::fs::write(
+        h.join("dotonce/config.toml"),
+        format!("ignore_paths = [{proj:?}]\n\n[[stores]]\nname = \"notes\"\npath = {notes:?}\n"),
+    )
+    .unwrap();
+    use_skill(&h, "s1", "p1");
+    let state = h.join("dotonce/sessions/s1.json");
+    let before = std::fs::read_to_string(&state).unwrap();
+    let at = |extra: serde_json::Value| {
+        let mut v = serde_json::json!({"session_id": "s1", "prompt_id": "p2", "cwd": proj});
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        v
+    };
+    let quiet = [
+        (
+            "prompt",
+            at(serde_json::json!({"prompt": "where is the staging site for the draft reply?"})),
+        ),
+        (
+            "session-start",
+            at(serde_json::json!({"source": "compact"})),
+        ),
+        (
+            "skill",
+            at(serde_json::json!({"tool_name": "Skill", "tool_input": {"skill": "acme-writer"}})),
+        ),
+        (
+            "expansion",
+            at(serde_json::json!({"command_name": "acme-writer", "prompt": "/acme-writer"})),
+        ),
+        (
+            "stop",
+            at(serde_json::json!({"last_assistant_message": BROKEN, "stop_hook_active": false})),
+        ),
+    ];
+    for (event, input) in quiet {
+        let out = hook(&h, event, input);
+        assert!(out.trim().is_empty(), "{event}: {out}");
+    }
+    assert_eq!(show_draft(&h, &proj, "s1", "p2", "m1"), None);
+    let bash = serde_json::json!({"command": "git push --force origin main"});
+    assert_eq!(pre(&h, &proj, "Bash", bash), None, "no tool checks");
+    let rule = h
+        .join("dotonce/rules/x.toml")
+        .to_string_lossy()
+        .into_owned();
+    let write = serde_json::json!({"file_path": rule, "content": "id = \"x\"\n"});
+    assert!(
+        pre(&h, &proj, "Write", write).is_some_and(|r| r.starts_with("dotonce: rule files")),
+        "the guard still runs"
+    );
+    assert_eq!(std::fs::read_to_string(&state).unwrap(), before);
+    assert!(!h.join("dotonce/catches.jsonl").exists());
+    let out = hook(
+        &h,
+        "prompt",
+        serde_json::json!({"session_id": "s2", "prompt_id": "p1", "prompt": "where is the staging site for the draft reply?", "cwd": "/tmp"}),
+    );
+    assert!(out.contains("acme.example.com"), "outside it: {out}");
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn prompt_words_skip_quoted_lines_and_match_a_phrase_whole() {
+    let h = home("phrase");
+    add_set(
+        &h,
+        "acme-notes",
+        "[when]\nprompt = [\"internal note\"]\n[remind]\ntext = \"Internal notes stay short.\"\n",
+    );
+    approve(&h, "acme-notes", "warn");
+    let prompt = |sid: &str, text: &str| {
+        hook(
+            &h,
+            "prompt",
+            serde_json::json!({"session_id": sid, "prompt_id": "p1", "prompt": text, "cwd": "/tmp"}),
+        )
+    };
+    for (i, text) in [
+        "The internal tool left a note on the acme order",
+        "keep it internal, note the date",
+        "> add an internal note for acme\nwhat does this mean?",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let out = prompt(&format!("s{i}"), text);
+        assert!(out.trim().is_empty(), "{text:?}: {out}");
+    }
+    assert!(prompt("s9", "add an internal note for acme").contains("Internal notes stay short."));
     std::fs::remove_dir_all(&h).unwrap();
 }

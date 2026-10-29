@@ -38,6 +38,12 @@ const FILLER: &[&str] = &[
     "good", "great", "looks", "look", "continue", "go", "ahead", "yes", "nice", "cool", "done",
     "perfect", "right", "correct", "agree", "lgtm",
 ];
+/// Words that open a question. A prompt that starts with one, or has a
+/// question mark, asks for something.
+const QUESTION_STARTS: &[&str] = &[
+    "how", "what", "why", "when", "where", "which", "who", "can", "should", "does", "do", "is",
+    "are", "could", "would",
+];
 
 const META: &str = "CREATE TABLE IF NOT EXISTS fact_meta(
     doc_id TEXT PRIMARY KEY,
@@ -441,6 +447,17 @@ const COVER: f64 = 0.3;
 /// The best fact must cover this much of the prompt, or nothing is sent: a
 /// prompt no fact is clearly about (a pasted log, a status line) gets no block.
 const BEST_COVER: f64 = 0.5;
+/// A prompt of at most this many meaningful words that asks nothing reads
+/// as a status line, like "done plugin update, next batch".
+const SHORT_WORDS: usize = 6;
+/// The best cover such a status line needs: a weaker match is on words that
+/// say how the work goes, not what it is about.
+const STATUS_COVER: f64 = 0.75;
+/// `UNSEEN` for such a prompt. A word no title has is weaker evidence in a
+/// few words than in a pasted log: on a small store most words are new, so
+/// "draft the staging site reply" still finds the staging site fact, while a
+/// typo in a status line still counts.
+const SHORT_UNSEEN: f64 = 0.25;
 /// Facts after the best must cover at least this share of what the best covers.
 const NEAR_BEST: f64 = 0.4;
 /// A prompt with one meaningful word only gets facts when that word is in at
@@ -475,6 +492,18 @@ pub fn word_match(term: &str, word: &str) -> bool {
         return true;
     }
     t >= 5 && w >= 5 && term.chars().take(5).eq(word.chars().take(5))
+}
+
+/// Whether the prompt asks something: a question mark, or a question word
+/// first, after any filler such as "ok".
+fn asks(query: &str) -> bool {
+    query.contains('?')
+        || query
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_lowercase)
+            .find(|w| !FILLER.contains(&w.as_str()))
+            .is_some_and(|w| QUESTION_STARTS.contains(&w.as_str()))
 }
 
 /// Keeps only facts whose name and description are about the prompt, not
@@ -531,22 +560,34 @@ fn gate(ix: &Index, query: &str, ids: Vec<String>, private_ok: bool) -> Result<V
     if useful == 1 && !weights.iter().any(|w| w.rare) {
         return Ok(Vec::new());
     }
+    // The share of the prompt a title covers, and how many words it matches.
+    let cover = |ws: &[String]| {
+        let (mut got, mut hits) = (0.0, 0);
+        for (t, wt) in terms.iter().zip(&weights) {
+            if wt.idf > 0.0 && ws.iter().any(|w| word_match(t, w)) {
+                got += wt.idf;
+                hits += 1;
+            }
+        }
+        (got / total, hits)
+    };
     let scored: Vec<(String, f64, usize)> = ids
         .into_iter()
         .filter_map(|id| {
-            let ws = titles.get(&id)?;
-            let (mut got, mut hits) = (0.0, 0);
-            for (t, wt) in terms.iter().zip(&weights) {
-                if wt.idf > 0.0 && ws.iter().any(|w| word_match(t, w)) {
-                    got += wt.idf;
-                    hits += 1;
-                }
-            }
-            Some((id, got / total, hits))
+            let (c, hits) = cover(titles.get(&id)?);
+            Some((id, c, hits))
         })
         .collect();
     let best = scored.iter().map(|s| s.1).fold(0.0, f64::max);
-    if best < BEST_COVER {
+    if terms.len() <= SHORT_WORDS && !asks(query) {
+        // A status line's words sit in many titles alike, so more of them
+        // tie for the best match than one block could show.
+        let ties = titles.values().filter(|ws| cover(ws).0 >= best).count();
+        let short_total = seen + unseen * SHORT_UNSEEN * (1.0 + n).ln();
+        if best * total / short_total < STATUS_COVER || ties > MAX_FACTS {
+            return Ok(Vec::new());
+        }
+    } else if best < BEST_COVER {
         return Ok(Vec::new());
     }
     let min_cover = COVER.max(best * NEAR_BEST);
@@ -633,6 +674,7 @@ mod tests {
                 path: dir.to_string_lossy().into_owned(),
             }],
             private_paths: private_paths.iter().map(|s| s.to_string()).collect(),
+            ignore_paths: Vec::new(),
             save_store: "kb".into(),
             prompt_budget: 1_500,
             session_budget: 1_500,
@@ -748,7 +790,7 @@ mod tests {
                 "where should I demonstrate this client feature?",
                 "demo-site",
             ),
-            ("write the commit message", "commit-style"),
+            ("how should I write the commit message?", "commit-style"),
             ("can we schedule it for Monday", "monday-off"),
             ("where do I file this plugin bug", "bug-reports"),
             ("which judge model does the benchmark use", "gemini-judge"),
@@ -912,12 +954,21 @@ mod tests {
         let cfg = cfg_for(&d, &[root.to_str().unwrap()]);
         let mut ix = open_at(":memory:").unwrap();
         sync(&mut ix, &cfg).unwrap();
+        // A question: as a bare status line, the 50 zebra facts that tie
+        // for the best match would give nothing.
         let names = |cwd: &Path| -> Vec<String> {
-            search(&ix, &cfg, "zebra crossing codes", cwd, NOW, 1_500)
-                .unwrap()
-                .into_iter()
-                .map(|h| h.name)
-                .collect()
+            search(
+                &ix,
+                &cfg,
+                "what are the zebra crossing codes?",
+                cwd,
+                NOW,
+                1_500,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|h| h.name)
+            .collect()
         };
         // From a public cwd, the private facts must not change the result:
         // it matches a store that holds only the public fact.
@@ -929,7 +980,7 @@ mod tests {
         let expected: Vec<String> = search(
             &alone_ix,
             &alone_cfg,
-            "zebra crossing codes",
+            "what are the zebra crossing codes?",
             Path::new("/tmp"),
             NOW,
             1_500,
@@ -1035,6 +1086,53 @@ mod tests {
     }
 
     #[test]
+    fn gate_sends_nothing_for_a_status_line() {
+        let (d, cfg, ix) = gate_store("gate-status");
+        for (n, desc) in [
+            ("next-batch-window", "The next batch export runs at noon"),
+            (
+                "plugin-update-review",
+                "Each plugin update gets a second review",
+            ),
+        ] {
+            write(&d, &format!("{n}.md"), &entry(n, desc, ""));
+        }
+        let mut ix = ix;
+        sync(&mut ix, &cfg).unwrap();
+        for q in [
+            "done plugin update, next batch",
+            "okay done plugin udapte nad next",
+            // A topic word among the status words.
+            "done plugin update, next batch of reviews",
+            // Words every team note shares.
+            "weekly plan done",
+        ] {
+            let got = gate_names(&ix, &cfg, q);
+            assert!(got.is_empty(), "{q:?}: {got:?}");
+        }
+        for (q, want) in [
+            ("when does the next batch export run?", "next-batch-window"),
+            (
+                "how do I check the next plugin update",
+                "plugin-update-review",
+            ),
+            ("run the linter before this commit", "lint-before-commit"),
+            (
+                "should I run the linter before this commit?",
+                "lint-before-commit",
+            ),
+        ] {
+            let got = gate_names(&ix, &cfg, q);
+            assert_eq!(
+                got.first().map(String::as_str),
+                Some(want),
+                "{q:?}: {got:?}"
+            );
+        }
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
     fn gate_works_on_a_store_with_one_fact() {
         let d = tmp("gate-tiny");
         write(
@@ -1051,6 +1149,11 @@ mod tests {
         sync(&mut ix, &cfg).unwrap();
         assert_eq!(
             gate_names(&ix, &cfg, "where is the staging site?"),
+            vec!["staging-site"]
+        );
+        // A short request whose other words no fact has yet.
+        assert_eq!(
+            gate_names(&ix, &cfg, "draft the staging site reply"),
             vec!["staging-site"]
         );
         fs::remove_dir_all(&d).unwrap();
@@ -1084,7 +1187,7 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            names("fix the title of this PR")
+            names("how do I fix the title of this PR?")
                 .first()
                 .map(String::as_str),
             Some("pr-titles")

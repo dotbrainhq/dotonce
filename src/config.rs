@@ -18,6 +18,10 @@ pub struct Config {
     pub stores: Vec<StoreCfg>,
     #[serde(default)]
     pub private_paths: Vec<String>,
+    /// Folders dotonce stays out of: its hooks add nothing and change nothing
+    /// there, except the guard that keeps rule files out of Claude's reach.
+    #[serde(default)]
+    pub ignore_paths: Vec<String>,
     #[serde(default = "default_save_store")]
     pub save_store: String,
     #[serde(default = "default_budget")]
@@ -132,6 +136,10 @@ impl Config {
     pub fn private_allowed(&self, cwd: &Path) -> bool {
         self.private_paths.iter().any(|p| path_inside(cwd, p))
     }
+
+    pub fn ignored(&self, cwd: &Path) -> bool {
+        self.ignore_paths.iter().any(|p| path_inside(cwd, p))
+    }
 }
 
 pub fn load() -> Result<Config> {
@@ -155,6 +163,10 @@ save_store = \"notes\"
 
 # Facts marked private are only shown when Claude Code runs inside one of these folders.
 private_paths = []
+
+# dotonce stays out of these folders: its hooks add nothing and change nothing there.
+# The guard that keeps rule files out of Claude's reach still runs.
+ignore_paths = []
 
 # Token budgets for what the hooks add to Claude's context, at most 2000 each.
 prompt_budget = 1500
@@ -296,6 +308,21 @@ mod tests {
         assert!(c.store("nope").is_none());
         assert!(c.private_allowed(Path::new("/work/private/app")));
         assert!(!c.private_allowed(Path::new("/work/public")));
+    }
+
+    #[test]
+    fn ignore_paths_follow_the_private_paths_rules() {
+        let c = Config::parse("ignore_paths = [\"/work/agents\", \"\", \"rel/dir\"]\n").unwrap();
+        assert!(c.ignored(Path::new("/work/agents")));
+        assert!(c.ignored(Path::new("/work/agents/run-1")));
+        assert!(!c.ignored(Path::new("/work/agentsX")));
+        assert!(!c.ignored(Path::new("/work/agents/../other")));
+        assert!(!c.ignored(Path::new("rel/dir")));
+        assert!(!Config::default().ignored(Path::new("/work/agents")));
+        assert!(TEMPLATE.contains("\nignore_paths = []\n"));
+        let err = Config::parse("[[stores]]\nname = \"kb\"\npath = \"/kb\"\nignore_paths = []\n")
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("ignore_paths"), "{err:#}");
     }
 
     #[test]
