@@ -655,6 +655,7 @@ mod tests {
                 path: dir.to_string_lossy().into_owned(),
             }],
             private_paths: private_paths.iter().map(|s| s.to_string()).collect(),
+            ignore_paths: Vec::new(),
             save_store: "kb".into(),
             prompt_budget: 1_500,
             session_budget: 1_500,

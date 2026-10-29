@@ -978,14 +978,22 @@ fn deny(reason: &str) -> String {
         .to_string()
 }
 
-pub fn pre_tool(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
+/// The always-on guard alone: a deny when the call would change rule files,
+/// approvals or rule commands. It runs even in an ignored folder.
+pub fn guard_call(v: &Value, cwd: &Path) -> Result<Option<String>> {
     let tool = str_field(v, "tool_name");
     let input = v.get("tool_input").cloned().unwrap_or(Value::Null);
     let home = home_dir()?;
     let user_home = std::env::var_os("HOME").map(PathBuf::from);
-    if guard(tool, &input, cwd, &home, user_home.as_deref()) {
-        return Ok(Some(deny(GUARD_REASON)));
+    Ok(guard(tool, &input, cwd, &home, user_home.as_deref()).then(|| deny(GUARD_REASON)))
+}
+
+pub fn pre_tool(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
+    if let Some(denied) = guard_call(v, cwd)? {
+        return Ok(Some(denied));
     }
+    let tool = str_field(v, "tool_name");
+    let input = v.get("tool_input").cloned().unwrap_or(Value::Null);
     let Some((path, body)) = tool_text(tool, &input) else {
         return Ok(None);
     };

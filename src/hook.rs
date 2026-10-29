@@ -65,6 +65,17 @@ pub fn handle(event: &str, input: &str, now: i64) -> Result<Option<String>> {
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    // A config that can't be read is left to each hook, which logs it.
+    if config::load_file()
+        .ok()
+        .flatten()
+        .is_some_and(|c| c.ignored(&cwd))
+    {
+        return match event {
+            "pre-tool" => crate::tools::guard_call(&v, &cwd),
+            _ => Ok(None),
+        };
+    }
     match event {
         "prompt" => prompt(&v, &cwd, now),
         "session-start" => session_start(&v, &cwd, now),

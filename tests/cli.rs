@@ -4473,3 +4473,78 @@ fn a_prompt_word_reminder_comes_once_per_session_and_checks_run_every_turn() {
     assert!(!reminded(&prompt("s1", "p6", "draft a sixth")));
     std::fs::remove_dir_all(&h).unwrap();
 }
+
+#[test]
+fn an_ignored_folder_gets_nothing_but_the_guard() {
+    let (h, proj) = code_home("ignore", "fix");
+    run(&h, &["init"], None);
+    run(&h, &["save", "The staging site is acme.example.com"], None);
+    add_set(&h, "acme-mail", ACME_MAIL);
+    approve(&h, "acme-mail", "fix");
+    add_set(&h, "acme-replies", REPLIES);
+    approve(&h, "acme-replies", "warn");
+    register_stop(&h);
+    let notes = h.join("dotonce/notes");
+    std::fs::write(
+        h.join("dotonce/config.toml"),
+        format!("ignore_paths = [{proj:?}]\n\n[[stores]]\nname = \"notes\"\npath = {notes:?}\n"),
+    )
+    .unwrap();
+    use_skill(&h, "s1", "p1");
+    let state = h.join("dotonce/sessions/s1.json");
+    let before = std::fs::read_to_string(&state).unwrap();
+    let at = |extra: serde_json::Value| {
+        let mut v = serde_json::json!({"session_id": "s1", "prompt_id": "p2", "cwd": proj});
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        v
+    };
+    let quiet = [
+        (
+            "prompt",
+            at(serde_json::json!({"prompt": "draft the staging site reply"})),
+        ),
+        (
+            "session-start",
+            at(serde_json::json!({"source": "compact"})),
+        ),
+        (
+            "skill",
+            at(serde_json::json!({"tool_name": "Skill", "tool_input": {"skill": "acme-writer"}})),
+        ),
+        (
+            "expansion",
+            at(serde_json::json!({"command_name": "acme-writer", "prompt": "/acme-writer"})),
+        ),
+        (
+            "stop",
+            at(serde_json::json!({"last_assistant_message": BROKEN, "stop_hook_active": false})),
+        ),
+    ];
+    for (event, input) in quiet {
+        let out = hook(&h, event, input);
+        assert!(out.trim().is_empty(), "{event}: {out}");
+    }
+    assert_eq!(show_draft(&h, &proj, "s1", "p2", "m1"), None);
+    let bash = serde_json::json!({"command": "git push --force origin main"});
+    assert_eq!(pre(&h, &proj, "Bash", bash), None, "no tool checks");
+    let rule = h
+        .join("dotonce/rules/x.toml")
+        .to_string_lossy()
+        .into_owned();
+    let write = serde_json::json!({"file_path": rule, "content": "id = \"x\"\n"});
+    assert!(
+        pre(&h, &proj, "Write", write).is_some_and(|r| r.starts_with("dotonce: rule files")),
+        "the guard still runs"
+    );
+    assert_eq!(std::fs::read_to_string(&state).unwrap(), before);
+    assert!(!h.join("dotonce/catches.jsonl").exists());
+    let out = hook(
+        &h,
+        "prompt",
+        serde_json::json!({"session_id": "s2", "prompt_id": "p1", "prompt": "draft the staging site reply", "cwd": "/tmp"}),
+    );
+    assert!(out.contains("acme.example.com"), "outside it: {out}");
+    std::fs::remove_dir_all(&h).unwrap();
+}

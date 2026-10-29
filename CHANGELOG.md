@@ -6,6 +6,7 @@ Every release of dotonce is listed here. Versions follow semantic versioning.
 
 ### Added
 
+- `ignore_paths` in the config: inside those folders the hooks add nothing, check nothing and change nothing. The guard that keeps rule files out of Claude's reach still runs there.
 - `dotonce init` and `dotonce doctor` print the line to add to your shell config when dotonce's folder isn't on your PATH. They never edit a shell file.
 - Each conversation in the results shows its weekday and how many days before the question it happened, so the agent doesn't have to do date math.
 - `bench-serve` accepts `max_sessions` and `fill` per request, and the benchmark adapter passes them from `DOTONCE_MAX_SESSIONS` and `DOTONCE_FILL`.
