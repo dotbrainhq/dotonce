@@ -24,10 +24,6 @@ const SKIP_FILES: [&str; 3] = ["INDEX.md", "README.md", "MEMORY.md"];
 const BODY_CHARS: usize = 300;
 const INDEX_BODY_CHARS: usize = 600;
 const MAX_FACTS: usize = 6;
-/// A fact scoring below this share of the best match is noise, not a weaker
-/// hit. The best match is the best fact the caller may see, so a private
-/// match can't push public facts under the floor.
-const FLOOR: f64 = 0.35;
 const STALE_DAYS: i64 = 90;
 /// Tokens kept back from the budget for the block's title and save hint.
 const BLOCK_RESERVE: usize = 120;
@@ -57,7 +53,8 @@ const META: &str = "CREATE TABLE IF NOT EXISTS fact_meta(
     name TEXT NOT NULL,
     description TEXT NOT NULL,
     body TEXT NOT NULL,
-    updated TEXT
+    updated TEXT,
+    aliases TEXT NOT NULL DEFAULT ''
 );";
 
 #[derive(Debug, Default, PartialEq)]
@@ -78,11 +75,20 @@ pub struct FactHit {
 
 /// How facts are turned into turns. Bump it when `index_fact` changes, so rows
 /// indexed the old way count as changed on the next sync.
-const FORMAT: i64 = 1;
+const FORMAT: i64 = 2;
 
 pub fn open_at(path: &str) -> Result<Index> {
     let ix = Index::open(path)?;
     ix.conn.execute_batch(META)?;
+    let has_aliases: bool = ix.conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('fact_meta') WHERE name = 'aliases'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_aliases {
+        ix.conn
+            .execute_batch("ALTER TABLE fact_meta ADD COLUMN aliases TEXT NOT NULL DEFAULT ''")?;
+    }
     let v: i64 = ix.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if v < FORMAT {
         ix.conn.execute_batch(&format!(
@@ -162,9 +168,13 @@ fn cap_at_word(s: &str, max: usize) -> &str {
 /// fact whose title matches. Speakers stay empty: `rank` takes a query word
 /// that names a speaker as a speaker filter, not as a search term.
 fn index_fact(ix: &mut Index, doc_id: &str, name: &str, f: &Fact) -> Result<()> {
+    let mut title = format!("{}: {}", name.replace('-', " "), f.description);
+    if !f.aliases.is_empty() {
+        title.push_str(&format!(" ({})", f.aliases.join(", ")));
+    }
     let mut turns = vec![TurnIn {
         speaker: String::new(),
-        text: format!("{}: {}", name.replace('-', " "), f.description),
+        text: title,
     }];
     if !f.body.is_empty() {
         turns.push(TurnIn {
@@ -240,8 +250,8 @@ fn sync_file(
         }
         index_fact(ix, &doc_id, &name, &f)?;
         ix.conn.execute(
-            "INSERT OR REPLACE INTO fact_meta(doc_id, store, path, mtime, size, private, pinned, replaced, name, description, body, updated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT OR REPLACE INTO fact_meta(doc_id, store, path, mtime, size, private, pinned, replaced, name, description, body, updated, aliases)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 doc_id,
                 store,
@@ -255,6 +265,7 @@ fn sync_file(
                 f.description,
                 f.body,
                 updated,
+                f.aliases.join("\n"),
             ],
         )?;
         Ok(())
@@ -412,67 +423,518 @@ pub fn search(
     now: i64,
     budget: usize,
 ) -> Result<Vec<FactHit>> {
-    if query::terms(query)
-        .iter()
-        .all(|t| FILLER.contains(&t.as_str()))
-    {
-        return Ok(Vec::new());
-    }
-    let opt = Options {
-        fill: false,
-        names: false,
-        ..Options::default()
-    };
     let private_ok = cfg.private_allowed(cwd);
-    let mut top = None;
-    let mut ids = Vec::new();
-    for (sid, score, _) in rank(ix, query, USER, Some(now), &opt)? {
-        let doc_id = ix.session(sid)?.doc_id;
-        match hit_for(ix, &doc_id, now)? {
-            Some((_, private)) if private_ok || !private => {}
-            _ => continue,
+    let (typed, material) = split_prompt(query);
+    let titles = Titles::load(ix, private_ok)?;
+    let mut said = Vec::new();
+    if !typed.trim().is_empty() && !is_status(&typed) {
+        let opt = Options {
+            fill: false,
+            names: false,
+            ..Options::default()
+        };
+        let mut order: HashMap<String, usize> = HashMap::new();
+        for (sid, _, _) in rank(ix, &typed, USER, Some(now), &opt)? {
+            let doc_id = ix.session(sid)?.doc_id;
+            let next = order.len();
+            order.entry(doc_id).or_insert(next);
         }
-        if score < *top.get_or_insert(score) * FLOOR {
-            break;
-        }
-        ids.push(doc_id);
+        said = titles.typed_matches(&typed, &order);
     }
-    let ids = gate(ix, query, ids, private_ok)?;
+    let pasted = if material.is_empty() {
+        Vec::new()
+    } else {
+        titles.material_matches(&material, &typed)
+    };
+    // The best match for what was typed and the best for what was pasted
+    // both get a place before the second best of either.
+    let mut ids: Vec<String> = Vec::new();
+    for i in 0..said.len().max(pasted.len()) {
+        for id in [said.get(i), pasted.get(i)].into_iter().flatten() {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+    }
+    ids.truncate(MAX_PROMPT_FACTS);
     let budget = budget.saturating_sub(BLOCK_RESERVE);
     take_within(ix, ids, private_ok, now, budget)
 }
 
-/// Share of the prompt's weight a fact's title must cover to count as a match.
-const COVER: f64 = 0.3;
-/// The best fact must cover this much of the prompt, or nothing is sent: a
-/// prompt no fact is clearly about (a pasted log, a status line) gets no block.
+/// At most this many facts go with one prompt: past the first few, a fact is
+/// more often a near miss than a second answer.
+pub const MAX_PROMPT_FACTS: usize = 3;
+/// The best fact must cover this share of what was typed, or nothing is sent.
 const BEST_COVER: f64 = 0.5;
-/// A prompt of at most this many meaningful words that asks nothing reads
-/// as a status line, like "done plugin update, next batch".
-const SHORT_WORDS: usize = 6;
-/// The best cover such a status line needs: a weaker match is on words that
-/// say how the work goes, not what it is about.
-const STATUS_COVER: f64 = 0.75;
-/// `UNSEEN` for such a prompt. A word no title has is weaker evidence in a
-/// few words than in a pasted log: on a small store most words are new, so
-/// "draft the staging site reply" still finds the staging site fact, while a
-/// typo in a status line still counts.
-const SHORT_UNSEEN: f64 = 0.25;
-/// Facts after the best must cover at least this share of what the best covers.
-const NEAR_BEST: f64 = 0.4;
-/// A prompt with one meaningful word only gets facts when that word is in at
-/// most this share of fact titles (or in one title), so "looks" alone
-/// matches nothing.
+/// Facts after the best must cover at least this share of what the best
+/// covers, unless the text search also ranks them near the top.
+const NEAR_BEST: f64 = 0.7;
+/// What any fact must cover of what was typed, to be sent at all.
+const MIN_COVER: f64 = 0.3;
+/// A word in at most this share of fact titles (and never fewer than two) is
+/// rare. Pasted material only counts rare words: common ones turn up in any
+/// long paste.
 const RARE_SHARE: f64 = 0.03;
-/// A prompt word no fact title has still counts toward the prompt's weight, at
-/// this share of the rarest word's weight. A pasted log is mostly such words,
-/// so a fact that matches its few known ones covers little of it.
-const UNSEEN: f64 = 0.5;
+/// A fact matches pasted material when the words it shares with it carry this
+/// share of its title's weight.
+const MATERIAL_COVER: f64 = 0.3;
+/// A typed word no fact title has counts toward the prompt's weight at the
+/// rarest word's weight times n / (n + STORE_SCALE) for a store of n facts. A
+/// small store doesn't know most words yet, so a new word says little there;
+/// in a large store it suggests the prompt is about something else.
+const STORE_SCALE: f64 = 200.0;
+/// A block of at most this many words and two lines, before or after pasted
+/// material, is what was typed.
+const TYPED_WORDS: usize = 25;
+/// A prompt of at most two lines and this many words is all typed.
+const SHORT_PROMPT_WORDS: usize = 60;
 
-/// How one prompt word weighs across fact titles.
-struct Weight {
-    idf: f64,
-    rare: bool,
+/// Words that say how the work goes rather than what it is about. A clause
+/// that starts or ends with one, like "deploy done" or "fixed the login
+/// redirect", reports progress.
+const PROGRESS: &[&str] = &[
+    "done", "next", "finished", "fine", "good", "clean", "worked", "moving", "continue", "passing",
+    "complete",
+];
+/// Common past forms that don't end in "ed".
+const IRREGULAR_PAST: &[&str] = &[
+    "ran", "sent", "went", "made", "built", "wrote", "did", "gave", "took", "saw", "began", "came",
+    "fell", "held", "kept", "lost", "met", "paid", "said", "sold", "spent", "stood", "told", "won",
+];
+/// Words that report trouble. A line with one is a bug report, not progress,
+/// even when it ends in a past form, like "lint failed" or "found a 429".
+/// "timed out" counts as well.
+const TROUBLE: &[&str] = &[
+    "fail",
+    "fails",
+    "failed",
+    "failing",
+    "failure",
+    "failures",
+    "crash",
+    "crashes",
+    "crashed",
+    "crashing",
+    "broke",
+    "broken",
+    "breaks",
+    "breaking",
+    "found",
+    "got",
+    "rejected",
+    "rejects",
+    "rejecting",
+    "expired",
+    "expires",
+    "expiring",
+    "stuck",
+    "missing",
+    "error",
+    "errors",
+    "errored",
+    "erroring",
+    "timeout",
+    "timeouts",
+];
+/// Words that stand in for a topic without naming one.
+const GENERIC: &[&str] = &[
+    "one",
+    "ones",
+    "thing",
+    "things",
+    "stuff",
+    "bit",
+    "lot",
+    "way",
+    "something",
+    "anything",
+    "everything",
+];
+
+/// Characters that are common in code and logs and rare in typed text.
+const CODE_CHARS: &str = "{}()[];=<>$#/\\|`*&@%_:\"'+~";
+
+fn swapped_pair(a: &str, b: &str) -> bool {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    if a.len() != b.len() {
+        return false;
+    }
+    let d: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
+    d.len() == 2 && d[1] == d[0] + 1 && a[d[0]] == b[d[1]] && a[d[1]] == b[d[0]]
+}
+
+/// A word that reports progress: a progress word (or one with two letters
+/// swapped, like "dnoe"), or a past form such as "merged" or "sent".
+fn reports(w: &str) -> bool {
+    let n = w.chars().count();
+    PROGRESS.contains(&w)
+        || IRREGULAR_PAST.contains(&w)
+        || (n >= 5 && w.ends_with("ed") && !w.ends_with("eed"))
+        || (n >= 4 && PROGRESS.iter().any(|p| swapped_pair(w, p)))
+}
+
+fn has_trouble(line: &str) -> bool {
+    let ws: Vec<String> = line
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    ws.iter().any(|w| TROUBLE.contains(&w.as_str()))
+        || ws.windows(2).any(|p| p[0] == "timed" && p[1] == "out")
+}
+
+/// Whether typed text is a status line: it asks nothing, reports no trouble,
+/// and one of its clauses starts or ends with a word that reports progress.
+/// Lines that look like code don't count, so a pasted `<pasted_content>` tag
+/// is no report.
+fn is_status(text: &str) -> bool {
+    if asks(text) {
+        return false;
+    }
+    let prose: Vec<&str> = text.lines().filter(|l| !looks_like_code(l)).collect();
+    if prose.iter().any(|l| has_trouble(l)) {
+        return false;
+    }
+    prose
+        .into_iter()
+        .flat_map(|l| l.split([',', ';', '.', '!']))
+        .any(|clause| {
+            let ws: Vec<String> = query::terms(clause)
+                .into_iter()
+                .filter(|w| !FILLER.contains(&w.as_str()) || PROGRESS.contains(&w.as_str()))
+                .collect();
+            ws.first().is_some_and(|w| reports(w)) || ws.last().is_some_and(|w| reports(w))
+        })
+}
+
+fn looks_like_code(line: &str) -> bool {
+    let s = line.trim();
+    if s.is_empty() {
+        return false;
+    }
+    if line.starts_with([' ', '\t']) || s.starts_with(['>', '$', '%', '#', '@', '[']) {
+        return true;
+    }
+    let marks = s.chars().filter(|c| CODE_CHARS.contains(*c)).count();
+    marks * 10 > s.chars().count()
+}
+
+/// Splits a prompt into what was typed and what was pasted. A short prompt is
+/// all typed. In a longer one, a short block after (or else before) the rest
+/// is what was typed, and so are one or two plain lines right before or after
+/// lines that look like code. Without either, the prompt is pasted when most
+/// of its lines look like code or a log, and typed otherwise.
+fn split_prompt(q: &str) -> (String, String) {
+    let lines: Vec<&str> = q.trim().lines().collect();
+    if lines.len() <= 2 && q.split_whitespace().count() <= SHORT_PROMPT_WORDS {
+        return (q.to_string(), String::new());
+    }
+    let mut blocks: Vec<Vec<&str>> = Vec::new();
+    let mut cur: Vec<&str> = Vec::new();
+    for l in &lines {
+        if l.trim().is_empty() {
+            if !cur.is_empty() {
+                blocks.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(l);
+        }
+    }
+    if !cur.is_empty() {
+        blocks.push(cur);
+    }
+    let short = |b: &Vec<&str>| {
+        b.len() <= 2
+            && b.iter()
+                .map(|l| l.split_whitespace().count())
+                .sum::<usize>()
+                <= TYPED_WORDS
+    };
+    let join = |bs: &[Vec<&str>]| {
+        bs.iter()
+            .map(|b| b.join("\n"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    if blocks.len() > 1 {
+        if short(&blocks[blocks.len() - 1]) {
+            let (rest, last) = blocks.split_at(blocks.len() - 1);
+            return (join(last), join(rest));
+        }
+        if short(&blocks[0]) {
+            let (first, rest) = blocks.split_at(1);
+            return (join(first), join(rest));
+        }
+    }
+    // No blank line sets the typed text apart: look for typed lines right
+    // before or after lines that look like code or a log.
+    let code: Vec<bool> = lines.iter().map(|l| looks_like_code(l)).collect();
+    let lead = code.iter().take_while(|c| !**c).count();
+    let tail = code.iter().rev().take_while(|c| !**c).count();
+    let words = |ls: &[&str]| {
+        ls.iter()
+            .map(|l| l.split_whitespace().count())
+            .sum::<usize>()
+    };
+    if (1..=2).contains(&lead) && lead < lines.len() && words(&lines[..lead]) <= TYPED_WORDS {
+        return (lines[..lead].join("\n"), lines[lead..].join("\n"));
+    }
+    let cut = lines.len() - tail;
+    if (1..=2).contains(&tail) && tail < lines.len() && words(&lines[cut..]) <= TYPED_WORDS {
+        return (lines[cut..].join("\n"), lines[..cut].join("\n"));
+    }
+    if code.iter().filter(|c| **c).count() * 2 >= lines.len() {
+        return (String::new(), q.to_string());
+    }
+    (q.to_string(), String::new())
+}
+
+/// The words of each fact title the caller may see: its name and aliases,
+/// and those plus its description.
+struct Titles {
+    ids: Vec<String>,
+    names: Vec<Vec<String>>,
+    words: Vec<Vec<String>>,
+    /// The name and description words alone, without the aliases.
+    own: Vec<Vec<String>>,
+    /// The name words alone.
+    own_names: Vec<Vec<String>>,
+    /// Each distinct title word and the facts that have it, by the word's
+    /// first four characters: `word_match` only pairs words that share them
+    /// (or are equal).
+    vocab: HashMap<String, Vec<(String, Vec<usize>)>>,
+}
+
+/// The bucket `word_match` partners of `w` are in.
+fn bucket(w: &str) -> String {
+    w.chars().take(4).collect()
+}
+
+impl Titles {
+    fn load(ix: &Index, private_ok: bool) -> Result<Self> {
+        let mut st = ix.conn.prepare(
+            "SELECT doc_id, name, description, aliases FROM fact_meta
+             WHERE replaced = 0 AND (?1 OR private = 0) ORDER BY doc_id",
+        )?;
+        let rows = st
+            .query_map(params![private_ok], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut t = Titles {
+            ids: Vec::new(),
+            names: Vec::new(),
+            words: Vec::new(),
+            own: Vec::new(),
+            own_names: Vec::new(),
+            vocab: HashMap::new(),
+        };
+        let mut by_word: HashMap<String, Vec<usize>> = HashMap::new();
+        for (id, name, desc, aliases) in rows {
+            t.own.push(distinct(tokens(&format!("{name} {desc}"))));
+            t.own_names.push(distinct(query::terms(&name)));
+            let name = format!("{name} {aliases}");
+            let mut words = distinct(tokens(&format!("{name} {desc}")));
+            words.retain(|w| !query::terms(w).is_empty());
+            let k = t.ids.len();
+            for w in &words {
+                by_word.entry(w.clone()).or_default().push(k);
+            }
+            t.ids.push(id);
+            t.names.push(distinct(query::terms(&name)));
+            t.words.push(words);
+        }
+        for (w, facts) in by_word {
+            t.vocab.entry(bucket(&w)).or_default().push((w, facts));
+        }
+        Ok(t)
+    }
+
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// How many titles have a word that matches `term`.
+    fn df(&self, term: &str) -> usize {
+        let mut seen: HashSet<usize> = HashSet::new();
+        for (w, facts) in self.vocab.get(&bucket(term)).into_iter().flatten() {
+            if word_match(term, w) {
+                seen.extend(facts);
+            }
+        }
+        seen.len()
+    }
+
+    fn idf(&self, df: usize) -> f64 {
+        if df == 0 {
+            0.0
+        } else {
+            (1.0 + self.len() as f64 / df as f64).ln()
+        }
+    }
+
+    fn rare(&self, df: usize) -> bool {
+        df > 0 && df as f64 <= (self.len() as f64 * RARE_SHARE).max(2.0)
+    }
+
+    /// Facts whose titles cover what was typed, in `order` (the text search's
+    /// ranking), then by cover.
+    fn typed_matches(&self, typed: &str, order: &HashMap<String, usize>) -> Vec<String> {
+        let terms: Vec<String> = query::terms(typed)
+            .into_iter()
+            .filter(|t| !FILLER.contains(&t.as_str()) && !GENERIC.contains(&t.as_str()))
+            .collect();
+        let idf: Vec<f64> = terms.iter().map(|t| self.idf(self.df(t))).collect();
+        let useful = idf.iter().filter(|w| **w > 0.0).count();
+        if useful == 0 {
+            return Vec::new();
+        }
+        let n = self.len() as f64;
+        let unseen = idf.iter().filter(|w| **w == 0.0).count() as f64;
+        let total = idf.iter().sum::<f64>() + unseen * (1.0 + n).ln() * n / (n + STORE_SCALE);
+        // (fact, cover, words matched, words matched in its name or aliases)
+        let mut found: Vec<(usize, f64, usize, usize)> = Vec::new();
+        for k in 0..self.len() {
+            let (mut got, mut hits, mut named) = (0.0, 0, 0);
+            for (t, w) in terms.iter().zip(&idf) {
+                if *w > 0.0 && self.words[k].iter().any(|x| word_match(t, x)) {
+                    got += w;
+                    hits += 1;
+                    if self.names[k].iter().any(|x| word_match(t, x)) {
+                        named += 1;
+                    }
+                }
+            }
+            if hits > 0 {
+                found.push((k, got / total, hits, named));
+            }
+        }
+        let best = found.iter().map(|f| f.1).fold(0.0, f64::max);
+        if best < BEST_COVER {
+            return Vec::new();
+        }
+        if useful == 1 {
+            // One word only says enough when it names a few facts.
+            found.retain(|f| f.3 > 0);
+            if found.len() > MAX_PROMPT_FACTS {
+                return Vec::new();
+            }
+        }
+        let pos = |k: usize| order.get(&self.ids[k]).copied().unwrap_or(usize::MAX);
+        if useful > 1 {
+            // Near the best title match, or near the top of the text search
+            // too, which also reads the body.
+            found.retain(|f| {
+                f.2 >= 2
+                    && (f.1 >= best * NEAR_BEST
+                        || (f.1 >= MIN_COVER && pos(f.0) < MAX_PROMPT_FACTS))
+            });
+        }
+        found.sort_by(|a, b| {
+            pos(a.0)
+                .cmp(&pos(b.0))
+                .then(b.1.total_cmp(&a.1))
+                .then(a.0.cmp(&b.0))
+        });
+        found.into_iter().map(|f| self.ids[f.0].clone()).collect()
+    }
+
+    /// Facts that pasted material is about: the title shares at least two
+    /// rare words with it, one of them in the name itself (an alias can hold
+    /// a plain word like "make"), and those
+    /// shared words carry `MATERIAL_COVER` of the weight of the name and
+    /// description. The typed
+    /// words count as part of the material.
+    fn material_matches(&self, material: &str, typed: &str) -> Vec<String> {
+        let words = PastedWords::new(tokens(material).into_iter().chain(query::terms(typed)));
+        let mut dfs: HashMap<&str, usize> = HashMap::new();
+        let mut found: Vec<(usize, f64)> = Vec::new();
+        for k in 0..self.len() {
+            let mut title: Vec<&String> = Vec::new();
+            for w in &self.words[k] {
+                if !title.iter().any(|x| word_match(w, x)) {
+                    title.push(w);
+                }
+            }
+            let (mut all, mut got, mut rare, mut rare_named) = (0.0, 0.0, 0, false);
+            for w in title {
+                let df = *dfs.entry(w.as_str()).or_insert_with(|| self.df(w));
+                let weight = self.idf(df);
+                // An alias is another way to say the title, not more of it.
+                if self.own[k].iter().any(|x| word_match(w, x)) {
+                    all += weight;
+                }
+                if words.has(w) {
+                    got += weight;
+                    if self.rare(df) {
+                        rare += 1;
+                        rare_named |= self.own_names[k].iter().any(|x| word_match(w, x));
+                    }
+                }
+            }
+            let cover = if all > 0.0 { (got / all).min(1.0) } else { 0.0 };
+            if rare >= 2 && rare_named && cover >= MATERIAL_COVER {
+                found.push((k, cover));
+            }
+        }
+        found.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        found.into_iter().map(|f| self.ids[f.0].clone()).collect()
+    }
+}
+
+fn distinct(ws: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in ws {
+        if !out.contains(&w) {
+            out.push(w);
+        }
+    }
+    out
+}
+
+/// The words of pasted text, kept so `word_match` against all of them is a
+/// few set lookups.
+struct PastedWords {
+    exact: HashSet<String>,
+    /// Every prefix of four or more characters of each word.
+    prefixes: HashSet<String>,
+    /// The first five characters of each word of five or more.
+    fives: HashSet<String>,
+}
+
+impl PastedWords {
+    fn new(ws: impl IntoIterator<Item = String>) -> Self {
+        let mut p = PastedWords {
+            exact: HashSet::new(),
+            prefixes: HashSet::new(),
+            fives: HashSet::new(),
+        };
+        for w in ws {
+            let cs: Vec<char> = w.chars().collect();
+            for n in 4..=cs.len() {
+                p.prefixes.insert(cs[..n].iter().collect());
+            }
+            if cs.len() >= 5 {
+                p.fives.insert(cs[..5].iter().collect());
+            }
+            p.exact.insert(w);
+        }
+        p
+    }
+
+    /// Whether `word_match(w, x)` holds for some pasted word `x`.
+    fn has(&self, w: &str) -> bool {
+        let cs: Vec<char> = w.chars().collect();
+        self.exact.contains(w)
+            || (cs.len() >= 4 && self.prefixes.contains(w))
+            || (4..cs.len()).any(|n| self.exact.contains(&cs[..n].iter().collect::<String>()))
+            || (cs.len() >= 5 && self.fives.contains(&cs[..5].iter().collect::<String>()))
+    }
 }
 
 fn tokens(s: &str) -> Vec<String> {
@@ -506,98 +968,6 @@ fn asks(query: &str) -> bool {
             .is_some_and(|w| QUESTION_STARTS.contains(&w.as_str()))
 }
 
-/// Keeps only facts whose name and description are about the prompt, not
-/// facts that share a few common words with it. Each prompt word is weighted
-/// by how rare it is across fact titles.
-fn gate(ix: &Index, query: &str, ids: Vec<String>, private_ok: bool) -> Result<Vec<String>> {
-    if ids.is_empty() {
-        return Ok(ids);
-    }
-    let titles: HashMap<String, Vec<String>> = {
-        let mut st = ix
-            .conn
-            .prepare("SELECT doc_id, name, description, private FROM fact_meta")?;
-        st.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, bool>(3)?,
-            ))
-        })?
-        .filter_map(|r| r.ok())
-        .filter(|(_, _, _, private)| private_ok || !private)
-        .map(|(id, name, desc, _)| (id, tokens(&format!("{name} {desc}"))))
-        .collect()
-    };
-    let n = titles.len().max(1) as f64;
-    let terms: Vec<String> = query::terms(query)
-        .into_iter()
-        .filter(|t| !FILLER.contains(&t.as_str()))
-        .collect();
-    let weights: Vec<Weight> = terms
-        .iter()
-        .map(|t| {
-            let df = titles
-                .values()
-                .filter(|ws| ws.iter().any(|w| word_match(t, w)))
-                .count() as f64;
-            // Smoothed so a word every title has still counts on a small store.
-            let idf = if df == 0.0 { 0.0 } else { (1.0 + n / df).ln() };
-            Weight {
-                idf,
-                rare: df > 0.0 && df <= (n * RARE_SHARE).max(1.0),
-            }
-        })
-        .collect();
-    let seen: f64 = weights.iter().map(|w| w.idf).sum();
-    if seen <= 0.0 {
-        return Ok(Vec::new());
-    }
-    let unseen = weights.iter().filter(|w| w.idf == 0.0).count() as f64;
-    let total = seen + unseen * UNSEEN * (1.0 + n).ln();
-    let useful = weights.iter().filter(|w| w.idf > 0.0).count();
-    if useful == 1 && !weights.iter().any(|w| w.rare) {
-        return Ok(Vec::new());
-    }
-    // The share of the prompt a title covers, and how many words it matches.
-    let cover = |ws: &[String]| {
-        let (mut got, mut hits) = (0.0, 0);
-        for (t, wt) in terms.iter().zip(&weights) {
-            if wt.idf > 0.0 && ws.iter().any(|w| word_match(t, w)) {
-                got += wt.idf;
-                hits += 1;
-            }
-        }
-        (got / total, hits)
-    };
-    let scored: Vec<(String, f64, usize)> = ids
-        .into_iter()
-        .filter_map(|id| {
-            let (c, hits) = cover(titles.get(&id)?);
-            Some((id, c, hits))
-        })
-        .collect();
-    let best = scored.iter().map(|s| s.1).fold(0.0, f64::max);
-    if terms.len() <= SHORT_WORDS && !asks(query) {
-        // A status line's words sit in many titles alike, so more of them
-        // tie for the best match than one block could show.
-        let ties = titles.values().filter(|ws| cover(ws).0 >= best).count();
-        let short_total = seen + unseen * SHORT_UNSEEN * (1.0 + n).ln();
-        if best * total / short_total < STATUS_COVER || ties > MAX_FACTS {
-            return Ok(Vec::new());
-        }
-    } else if best < BEST_COVER {
-        return Ok(Vec::new());
-    }
-    let min_cover = COVER.max(best * NEAR_BEST);
-    Ok(scored
-        .into_iter()
-        .filter(|(_, cover, hits)| *cover >= min_cover && *hits >= useful.min(2))
-        .map(|(id, ..)| id)
-        .collect())
-}
-
 pub fn pinned(
     ix: &Index,
     cfg: &Config,
@@ -616,6 +986,12 @@ pub fn pinned(
     take_within(ix, ids, cfg.private_allowed(cwd), now, budget)
 }
 
+/// How to save a fact, with `{bin}` for the command that runs dotonce.
+/// Aliases are other names for the fact's topic; the prompt filter matches
+/// them like the fact's title, so a plain word there pulls the fact into any
+/// prompt that uses it.
+const SAVE_HINT: &str = "To keep something for next time, run: {bin} save \"<one line: the rule or fact>\" --source \"<where it came from>\" --aliases \"<at most 3 short other names for the same topic, comma separated, like: sev1, incident, on-call; never general words like server, test or deploy>\"";
+
 /// The block ends with how to save a fact, run as `bin`: the command that
 /// starts this dotonce, since it may not be on PATH.
 pub fn render_block(title: &str, hits: &[FactHit], bin: &str) -> String {
@@ -624,9 +1000,7 @@ pub fn render_block(title: &str, hits: &[FactHit], bin: &str) -> String {
         s.push_str(&h.line);
         s.push('\n');
     }
-    s.push_str(&format!(
-        "To keep something for next time, run: {bin} save \"<one line: the rule or fact>\" --source \"<where it came from>\""
-    ));
+    s.push_str(&SAVE_HINT.replace("{bin}", bin));
     s.push_str("\n</dotonce>");
     s
 }
@@ -1253,6 +1627,39 @@ mod tests {
     }
 
     #[test]
+    fn an_index_from_before_aliases_gets_the_column_and_a_reindex() {
+        let d = tmp("old-table");
+        write(
+            &d,
+            "a.md",
+            &entry(
+                "pr-titles",
+                "PR titles use sentence case",
+                "aliases: [pull request names]\n",
+            ),
+        );
+        let cfg = cfg_for(&d, &[]);
+        let db = d.join("ix.sqlite");
+        let db = db.to_str().unwrap();
+        {
+            let ix = Index::open(db).unwrap();
+            ix.conn
+                .execute_batch(&format!(
+                    "{}; PRAGMA user_version = 1;",
+                    META.replace(",\n    aliases TEXT NOT NULL DEFAULT ''", "")
+                ))
+                .unwrap();
+        }
+        let mut ix = open_at(db).unwrap();
+        assert_eq!(sync(&mut ix, &cfg).unwrap().added, 1);
+        assert_eq!(
+            gate_names(&ix, &cfg, "how should pull request names look?"),
+            vec!["pr-titles"]
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
     fn body_cap_cuts_at_a_word_boundary() {
         assert_eq!(cap_at_word("alpha beta gamma", 8), "alpha");
         assert_eq!(cap_at_word("alpha beta gamma", 10), "alpha beta");
@@ -1430,6 +1837,231 @@ mod tests {
         fs::remove_dir_all(&d).unwrap();
     }
 
+    /// A small store like a new user's: a few facts on different topics.
+    fn small_store(name: &str) -> (PathBuf, Config, Index) {
+        let d = tmp(name);
+        for (n, desc, extra) in [
+            (
+                "session-keys",
+                "Garden service session keys expire after one hour; renew them at /keys/renew",
+                "",
+            ),
+            (
+                "schema-changes",
+                "Schema changes live in db/changes; never edit one that already ran",
+                "",
+            ),
+            (
+                "request-quota",
+                "The garden service allows 100 calls a minute per key and answers 429 above that",
+                "",
+            ),
+            (
+                "release-tags",
+                "Releases are tagged vX.Y.Z on the trunk branch",
+                "",
+            ),
+            (
+                "branch-names",
+                "Branch names look like fix/seed-picker or feat/rain-gauge",
+                "",
+            ),
+            (
+                "paging",
+                "Page the duty gardener in #garden-duty for a broken pump",
+                "aliases: [on duty, pager]\n",
+            ),
+        ] {
+            write(&d, &format!("{n}.md"), &entry(n, desc, extra));
+        }
+        for i in 0..6 {
+            write(
+                &d,
+                &format!("tour-{i}.md"),
+                &entry(
+                    &format!("garden-tour-{i}"),
+                    &format!("Garden tour stop {i} has a bench and a map"),
+                    "",
+                ),
+            );
+        }
+        let cfg = cfg_for(&d, &[]);
+        let mut ix = open_at(":memory:").unwrap();
+        sync(&mut ix, &cfg).unwrap();
+        (d, cfg, ix)
+    }
+
+    #[test]
+    fn short_request_on_a_small_store_finds_its_fact() {
+        let (d, cfg, ix) = small_store("small-request");
+        assert_eq!(
+            gate_names(&ix, &cfg, "add a schema change for the seed table"),
+            vec!["schema-changes"]
+        );
+        assert_eq!(gate_names(&ix, &cfg, "tag a release"), vec!["release-tags"]);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn status_lines_get_nothing_even_when_a_fact_matches_them() {
+        let (d, cfg, ix) = small_store("small-status");
+        for q in [
+            "fixed the seed picker, moving on",
+            "schema change ran fine, next one",
+            "release tagged",
+            "release tgaged dnoe",
+            "keys renewed, what's next",
+        ] {
+            let got = gate_names(&ix, &cfg, q);
+            assert!(got.is_empty(), "{q:?}: {got:?}");
+        }
+        assert_eq!(
+            gate_names(&ix, &cfg, "fix the seed picker branch")
+                .first()
+                .map(String::as_str),
+            Some("branch-names")
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn trouble_reports_are_not_status_lines() {
+        let (d, cfg, ix) = small_store("small-trouble");
+        for (q, want) in [
+            ("found a bug in the request quota", "request-quota"),
+            ("found a 429 above the request quota", "request-quota"),
+            ("the schema change crashed", "schema-changes"),
+            ("release tagging failed", "release-tags"),
+            ("the session keys expired again", "session-keys"),
+            ("renewing session keys timed out", "session-keys"),
+            ("our session keys got rejected", "session-keys"),
+            ("schema change broke after the update", "schema-changes"),
+        ] {
+            let got = gate_names(&ix, &cfg, q);
+            assert_eq!(
+                got.first().map(String::as_str),
+                Some(want),
+                "{q:?}: {got:?}"
+            );
+        }
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_lone_word_needs_to_pick_out_a_few_facts_by_name() {
+        let (d, cfg, ix) = small_store("small-lone");
+        // Six facts carry "garden" in their name, so it says too little.
+        let got = gate_names(&ix, &cfg, "garden?");
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(gate_names(&ix, &cfg, "paging"), vec!["paging"]);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn aliases_match_like_the_title() {
+        let (d, cfg, ix) = small_store("small-alias");
+        assert_eq!(
+            gate_names(&ix, &cfg, "who is on duty tonight?"),
+            vec!["paging"]
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn pasted_material_finds_a_fact_by_its_rare_words() {
+        let (d, cfg, ix) = small_store("small-paste");
+        let log = "HTTP/1.1 429 Too Many Requests\nRetry-After: 37\n\n{\"error\":\"quota\",\"message\":\"over the request quota for this key\"}\n\nwhy is it rejecting us?";
+        assert_eq!(gate_names(&ix, &cfg, log), vec!["request-quota"]);
+        let code = "-- db/changes/20260611_add_beds.sql (already applied)\nCREATE TABLE beds (\n  id serial PRIMARY KEY\n);\n\nadd a width column to this";
+        assert_eq!(gate_names(&ix, &cfg, code), vec!["schema-changes"]);
+        let unrelated = "fn main() {\n    let xs = vec![3, 1, 2];\n    println!(\"{:?}\", xs.iter().max());\n}\n\nwhy does this print Some?";
+        let got = gate_names(&ix, &cfg, unrelated);
+        assert!(got.is_empty(), "{got:?}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn aliases_do_not_water_down_a_pasted_match() {
+        let d = tmp("alias-paste");
+        write(
+            &d,
+            "a.md",
+            &entry(
+                "schema-changes",
+                "Schema changes live in db/changes; never edit one that already ran",
+                "aliases: [migrations, upgrade scripts, version steps, layout history, evolution]\n",
+            ),
+        );
+        for i in 0..6 {
+            write(
+                &d,
+                &format!("tour-{i}.md"),
+                &entry(
+                    &format!("garden-tour-{i}"),
+                    &format!("Garden tour stop {i} has a bench and a map"),
+                    "",
+                ),
+            );
+        }
+        let cfg = cfg_for(&d, &[]);
+        let mut ix = open_at(":memory:").unwrap();
+        sync(&mut ix, &cfg).unwrap();
+        let code = "-- db/changes/20260611_add_beds.sql (already applied)\nCREATE TABLE beds (\n  id serial PRIMARY KEY\n);\n\nadd a width column to this";
+        assert_eq!(gate_names(&ix, &cfg, code), vec!["schema-changes"]);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn prose_paste_needs_a_name_word_to_match() {
+        let (d, cfg, ix) = small_store("small-prose");
+        // Shares "renew", "service" and "branch" with titles, but no fact name.
+        let essay = "Tree care is mostly patience. Renew the mulch each spring, keep the service paths clear,\nand cut a dead branch back to healthy wood before the sap rises. Most trees need\nlittle else, and the rest is watching what the weather does over a few seasons.\n\ntl;dr?";
+        let got = gate_names(&ix, &cfg, essay);
+        assert!(got.is_empty(), "{got:?}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn at_most_three_facts_come_back_for_a_prompt() {
+        let (d, cfg, ix) = small_store("small-cap");
+        let got = gate_names(&ix, &cfg, "which garden tour stop has a bench and a map?");
+        assert!(!got.is_empty() && got.len() <= MAX_PROMPT_FACTS, "{got:?}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_weaker_title_match_stays_when_the_text_search_ranks_it_high() {
+        let d = tmp("both-rankers");
+        write(
+            &d,
+            "a.md",
+            &entry(
+                "reply-layout",
+                "Format each reply with the code block last",
+                "",
+            ),
+        );
+        write(
+            &d,
+            "b.md",
+            "---\nname: block-labels\ndescription: Never label a code block with a language\nupdated: 2026-10-20\n---\nThis holds for the code block in every reply, whatever the format.\n",
+        );
+        for (n, desc) in [
+            ("reply-tone", "Keep each reply short and plain"),
+            ("format-dates", "Format dates as 2026-10-20"),
+            ("code-owners", "Code owners approve each pull request"),
+        ] {
+            write(&d, &format!("{n}.md"), &entry(n, desc, ""));
+        }
+        let cfg = cfg_for(&d, &[]);
+        let mut ix = open_at(":memory:").unwrap();
+        sync(&mut ix, &cfg).unwrap();
+        let got = gate_names(&ix, &cfg, "how should I format code blocks in a reply?");
+        assert!(got.contains(&"reply-layout".to_string()), "{got:?}");
+        assert!(got.contains(&"block-labels".to_string()), "{got:?}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
     #[test]
     fn save_writes_a_new_file_and_never_overwrites() {
         let d = tmp("save");
@@ -1550,7 +2182,15 @@ mod tests {
             ),
         );
         assert!(sync(&mut ix, &cfg).is_err());
-        let hits = search(&ix, &cfg, "acme", Path::new("/tmp"), NOW, 1_500).unwrap();
+        let hits = search(
+            &ix,
+            &cfg,
+            "which staging site",
+            Path::new("/tmp"),
+            NOW,
+            1_500,
+        )
+        .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(
             hits[0].line.contains("acme.example.com"),
@@ -1613,9 +2253,26 @@ mod tests {
                 .map(|h| h.name)
                 .collect()
         };
-        assert_eq!(names("zebra codes").len(), 5);
+        let zebras: i64 = ix
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM fact_meta WHERE name LIKE 'zebra-%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(zebras, 5);
+        assert_eq!(names("zebra codes").len(), MAX_PROMPT_FACTS);
         assert!(names("deploys tuesday").is_empty());
-        let old = search(&ix, &cfg, "acme", Path::new("/tmp"), NOW, 1_500).unwrap();
+        let old = search(
+            &ix,
+            &cfg,
+            "which staging site",
+            Path::new("/tmp"),
+            NOW,
+            1_500,
+        )
+        .unwrap();
         assert!(old[0].line.contains("acme.example.com"), "{}", old[0].line);
         ix.conn.execute_batch("DROP TRIGGER fail_meta").unwrap();
         assert_eq!(
