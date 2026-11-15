@@ -20,6 +20,7 @@ pub mod retrieve;
 pub mod rules;
 pub mod serve;
 pub mod session;
+pub mod skills;
 pub mod store;
 pub mod timeq;
 pub mod tools;

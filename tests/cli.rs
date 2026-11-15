@@ -22,6 +22,8 @@ fn run_in(home: &Path, cwd: &Path, args: &[&str], stdin: Option<&str>) -> (Strin
         .env_remove("CLAUDECODE")
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
         .env_remove("CLAUDE_PLUGIN_ROOT")
+        // Installed skills come from HOME, never the machine's own.
+        .env_remove("CLAUDE_CONFIG_DIR")
         // Without Claude Code's hook marker, so these tests see rule sets
         // as a terminal-only setup does, with no autopilot and no codes.
         .env_remove("AI_AGENT")
@@ -4876,5 +4878,147 @@ fn prompt_words_skip_quoted_lines_and_match_a_phrase_whole() {
         assert!(out.trim().is_empty(), "{text:?}: {out}");
     }
     assert!(prompt("s9", "add an internal note for acme").contains("Internal notes stay short."));
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+const WRITING: &str = "[when]\nfolders = [\"/tmp\"]\n[draft]\nfence = [\"\", \"markdown\"]\n[[check]]\nid = \"skill-first\"\nkind = \"skill-loaded\"\nskills = [\"acme-writer\"]\nwhy = \"Load the writing skill that fits before you write a draft.\"\n";
+const PROSE_DRAFT: &str = "Here is the reply:\n\n```\nHi Sam,\n\nThanks for the details on the checkout page. I tested the same steps on a fresh store and the coupon applies there. Could you share the plugin list from your store so I can compare the two?\n```";
+const COMMANDS: &str = "Run these:\n\n```\ncd ~/acme\ngit pull\nnpm install\nnpm run build\n```";
+const NUDGE: &str = "[writing-skill/skill-first]\nYour last reply had a draft and no writing skill was loaded. Load the writing skill that fits before you write a draft. Writing skills: acme-writer.";
+
+fn writing_home(name: &str, level: &str, set: &str) -> PathBuf {
+    let h = home(name);
+    add_set(&h, "writing-skill", set);
+    approve(&h, "writing-skill", level);
+    h
+}
+
+fn ask(h: &Path, sid: &str, pid: &str) -> String {
+    hook(
+        h,
+        "prompt",
+        serde_json::json!({"session_id": sid, "prompt_id": pid, "prompt": "give me text", "cwd": "/tmp"}),
+    )
+}
+
+#[test]
+fn a_draft_before_the_writing_skill_is_caught_and_nudged_once() {
+    let h = writing_home("skillwarn", "warn", WRITING);
+    ask(&h, "s1", "p1");
+    assert!(stop(&h, "s1", "p1", PROSE_DRAFT, false).trim().is_empty());
+    assert_eq!(
+        outcomes(&h, "catches.jsonl"),
+        pairs(&[("skill-first", "caught")])
+    );
+    let ctx = context(&ask(&h, "s1", "p2"), "UserPromptSubmit");
+    assert!(ctx.contains(NUDGE), "{ctx}");
+    assert!(!ask(&h, "s1", "p3").contains("skill-first"), "given once");
+    assert!(stop(&h, "s1", "p3", COMMANDS, false).trim().is_empty());
+    assert_eq!(
+        outcomes(&h, "catches.jsonl").len(),
+        1,
+        "commands aren't a draft"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn loading_the_writing_skill_clears_the_nudge_and_passes_the_next_draft() {
+    let h = writing_home("skillclear", "warn", WRITING);
+    ask(&h, "s1", "p1");
+    stop(&h, "s1", "p1", PROSE_DRAFT, false);
+    use_skill(&h, "s1", "p1");
+    assert!(!ask(&h, "s1", "p2").contains("skill-first"));
+    assert!(stop(&h, "s1", "p2", PROSE_DRAFT, false).trim().is_empty());
+    assert_eq!(
+        outcomes(&h, "catches.jsonl"),
+        pairs(&[("skill-first", "caught")])
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn a_skill_the_session_record_shows_counts_as_loaded() {
+    let h = writing_home("skillrecord", "warn", WRITING);
+    let record = h.join("record.jsonl");
+    let read = serde_json::json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/home/sam/.claude/skills/acme-writer/SKILL.md"}}]}});
+    std::fs::write(&record, format!("{read}\n")).unwrap();
+    ask(&h, "s1", "p1");
+    assert!(
+        stop_with(&h, "s1", "p1", PROSE_DRAFT, false, &record)
+            .trim()
+            .is_empty()
+    );
+    assert!(outcomes(&h, "catches.jsonl").is_empty());
+    let state = std::fs::read_to_string(h.join("dotonce/sessions/s1.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&state).unwrap();
+    assert_eq!(v["skills"], serde_json::json!(["acme-writer"]), "{state}");
+    assert!(v["skills_read"].as_u64().unwrap() > 0, "{state}");
+    // Another session's record without the skill gets the catch.
+    let other = h.join("other.jsonl");
+    let note = serde_json::json!({"type": "user", "message": {"content": "Base directory for this skill: /home/sam/.claude/skills/code-review"}});
+    std::fs::write(&other, format!("{note}\n")).unwrap();
+    ask(&h, "s2", "p1");
+    stop_with(&h, "s2", "p1", PROSE_DRAFT, false, &other);
+    assert_eq!(
+        outcomes(&h, "catches.jsonl"),
+        pairs(&[("skill-first", "caught")])
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn a_fix_set_sends_the_draft_back_until_the_skill_loads() {
+    let h = writing_home("skillfix", "fix", WRITING);
+    ask(&h, "s1", "p1");
+    let msg = sent_back(&stop(&h, "s1", "p1", PROSE_DRAFT, false));
+    assert!(
+        msg.contains("- skill-first: \"Hi Sam,\". Load the writing skill that fits before you write a draft. Writing skills: acme-writer."),
+        "{msg}"
+    );
+    use_skill(&h, "s1", "p1");
+    let redraft = PROSE_DRAFT.replace("Here is the reply:", "Loaded acme-writer first.");
+    assert!(stop(&h, "s1", "p1", &redraft, true).trim().is_empty());
+    assert_eq!(
+        outcomes(&h, "catches.jsonl"),
+        pairs(&[("skill-first", "caught"), ("skill-first", "fixed")])
+    );
+    assert!(
+        !ask(&h, "s1", "p2").contains("skill-first"),
+        "no nudge at fix"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn without_a_list_the_installed_writing_skills_count() {
+    let set = WRITING.replace("skills = [\"acme-writer\"]\n", "");
+    let h = writing_home("skilldefault", "warn", &set);
+    ask(&h, "s1", "p1");
+    stop(&h, "s1", "p1", PROSE_DRAFT, false);
+    assert!(
+        outcomes(&h, "catches.jsonl").is_empty(),
+        "no writing skill installed, nothing to load"
+    );
+    for name in ["writing-notes", "code-review"] {
+        let dir = h.join(".claude/skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\nname: x\n---\n").unwrap();
+    }
+    ask(&h, "s1", "p2");
+    stop(&h, "s1", "p2", PROSE_DRAFT, false);
+    assert_eq!(
+        outcomes(&h, "catches.jsonl"),
+        pairs(&[("skill-first", "caught")])
+    );
+    let ctx = context(&ask(&h, "s1", "p3"), "UserPromptSubmit");
+    assert!(ctx.contains("Writing skills: writing-notes."), "{ctx}");
+    hook(
+        &h,
+        "skill",
+        serde_json::json!({"session_id": "s1", "prompt_id": "p3", "tool_name": "Skill", "tool_input": {"skill": "writing-notes"}, "cwd": "/tmp"}),
+    );
+    stop(&h, "s1", "p3", PROSE_DRAFT, false);
+    assert_eq!(outcomes(&h, "catches.jsonl").len(), 1);
     std::fs::remove_dir_all(&h).unwrap();
 }

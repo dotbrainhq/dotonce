@@ -19,6 +19,7 @@ use crate::plugin;
 use crate::retrieve::estimate_tokens;
 use crate::rules::{self, FileError, Level, Loaded, RuleSet, printable};
 use crate::session::{self, Event, State, Trigger};
+use crate::skills::Seen;
 use crate::tools;
 
 /// A reminder this long leaves little room under the hooks' 2,000-token cap.
@@ -192,7 +193,12 @@ pub fn rules_test(
         Some(t) => (1, tools::run_tool(&set, t, path, &text)),
         None => (
             checks::drafts(&set, &text).len(),
-            checks::run_reply(&set, &text),
+            // As in a session that loaded no skill yet.
+            checks::run_reply(
+                &set,
+                &text,
+                &Seen::new(&[], None, &std::env::current_dir().unwrap_or_default()),
+            ),
         ),
     };
     if json {
