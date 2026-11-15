@@ -176,6 +176,9 @@ pub enum CheckKind {
     /// A draft in the reply needs one of these skills loaded first. Empty
     /// means the installed skills named like writing skills.
     SkillLoaded(Vec<String>),
+    /// A second model reads the draft and judges it against this sentence.
+    /// Runs at Stop only, through the judge (see judge.rs).
+    Model(String),
 }
 
 impl CheckKind {
@@ -189,6 +192,7 @@ impl CheckKind {
             CheckKind::MaxParagraphs(_) => "max_paragraphs",
             CheckKind::MaxWords(_) => "max_words",
             CheckKind::SkillLoaded(_) => "skill-loaded",
+            CheckKind::Model(_) => "model",
         }
     }
 }
@@ -215,6 +219,15 @@ pub struct RuleSet {
     pub file: PathBuf,
     /// The file's text as read, for the approval hash.
     pub src: String,
+}
+
+impl RuleSet {
+    /// Whether a check in the set is a model check, run by the judge at Stop.
+    pub fn has_model_check(&self) -> bool {
+        self.checks
+            .iter()
+            .any(|c| matches!(c.kind, CheckKind::Model(_)))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -303,6 +316,7 @@ struct RawCheck {
     max_paragraphs: Option<usize>,
     max_words: Option<usize>,
     skills: Option<Vec<String>>,
+    ask: Option<String>,
 }
 
 pub fn rules_dir() -> Result<PathBuf> {
@@ -361,7 +375,7 @@ fn check(raw: RawCheck, n: usize) -> Result<Check> {
     .count();
     if kinds == 0 {
         bail!(
-            "check {id} has no kind: give one of forbid, forbid_regex, require, kind = \"bare-url\", kind = \"skill-loaded\", repeat_of, max_paragraphs or max_words"
+            "check {id} has no kind: give one of forbid, forbid_regex, require, kind = \"bare-url\", kind = \"skill-loaded\", kind = \"model\", repeat_of, max_paragraphs or max_words"
         );
     }
     if kinds > 1 {
@@ -372,6 +386,9 @@ fn check(raw: RawCheck, n: usize) -> Result<Check> {
     }
     if raw.skills.is_some() && raw.kind.as_deref() != Some("skill-loaded") {
         bail!("check {id}: skills only goes with kind = \"skill-loaded\"");
+    }
+    if raw.ask.is_some() && raw.kind.as_deref() != Some("model") {
+        bail!("check {id}: ask only goes with kind = \"model\"");
     }
     let kind = if let Some(list) = raw.forbid {
         CheckKind::Forbid(phrases(list, &id, "forbid")?)
@@ -395,8 +412,25 @@ fn check(raw: RawCheck, n: usize) -> Result<Check> {
                     .collect();
                 CheckKind::SkillLoaded(skills)
             }
+            "model" => {
+                if raw.on == On::Tool {
+                    bail!("check {id}: model checks read drafts, not tools");
+                }
+                let ask = raw
+                    .ask
+                    .map(|a| a.trim().to_string())
+                    .filter(|a| !a.is_empty())
+                    .with_context(|| {
+                        format!(
+                            "check {id}: a model check needs ask: the rule in one plain sentence"
+                        )
+                    })?;
+                CheckKind::Model(ask)
+            }
             _ => {
-                bail!("check {id}: unknown kind {k}: the named kinds are bare-url and skill-loaded")
+                bail!(
+                    "check {id}: unknown kind {k}: the named kinds are bare-url, skill-loaded and model"
+                )
             }
         }
     } else if let Some(re) = raw.repeat_of {
@@ -528,12 +562,15 @@ fn parse_lazy(src: &str, file: &Path) -> Result<RuleSet> {
             bail!("two checks have the id {}", c.id);
         }
         // A whole reply reads as prose almost every time, so this check
-        // would catch every reply.
-        if matches!(c.kind, CheckKind::SkillLoaded(_)) && draft.is_none() {
-            bail!(
-                "check {}: skill-loaded checks drafts: add a [draft] table with the fences that mark one",
-                c.id
-            );
+        // would catch every reply, and a model check would judge every reply.
+        if draft.is_none() {
+            if let CheckKind::SkillLoaded(_) | CheckKind::Model(_) = c.kind {
+                bail!(
+                    "check {}: {} checks drafts: add a [draft] table with the fences that mark one",
+                    c.id,
+                    c.kind.name()
+                );
+            }
         }
         checks.push(c);
     }
@@ -703,6 +740,15 @@ why = "Under 300 words."
 # kind = "skill-loaded"
 # skills = ["example-skill"]
 # why = "Load the writing skill before you write a draft."
+
+# A model check has a second model judge the draft against a rule no
+# pattern can hold. It runs Claude Code's claude command at the end of a
+# turn with a draft, and needs the [draft] table too.
+# [[check]]
+# id = "every-ask"
+# kind = "model"
+# ask = "The draft answers every question in the message it replies to."
+# why = "Answer what was asked, all of it."
 "##;
 
 const DRAFT_TABLE: &str = "# Drafts are fenced blocks with these info strings, like ```markdown.\n# \"\" means a fence with no info string. Drop this table to check whole\n# replies instead.\n[draft]\nfence = [\"markdown\", \"draft\"]\n";
@@ -863,6 +909,46 @@ why = "No TODOs in Rust files."
         assert!(
             err("id = \"acme-mail\"\n[[check]]\nid = \"first\"\nwhy = \"w\"\nkind = \"skill-loaded\"\n")
                 .contains("skill-loaded checks drafts: add a [draft] table")
+        );
+    }
+
+    #[test]
+    fn a_model_check_needs_its_ask_and_a_draft_table() {
+        let head = "id = \"acme-mail\"\n[draft]\nfence = [\"\"]\n[[check]]\nid = \"every-ask\"\nwhy = \"w\"\n";
+        let s = p(&format!(
+            "{head}kind = \"model\"\nask = \" Answers every question. \"\n"
+        ))
+        .unwrap();
+        assert_eq!(s.checks[0].kind.name(), "model");
+        assert!(matches!(&s.checks[0].kind, CheckKind::Model(a) if a == "Answers every question."));
+        assert!(s.has_model_check());
+        assert!(
+            !p(&format!("{head}forbid = [\"x\"]\n"))
+                .unwrap()
+                .has_model_check()
+        );
+        for ask in ["", "ask = \"  \"\n"] {
+            assert!(
+                err(&format!("{head}kind = \"model\"\n{ask}"))
+                    .contains("a model check needs ask: the rule in one plain sentence")
+            );
+        }
+        assert!(
+            err(&format!("{head}forbid = [\"x\"]\nask = \"a\"\n"))
+                .contains("ask only goes with kind = \"model\"")
+        );
+        assert!(
+            err(&format!(
+                "{head}kind = \"model\"\nask = \"a\"\non = \"tool\"\ntool = \"Bash\"\n"
+            ))
+            .contains("model checks read drafts, not tools")
+        );
+        assert!(
+            err("id = \"acme-mail\"\n[[check]]\nid = \"c\"\nwhy = \"w\"\nkind = \"model\"\nask = \"a\"\n")
+                .contains("model checks drafts: add a [draft] table")
+        );
+        assert!(
+            err(&format!("{head}kind = \"judge\"\n")).contains("bare-url, skill-loaded and model")
         );
     }
 

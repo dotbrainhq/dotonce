@@ -2,8 +2,9 @@
 //! match the prompt; SessionStart adds pinned facts, re-adds reminders after
 //! compaction and reports broken rule files; PostToolUse (Skill) and
 //! UserPromptExpansion turn on the rule sets for a skill.
-//! Stop runs the reply checks (see reply.rs); MessageDisplay labels a broken
-//! draft on screen (see display.rs).
+//! Stop runs the reply checks (see reply.rs), and a second Stop hook in the
+//! background has a model judge the drafts (see judge.rs); MessageDisplay
+//! labels a broken draft on screen (see display.rs).
 //! PreToolUse runs tool checks and the rules guard (see tools.rs).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -35,31 +36,71 @@ const EVENTS: &[&str] = &[
     "skill",
     "expansion",
     "stop",
+    "judge",
     "display",
     "pre-tool",
 ];
 
-/// Every hook dotonce needs: the Claude Code event, the `dotonce hook`
-/// argument, and the matcher.
-pub const HOOKS: &[(&str, &str, Option<&str>)] = &[
-    ("UserPromptSubmit", "prompt", None),
-    ("SessionStart", "session-start", None),
-    ("Stop", "stop", None),
-    ("PostToolUse", "skill", Some("Skill")),
-    ("UserPromptExpansion", "expansion", None),
-    (
+/// One hook dotonce needs.
+pub struct Hook {
+    /// The Claude Code event.
+    pub event: &'static str,
+    /// The `dotonce hook` argument.
+    pub arg: &'static str,
+    pub matcher: Option<&'static str>,
+    /// Seconds Claude Code waits for it.
+    pub timeout: u32,
+    /// Runs in the background (`async`): the turn doesn't wait for it, and
+    /// what it adds reaches Claude on the next turn.
+    pub background: bool,
+}
+
+const fn hook(event: &'static str, arg: &'static str, matcher: Option<&'static str>) -> Hook {
+    Hook {
+        event,
+        arg,
+        matcher,
+        timeout: 5,
+        background: false,
+    }
+}
+
+/// Every hook dotonce needs. Stop waits up to 30 seconds because a fix set's
+/// model check runs inside it.
+pub const HOOKS: &[Hook] = &[
+    hook("UserPromptSubmit", "prompt", None),
+    hook("SessionStart", "session-start", None),
+    Hook {
+        timeout: 30,
+        ..hook("Stop", "stop", None)
+    },
+    Hook {
+        timeout: 30,
+        background: true,
+        ..hook("Stop", "judge", None)
+    },
+    hook("PostToolUse", "skill", Some("Skill")),
+    hook("UserPromptExpansion", "expansion", None),
+    hook(
         "PreToolUse",
         "pre-tool",
         Some("Bash|Write|Edit|MultiEdit|NotebookEdit"),
     ),
-    ("MessageDisplay", "display", None),
+    hook("MessageDisplay", "display", None),
 ];
+
+/// Set on the `claude` command the judge runs, so a dotonce hook that runs
+/// inside it anyway adds nothing.
+pub const CHILD_VAR: &str = "DOTONCE_CHILD";
 
 /// Handles one Claude Code hook call. Returns the JSON to print, or None when
 /// there is nothing to add.
 pub fn handle(event: &str, input: &str, now: i64) -> Result<Option<String>> {
     if !EVENTS.contains(&event) {
         bail!("unknown hook event: {event}");
+    }
+    if std::env::var_os(CHILD_VAR).is_some() {
+        return Ok(None);
     }
     let v: Value = serde_json::from_str(input)?;
     let cwd = v
@@ -83,6 +124,7 @@ pub fn handle(event: &str, input: &str, now: i64) -> Result<Option<String>> {
         "session-start" => session_start(&v, &cwd, now),
         "skill" => skill(&v, &cwd),
         "stop" => crate::reply::stop(&v, &cwd, now),
+        "judge" => crate::judge::hook(&v, &cwd, now),
         "display" => crate::display::display(&v, &cwd),
         "pre-tool" => crate::tools::pre_tool(&v, &cwd, now),
         _ => expansion(&v, &cwd),

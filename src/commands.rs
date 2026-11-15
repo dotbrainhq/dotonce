@@ -15,6 +15,7 @@ use crate::catches;
 use crate::checks::{self, Failure};
 use crate::config;
 use crate::hook;
+use crate::judge;
 use crate::plugin;
 use crate::retrieve::estimate_tokens;
 use crate::rules::{self, FileError, Level, Loaded, RuleSet, printable};
@@ -224,6 +225,18 @@ pub fn rules_test(
         return Ok(());
     }
     print_failures(&fails);
+    let model: Vec<&str> = set
+        .checks
+        .iter()
+        .filter(|c| matches!(c.kind, rules::CheckKind::Model(_)))
+        .map(|c| c.id.as_str())
+        .collect();
+    if tool.is_none() && !model.is_empty() {
+        println!(
+            "note     {} only run at Stop, where a second model judges the draft: rules test doesn't call it",
+            printable(&model.join(", "))
+        );
+    }
     Ok(())
 }
 
@@ -616,7 +629,8 @@ pub fn doctor() -> Result<()> {
     let mut missing = 0;
     let mut twice = 0;
     let mut twice_files = BTreeSet::new();
-    for &(event, arg, matcher) in hook::HOOKS {
+    for h in hook::HOOKS {
+        let (event, arg, matcher) = (h.event, h.arg, h.matcher);
         let from_plugins: Vec<String> = on
             .iter()
             .filter(|p| has_hook(&p.hooks, event, arg, matcher))
@@ -698,10 +712,74 @@ pub fn doctor() -> Result<()> {
         loaded.errors.len(),
         waiting
     );
+    let cfg = config::load_file().ok().flatten().unwrap_or_default();
+    let log = catches::read(cfg.private_allowed(&cwd)).unwrap_or_default();
+    let judged = judge::read_log(cfg.private_allowed(&cwd));
+    let now = chrono::Utc::now();
+    for line in model_check_lines(&loaded.sets, &a, &log, &judged, &cfg.judge_model, now) {
+        println!("{line}");
+    }
     if let Some(hint) = config::path_hint() {
         println!("{hint}");
     }
     Ok(())
+}
+
+/// Doctor's lines on model checks: whether the judge can run, last week's
+/// calls, and the log-only sets with enough catches for fix, which the
+/// autopilot leaves for the user to move. Nothing when no set has one.
+fn model_check_lines(
+    sets: &[RuleSet],
+    a: &approvals::Approvals,
+    log: &[catches::Catch],
+    judged: &[judge::LogLine],
+    model: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    let with_model: Vec<&RuleSet> = sets.iter().filter(|s| s.has_model_check()).collect();
+    if with_model.is_empty() {
+        return Vec::new();
+    }
+    let n = with_model.len();
+    let mut out = vec![match judge::find_claude() {
+        Some(bin) => format!(
+            "{:<8} model checks in {n} set(s), judged by {} through {}",
+            "ok",
+            printable(model),
+            printable(&bin.to_string_lossy())
+        ),
+        None => format!(
+            "warning  model checks in {n} set(s) let every draft through: no claude command on PATH, in ~/.local/bin or in ~/.claude/local. Install Claude Code to turn them on."
+        ),
+    }];
+    let since = catches::timestamp((now - chrono::Duration::days(7)).timestamp());
+    let week: Vec<&judge::LogLine> = judged.iter().filter(|l| l.time >= since).collect();
+    if !week.is_empty() {
+        let caught = week.iter().filter(|l| l.result == "caught").count();
+        let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
+        for l in week.iter().filter(|l| l.failed()) {
+            *kinds.entry(l.result.as_str()).or_default() += 1;
+        }
+        let failed: usize = kinds.values().sum();
+        let mut line = format!(
+            "model checks, last 7 days: {} judged, {caught} caught, {failed} let through",
+            week.len() - failed
+        );
+        if failed > 0 {
+            let kinds: Vec<String> = kinds.iter().map(|(k, n)| format!("{n} {k}")).collect();
+            line.push_str(&format!(" ({})", kinds.join(", ")));
+        }
+        out.push(line);
+    }
+    for s in with_model.iter().filter(|s| !s.private) {
+        if let Some((catches, sessions)) = crate::autopilot::ready_for_fix(a, s, log, now) {
+            out.push(format!(
+                "note     {id} has {catches} catches in {sessions} sessions, enough for fix. A set with a model check doesn't move by itself: dotonce rules level {id} fix moves it.",
+                id = printable(&s.id)
+            ));
+        }
+    }
+    out
 }
 
 /// Prints the hooks block for Claude Code's settings.json, with this
@@ -711,12 +789,20 @@ pub fn hook_config() -> Result<()> {
     let exe = std::env::current_exe()?;
     let bin = hook::shell_word(&exe.to_string_lossy());
     let mut hooks = serde_json::Map::new();
-    for &(event, arg, matcher) in hook::HOOKS {
-        let mut group = json!({"hooks": [{"type": "command", "command": format!("{bin} hook {arg}"), "timeout": 5}]});
-        if let Some(m) = matcher {
+    for h in hook::HOOKS {
+        let mut command = json!({"type": "command", "command": format!("{bin} hook {}", h.arg), "timeout": h.timeout});
+        if h.background {
+            command["async"] = json!(true);
+        }
+        let mut group = json!({"hooks": [command]});
+        if let Some(m) = h.matcher {
             group["matcher"] = json!(m);
         }
-        hooks.insert(event.to_string(), json!([group]));
+        if let Some(Value::Array(groups)) = hooks.get_mut(h.event) {
+            groups.push(group);
+        } else {
+            hooks.insert(h.event.to_string(), json!([group]));
+        }
     }
     println!(
         "{}",

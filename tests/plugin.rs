@@ -345,7 +345,7 @@ fn doctor_reports_the_plugin_and_hooks_that_run_twice() {
     }
     let warning = out
         .lines()
-        .find(|l| l.starts_with("warning  7 hook(s) run twice"))
+        .find(|l| l.starts_with("warning  8 hook(s) run twice"))
         .unwrap_or_else(|| panic!("{out}"));
     assert!(warning.contains(&*file), "{warning}");
     assert_eq!(
@@ -402,7 +402,7 @@ fn doctor_names_the_plugin_when_its_hooks_fall_short() {
     let out = run_in(&h, &h, &["doctor"]);
     assert!(out.contains("missing  Stop"), "{out}");
     assert!(
-        out.contains("1 hook(s) missing from plugin dotonce@dotonce. Update it with claude plugin update dotonce@dotonce"),
+        out.contains("2 hook(s) missing from plugin dotonce@dotonce. Update it with claude plugin update dotonce@dotonce"),
         "{out}"
     );
     let out = run_in(&h, &proj, &["doctor"]);

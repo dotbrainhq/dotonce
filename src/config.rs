@@ -28,6 +28,9 @@ pub struct Config {
     pub prompt_budget: usize,
     #[serde(default = "default_budget")]
     pub session_budget: usize,
+    /// The model a rule set's model checks run on, as `claude --model` takes it.
+    #[serde(default = "default_judge_model")]
+    pub judge_model: String,
 }
 
 fn default_stores() -> Vec<StoreCfg> {
@@ -42,6 +45,10 @@ fn default_stores() -> Vec<StoreCfg> {
 
 fn default_save_store() -> String {
     "notes".to_string()
+}
+
+fn default_judge_model() -> String {
+    "haiku".to_string()
 }
 
 fn default_budget() -> usize {
@@ -171,6 +178,9 @@ ignore_paths = []
 # Token budgets for what the hooks add to Claude's context, at most 2000 each.
 prompt_budget = 1500
 session_budget = 1500
+
+# The model that judges drafts for a rule set's model checks, as `claude --model` takes it.
+judge_model = \"haiku\"
 
 [[stores]]
 name = \"notes\"
