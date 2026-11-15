@@ -242,7 +242,7 @@ max = 0
 why = "Use the name once, in the greeting."
 ```
 
-A draft is a fenced block whose info string is in `fence`. Use `""` for fences with no info string. A longer fence can hold a shorter one, so a draft can carry a code snippet. Without a `[draft]` table, the checks read the whole reply.
+A draft is a fenced block whose info string is in `fence`. Use `""` for fences with no info string. A longer fence can hold a shorter one, so a draft can carry a code snippet. `skip = ['...']` lists patterns for blocks that share a draft's fence but aren't drafts, like an analysis card or a form. A block that one of them matches is left out. `^` and `$` match at each line, and `\A` matches the start of the block. Without a `[draft]` table, the checks read the whole reply.
 
 | Check | Fails when |
 |---|---|
