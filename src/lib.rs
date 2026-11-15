@@ -18,6 +18,7 @@ pub mod model;
 pub mod names;
 pub mod plugin;
 pub mod query;
+pub mod reads;
 pub mod reply;
 pub mod retrieve;
 pub mod rules;

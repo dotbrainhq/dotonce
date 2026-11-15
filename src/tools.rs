@@ -1,7 +1,8 @@
 //! PreToolUse: rule sets' tool checks, and the always-on guard that keeps
 //! Claude from editing rule files, approvals.json, last-live.json or
 //! chat.json, from running the `dotonce rules` commands that change
-//! approvals, and from turning the dotonce plugin off.
+//! approvals or write a starter, and from turning the dotonce plugin off.
+//! Bash commands that only read may still name those files.
 
 use std::iter::Peekable;
 use std::path::{Path, PathBuf};
@@ -17,10 +18,12 @@ use crate::checks::{Failure, failing_line};
 use crate::config::{home_dir, lexical_normalize, resolve};
 use crate::hook::{prompt_id, session_id, str_field};
 use crate::plugin;
+use crate::reads::only_reads;
 use crate::rules::{Level, On, RuleSet};
 use crate::session;
 
 pub const GUARD_REASON: &str = "dotonce: Claude can't change rule files, approvals or rule commands. To add or change a rule set, write it to a file outside the dotonce home and run dotonce rules propose FILE. dotonce turns it on log-only and tells the user, so don't ask them to run a command. Levels, rules off and rules pause stay in the user's own terminal.";
+pub const NEW_REASON: &str = "dotonce: Claude can't run dotonce rules new. It writes a starter into the rules folder, and Claude can't change or remove files there. Write the rule set to a file outside the dotonce home, then run dotonce rules propose FILE --ask --note \"...\" for a rule from the user's correction, or dotonce rules propose FILE for any other set. Don't ask the user to run a command.";
 
 const FILE_TOOLS: [&str; 4] = ["Write", "Edit", "MultiEdit", "NotebookEdit"];
 /// The files in the dotonce home that only the user changes. last-live.json
@@ -37,6 +40,8 @@ const GUARDED_NAMES: [&str; 4] = [
 ];
 /// The `dotonce rules` subcommands that change what checks run.
 const RULE_CHANGES: [&str; 4] = ["approve", "level", "off", "pause"];
+/// The `dotonce rules` subcommand that writes a starter into the rules folder.
+const STARTER: [&str; 1] = ["new"];
 /// Shells whose `-c` argument, or stdin, runs as a command.
 const SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", "fish"];
 /// Shell options that take the next word as their value.
@@ -366,8 +371,12 @@ fn can_write(cmd: &str, depth: usize) -> bool {
 /// True when a shell command names the rules folder or a guarded file, the
 /// home itself as an argument to a command that changes it, or the home and
 /// a guarded name in a command that can write. Paths are matched in the raw
-/// text and in the words with their quotes and backslashes taken off.
+/// text and in the words with their quotes and backslashes taken off. A
+/// command that only reads never counts.
 pub fn mentions(cmd: &str, home: &Path, cwd: &Path, user_home: Option<&Path>) -> bool {
+    if only_reads(cmd) {
+        return false;
+    }
     let cmd = fold(cmd);
     let cmd = cmd.as_str();
     let mut bases: Vec<String> = forms(home)
@@ -416,7 +425,8 @@ pub fn mentions(cmd: &str, home: &Path, cwd: &Path, user_home: Option<&Path>) ->
     names_target && at_home && can_write(cmd, 0)
 }
 
-/// True when the call would change a rule file or approvals.json.
+/// True when the call would change a rule file or a guarded file, run a rule
+/// change, or write a starter with `rules new`.
 pub fn guard(tool: &str, input: &Value, cwd: &Path, home: &Path, user_home: Option<&Path>) -> bool {
     if FILE_TOOLS.contains(&tool) {
         let key = if tool == "NotebookEdit" {
@@ -428,7 +438,8 @@ pub fn guard(tool: &str, input: &Value, cwd: &Path, home: &Path, user_home: Opti
         return !p.is_empty() && guarded_path(&cwd.join(p), home);
     }
     let cmd = str_field(input, "command");
-    tool == "Bash" && (mentions(cmd, home, cwd, user_home) || runs_rule_change(cmd))
+    tool == "Bash"
+        && (mentions(cmd, home, cwd, user_home) || runs_rule_change(cmd) || writes_starter(cmd))
 }
 
 #[derive(PartialEq)]
@@ -444,13 +455,16 @@ enum Ctx {
 /// One simple command: its words with quotes taken off, and what it reads
 /// on stdin from here-docs and here-strings.
 #[derive(Default)]
-struct Simple {
-    words: Vec<String>,
+pub(crate) struct Simple {
+    pub(crate) words: Vec<String>,
     stdin: Vec<String>,
     /// True when an output redirection writes to a file.
-    writes: bool,
+    pub(crate) writes: bool,
     /// The index of the first command of the pipeline that feeds this one.
     piped_from: Option<usize>,
+    /// When these are the words after a `$(...)` or backtick in an argument,
+    /// the index of the command they belong to.
+    pub(crate) joins: Option<usize>,
 }
 
 /// A here-doc waiting for its body: the command's index, the delimiter,
@@ -472,8 +486,16 @@ struct Lexer {
     /// The next word is a redirection target (`> file`).
     redir_next: bool,
     /// For each open `$(...)` or backtick: whether it stands where a command
-    /// word goes, and the index of its first command.
-    subs: Vec<(bool, usize)>,
+    /// word goes, the index of its first command, and the index of the
+    /// command it is an argument of.
+    subs: Vec<(bool, usize, Option<usize>)>,
+}
+
+/// A `>&` target that copies or closes a descriptor (`&1`, `&-`). Any other
+/// `>&word` writes to the file `word`.
+fn copies_fd(t: &str) -> bool {
+    t.strip_prefix('&')
+        .is_some_and(|n| n == "-" || (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
 }
 
 impl Lexer {
@@ -492,7 +514,7 @@ impl Lexer {
                 None if std::mem::take(&mut self.redir_next) => Some(w.as_str()),
                 None => None,
             };
-            if target.is_some_and(|t| !t.starts_with('&') && !SINKS.contains(&t)) {
+            if target.is_some_and(|t| !copies_fd(t) && !SINKS.contains(&t)) {
                 self.cur.writes = true;
             }
             if std::mem::take(&mut self.here_string) {
@@ -514,20 +536,36 @@ impl Lexer {
         }
     }
 
-    /// Starts a `$(...)` or backtick command of its own.
+    /// True when the current word ends in an unquoted `>`.
+    fn ends_in_redir(&self) -> bool {
+        self.redir.is_some() && self.redir == self.word.as_ref().map(String::len)
+    }
+
+    /// True when what comes next is a redirection target: the current word
+    /// ends in an unquoted `>`, or the last word was a bare `>`.
+    fn at_target(&self) -> bool {
+        self.redir_next || self.ends_in_redir()
+    }
+
+    /// Starts a `$(...)` or backtick command of its own. A redirection to
+    /// it writes to a file.
     fn open_sub(&mut self) {
         let at_cmd = self.word.as_deref().is_none_or(str::is_empty)
             && self.cur.words.iter().all(|w| is_assignment(w));
+        self.cur.writes |= self.at_target();
+        let before = self.out.len();
         self.end_cmd();
-        self.subs.push((at_cmd, self.out.len()));
+        let outer = (!at_cmd && self.out.len() > before).then_some(before);
+        self.subs.push((at_cmd, self.out.len(), outer));
     }
 
     /// Ends a `$(...)` or backtick command. The outer command gets a word in
     /// its place: `dotonce` when it stands where the command word goes and
     /// names dotonce (`$(which dotonce) rules ...`), a stand-in otherwise.
+    /// The words after a stand-in in an argument join the outer command.
     fn close_sub(&mut self) {
         self.end_cmd();
-        if let Some((at_cmd, start)) = self.subs.pop() {
+        if let Some((at_cmd, start, outer)) = self.subs.pop() {
             let names = self
                 .out
                 .get(start..)
@@ -536,6 +574,7 @@ impl Lexer {
                 .any(|c| c.words.iter().any(|w| is_dotonce(w)));
             let word = if at_cmd && names { "dotonce" } else { "$()" };
             self.cur.words.push(word.to_string());
+            self.cur.joins = outer;
         }
     }
 
@@ -569,6 +608,7 @@ impl Lexer {
                 self.out
                     .extend(lex(&body, vec![Ctx::Body]).into_iter().map(|mut s| {
                         s.piped_from = s.piped_from.map(|p| p + offset);
+                        s.joins = s.joins.map(|j| j + offset);
                         s
                     }));
             }
@@ -611,7 +651,7 @@ fn read_delimiter(chars: &mut Peekable<Chars>) -> Option<(String, bool)> {
 /// one word, so text that only quotes a command never reads as running it;
 /// `$(...)` and backticks inside double quotes still run, so they start a
 /// command of their own.
-fn simple_commands(cmd: &str) -> Vec<Simple> {
+pub(crate) fn simple_commands(cmd: &str) -> Vec<Simple> {
     lex(cmd, Vec::new())
 }
 
@@ -659,6 +699,11 @@ fn lex(cmd: &str, mut stack: Vec<Ctx>) -> Vec<Simple> {
             '&' => {
                 chars.next_if_eq(&'&');
                 l.end_list();
+            }
+            // `>|` writes like `>`, so its `|` is not a pipe.
+            '|' if l.ends_in_redir() => {
+                l.push(c);
+                l.redir = l.word.as_ref().map(String::len);
             }
             '|' if chars.next_if_eq(&'|').is_some() => l.end_list(),
             '|' => {
@@ -740,17 +785,23 @@ fn is_dotonce(w: &str) -> bool {
 }
 
 /// True when a `dotonce` word has `rules` as its first word that is not an
-/// option, and a rule change right after it. Wherever `dotonce` stands it
+/// option, and one of `verbs` right after it. Wherever `dotonce` stands it
 /// can be run: by `sudo`, `xargs`, `script`, `nice`, `timeout` and the like.
-fn runs_change(words: &[String]) -> bool {
+fn runs_rules(words: &[String], verbs: &[&str]) -> bool {
     words.iter().enumerate().any(|(i, w)| {
         let mut rest = words[i + 1..].iter().skip_while(|w| w.starts_with('-'));
         is_dotonce(w)
             && rest.next().is_some_and(|w| w == "rules")
-            && rest
-                .next()
-                .is_some_and(|w| RULE_CHANGES.contains(&w.as_str()))
+            && rest.next().is_some_and(|w| verbs.contains(&w.as_str()))
     })
+}
+
+fn runs_change(words: &[String]) -> bool {
+    runs_rules(words, &RULE_CHANGES)
+}
+
+fn runs_new(words: &[String]) -> bool {
+    runs_rules(words, &STARTER)
 }
 
 fn base_name(w: &str) -> &str {
@@ -932,14 +983,22 @@ fn quoted_commands(words: &[String]) -> (Vec<String>, bool) {
     (cmds, stdin)
 }
 
-/// True when text names `dotonce`, `rules` and a rule change, in any order.
-fn names_change(text: &str) -> bool {
+/// True when text names `dotonce`, `rules` and one of `verbs`, in any order.
+fn names_rules(text: &str, verbs: &[&str]) -> bool {
     let words: Vec<&str> = text
         .split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
         .collect();
     words.contains(&"dotonce")
         && words.contains(&"rules")
-        && RULE_CHANGES.iter().any(|v| words.contains(v))
+        && verbs.iter().any(|v| words.contains(v))
+}
+
+fn names_change(text: &str) -> bool {
+    names_rules(text, &RULE_CHANGES)
+}
+
+fn names_new(text: &str) -> bool {
+    names_rules(text, &STARTER)
 }
 
 /// True when the command runs `dotonce rules` approve, level, off or pause.
@@ -949,6 +1008,13 @@ fn names_change(text: &str) -> bool {
 /// check covers that.
 fn runs_rule_change(cmd: &str) -> bool {
     changes_at(cmd, 0, &RULE_CHANGE)
+}
+
+/// True when the command runs `dotonce rules new`, which writes a starter
+/// into the rules folder that Claude then can't change or remove. Read like
+/// rule changes.
+fn writes_starter(cmd: &str) -> bool {
+    changes_at(cmd, 0, &RULE_NEW)
 }
 
 /// True when the command runs `claude plugin` to turn dotonce off: disable,
@@ -970,6 +1036,12 @@ struct Change {
 const RULE_CHANGE: Change = Change {
     runs: runs_change,
     names: names_change,
+    deep: ["dotonce", "rules"],
+};
+
+const RULE_NEW: Change = Change {
+    runs: runs_new,
+    names: names_new,
     deep: ["dotonce", "rules"],
 };
 
@@ -1016,17 +1088,26 @@ fn deny(reason: &str) -> String {
 }
 
 /// The always-on guard alone: a deny when the call would change rule files,
-/// approvals or rule commands, or turn the dotonce plugin off. It runs even
-/// in an ignored folder.
+/// approvals or rule commands, write a starter, or turn the dotonce plugin
+/// off. It runs even in an ignored folder.
 pub fn guard_call(v: &Value, cwd: &Path) -> Result<Option<String>> {
     let tool = str_field(v, "tool_name");
     let input = v.get("tool_input").cloned().unwrap_or(Value::Null);
-    if tool == "Bash" && turns_plugin_off(str_field(&input, "command")) {
+    let cmd = str_field(&input, "command");
+    if tool == "Bash" && turns_plugin_off(cmd) {
         return Ok(Some(deny(plugin::OFF_REASON)));
     }
     let home = home_dir()?;
     let user_home = std::env::var_os("HOME").map(PathBuf::from);
-    Ok(guard(tool, &input, cwd, &home, user_home.as_deref()).then(|| deny(GUARD_REASON)))
+    if !guard(tool, &input, cwd, &home, user_home.as_deref()) {
+        return Ok(None);
+    }
+    let reason = if tool == "Bash" && writes_starter(cmd) {
+        NEW_REASON
+    } else {
+        GUARD_REASON
+    };
+    Ok(Some(deny(reason)))
 }
 
 pub fn pre_tool(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
@@ -1541,6 +1622,133 @@ mod tests {
         }
         assert!(mentions("rm rules/a.toml", home, home, user));
         assert!(!mentions("cat rules/a.toml", home, home, user));
+    }
+
+    #[test]
+    fn commands_that_only_read_may_name_the_rules_and_guarded_files() {
+        let home = Path::new("/fake/sam/.dotonce");
+        let user = Some(Path::new("/fake/sam"));
+        let cwd = Path::new("/fake/sam/code");
+        for cmd in [
+            "ls ~/.dotonce/rules",
+            "ls -la /fake/sam/.dotonce/rules/",
+            "cat ~/.dotonce/rules/acme.toml",
+            "head -20 $HOME/.dotonce/rules/acme.toml",
+            "tail -n 5 ${HOME}/.dotonce/approvals.json",
+            "grep -n id ~/.dotonce/rules/*.toml",
+            "ls ~/.dotonce/r*",
+            "wc -l ~/.dotonce/rules/*.toml | tail -1",
+            "stat ~/.dotonce/chat.json",
+            "diff ~/.dotonce/rules/acme.toml /tmp/acme.toml",
+            "file ~/.dotonce/last-live.json",
+            "jq . ~/.dotonce/approvals.json 2>&1 | head",
+            "grep -c check ~/.dotonce/rules/acme.toml >&2",
+            "ls ~/.dotonce/rules 2>/dev/null || echo none",
+            "cd ~/.dotonce && ls rules && cat approvals.json",
+            "ls ~/.dotonce/rules; echo; cat ~/.dotonce/approvals.json",
+            "find ~/.dotonce/rules -name '*.toml'",
+            "find ~/.dotonce -type f",
+            "cat $(ls ~/.dotonce/rules/*.toml | head -1)",
+            "head -3 `ls ~/.dotonce/rules/*.toml` | grep id",
+            "grep level \"$(ls ~/.dotonce/rules/*.toml)\" /tmp/acme.toml",
+        ] {
+            assert!(!mentions(cmd, home, cwd, user), "{cmd}");
+            let input = json!({"command": cmd});
+            assert!(!guard("Bash", &input, cwd, home, user), "{cmd}");
+        }
+        assert!(!mentions("cat rules/acme.toml", home, home, user));
+    }
+
+    #[test]
+    fn writes_and_rule_changes_stay_denied_next_to_reads() {
+        let home = Path::new("/fake/sam/.dotonce");
+        let user = Some(Path::new("/fake/sam"));
+        let cwd = Path::new("/fake/sam/code");
+        for cmd in [
+            "mv ~/.dotonce/rules/acme.toml /tmp/",
+            "cp /tmp/acme.toml ~/.dotonce/rules/",
+            "rm ~/.dotonce/rules/acme.toml",
+            "sed -i '' s/warn/fix/ ~/.dotonce/rules/acme.toml",
+            "cat /tmp/acme.toml | tee ~/.dotonce/rules/acme.toml",
+            "vim ~/.dotonce/rules/acme.toml",
+            "nano ~/.dotonce/approvals.json",
+            "python3 -c 'print(1)' ~/.dotonce/rules/acme.toml",
+            "perl -pi -e s/warn/fix/ ~/.dotonce/rules/acme.toml",
+            "cat /tmp/acme.toml > ~/.dotonce/rules/acme.toml",
+            "cat ~/.dotonce/rules/acme.toml > /tmp/acme.toml",
+            "echo '{}' >> ~/.dotonce/approvals.json",
+            "cat /tmp/x >| ~/.dotonce/approvals.json",
+            "cat /tmp/x >&~/.dotonce/approvals.json",
+            "cat /tmp/x >& ~/.dotonce/approvals.json",
+            "cat /tmp/x >$(echo ~/.dotonce/approvals.json)",
+            "cat /tmp/x > \"$(echo ~/.dotonce/approvals.json)\"",
+            "cat /tmp/x > `echo ~/.dotonce/approvals.json`",
+            "cd ~/.dotonce/rules && cat /tmp/acme.toml >| cat",
+            "find ~/.dotonce/rules -name '*.toml' -delete",
+            "find ~/.dotonce/rules -exec rm {} +",
+            "find ~/.dotonce/rules -execdir rm {} ;",
+            "find ~/.dotonce/rules -ok rm {} ;",
+            "find ~/.dotonce/rules -fprint ~/.dotonce/rules/x",
+            "find ~/.dotonce/rules -de\"let\"e",
+            "find ~/.dotonce/rules ${X:--delete}",
+            "find ~/.dotonce/rules $(echo -delete)",
+            "find ~/.dotonce/rules {-delete,}",
+            "find $(echo ~/.dotonce/rules) -delete",
+            "file -C -m ~/.dotonce/rules/acme.toml",
+            "file --compile -m ~/.dotonce/rules/acme.toml",
+            "ls ~/.dotonce/rules && rm ~/.dotonce/rules/acme.toml",
+            "ls ~/.dotonce/rules | xargs rm",
+            "cat ~/.dotonce/rules/acme.toml | sh",
+            "cat $(rm ~/.dotonce/approvals.json)",
+            "ls `rm -rf ~/.dotonce/rules`",
+            "cat <(rm ~/.dotonce/approvals.json)",
+            "X=1 cat ~/.dotonce/rules/acme.toml",
+            "/tmp/cat ~/.dotonce/rules/acme.toml",
+            "for f in ~/.dotonce/rules/*; do rm $f; done",
+            "cat ~/.dotonce/rules/acme.toml; dotonce rules approve acme",
+            "echo dotonce rules approve acme ~/.dotonce/rules",
+        ] {
+            let input = json!({"command": cmd});
+            assert!(guard("Bash", &input, cwd, home, user), "{cmd}");
+        }
+        for cmd in [
+            "cd ~/.dotonce && cat /tmp/x >| approvals.json",
+            "cd ~/.dotonce && echo '{}' >&approvals.json",
+        ] {
+            assert!(mentions(cmd, home, cwd, user), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn rules_new_is_denied_where_it_runs() {
+        let home = Path::new("/fake/sam/.dotonce");
+        let user = Some(Path::new("/fake/sam"));
+        let cwd = Path::new("/fake/sam/code");
+        for cmd in [
+            "dotonce rules new acme",
+            "dotonce rules new acme --whole-reply",
+            "cd /tmp && ~/.cargo/bin/dotonce rules new acme",
+            "cargo run --bin dotonce -- rules new acme",
+            "sh -c 'dotonce rules new acme'",
+            "echo 'dotonce rules new acme' | bash",
+            "$(which dotonce) rules new acme",
+        ] {
+            assert!(writes_starter(cmd), "{cmd}");
+            assert!(!runs_rule_change(cmd), "{cmd}");
+            let input = json!({"command": cmd});
+            assert!(guard("Bash", &input, cwd, home, user), "{cmd}");
+        }
+        for cmd in [
+            "dotonce rules propose /tmp/acme.toml --ask --note 'Links go inline.'",
+            "dotonce rules list",
+            "dotonce rules test new /tmp/reply.md",
+            "grep -rn \"dotonce rules new\" src",
+            "git commit -m 'Explain dotonce rules new'",
+        ] {
+            assert!(!writes_starter(cmd), "{cmd}");
+            let input = json!({"command": cmd});
+            assert!(!guard("Bash", &input, cwd, home, user), "{cmd}");
+        }
     }
 
     #[cfg(unix)]

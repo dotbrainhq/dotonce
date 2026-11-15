@@ -3566,6 +3566,53 @@ fn guard_lets_searches_and_other_rule_commands_through() {
     std::fs::remove_dir_all(&h).unwrap();
 }
 
+const NEW_GUARD: &str = "dotonce: Claude can't run dotonce rules new. It writes a starter into the rules folder, and Claude can't change or remove files there. Write the rule set to a file outside the dotonce home, then run dotonce rules propose FILE --ask --note \"...\" for a rule from the user's correction, or dotonce rules propose FILE for any other set. Don't ask the user to run a command.";
+
+#[test]
+fn guard_denies_rules_new_and_lets_reads_of_the_rules_through() {
+    let h = home("guardreads");
+    let proj = h.join("proj");
+    std::fs::create_dir_all(h.join("dotonce/rules")).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+    let bash = |cmd: &str| serde_json::json!({"command": cmd});
+    for cmd in [
+        "dotonce rules new acme",
+        "cd /tmp && dotonce rules new acme --whole-reply",
+    ] {
+        assert_eq!(
+            pre(&h, &proj, "Bash", bash(cmd)).as_deref(),
+            Some(NEW_GUARD),
+            "{cmd}"
+        );
+    }
+    assert!(!h.join("dotonce/rules/acme.toml").exists());
+    for cmd in [
+        "ls ~/dotonce/rules",
+        "cat ~/dotonce/rules/acme.toml",
+        "grep -n id ~/dotonce/rules/*.toml | head -5",
+        "cd ~/dotonce && ls rules && cat approvals.json",
+        "find ~/dotonce/rules -name '*.toml'",
+        "cat $(ls ~/dotonce/rules/*.toml | head -1)",
+    ] {
+        assert_eq!(pre(&h, &proj, "Bash", bash(cmd)), None, "{cmd}");
+    }
+    for cmd in [
+        "mv ~/dotonce/rules/acme.toml /tmp/",
+        "cat /tmp/acme.toml > ~/dotonce/rules/acme.toml",
+        "cat /tmp/acme.toml >| ~/dotonce/rules/acme.toml",
+        "find ~/dotonce/rules -delete",
+        "ls ~/dotonce/rules | xargs rm",
+        "cat ~/dotonce/rules/acme.toml; dotonce rules approve acme",
+    ] {
+        assert_eq!(
+            pre(&h, &proj, "Bash", bash(cmd)).as_deref(),
+            Some(GUARD),
+            "{cmd}"
+        );
+    }
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
 #[test]
 fn guard_catches_plain_text_changes_to_the_home() {
     let h = home("guardplain");
