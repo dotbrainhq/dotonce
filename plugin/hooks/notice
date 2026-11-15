@@ -1,0 +1,23 @@
+#!/bin/sh
+# Tells the user at session start when the plugin's hooks can't run dotonce:
+# the binary is missing, or older than the plugin. Claude Code shows a
+# systemMessage to the user, not to Claude. Prints nothing when all is well.
+bin=$(command -v dotonce 2>/dev/null) || bin="${CARGO_HOME:-$HOME/.cargo}/bin/dotonce"
+say() {
+	printf '{"systemMessage": "%s"}\n' "$1"
+	exit 0
+}
+[ -x "$bin" ] || say "dotonce isn't installed, so its hooks are off. Install it from github.com/dotbrainhq/dotonce, then start a new session."
+root=$(cd "$(dirname "$0")/.." && pwd)
+want=$(sed -n 's/.*"version": *"\([0-9.]*\)".*/\1/p' "$root/.claude-plugin/plugin.json" | head -n 1)
+have=$("$bin" --version 2>/dev/null | awk '{ print $2 }')
+[ -n "$want" ] && [ -n "$have" ] || exit 0
+older=$(awk -v a="$have" -v b="$want" 'BEGIN {
+	split(a, x, "."); split(b, y, ".")
+	for (i = 1; i <= 3; i++) {
+		if (x[i] + 0 < y[i] + 0) { print 1; exit }
+		if (x[i] + 0 > y[i] + 0) exit
+	}
+}')
+[ -z "$older" ] || say "dotonce $have is older than its plugin ($want), so some hooks may not work. Update it, then start a new session."
+exit 0

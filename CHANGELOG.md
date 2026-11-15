@@ -6,8 +6,9 @@ Every release of dotonce is listed here. Versions follow semantic versioning.
 
 ### Added
 
-- A Claude Code plugin. `claude plugin marketplace add dotbrainhq/dotonce`, then `claude plugin install dotonce@dotonce`, adds all seven hooks, so nothing goes into settings.json by hand. The plugin runs the dotonce binary from your PATH or `~/.cargo/bin`, and does nothing until it's installed.
+- A Claude Code plugin. `claude plugin marketplace add dotbrainhq/dotonce`, then `claude plugin install dotonce@dotonce`, adds all seven hooks, so nothing goes into settings.json by hand. The plugin runs the dotonce binary from your PATH or `~/.cargo/bin`, and tells you at the start of each session when the binary is missing or older than the plugin.
 - `dotonce doctor` reads Claude Code's plugin list too. It names the plugin as the source of each hook, says when the plugin is installed but off, and warns when a hook runs twice because it's in the plugin and in a settings file.
+- The guard stops Claude from turning the dotonce plugin off: `claude plugin disable` or `uninstall` on dotonce, `disable --all`, and `marketplace remove dotonce`.
 - Rule sets turn on by themselves. A new rule file, or a set Claude proposes, starts log-only (`warn`): its checks note what they catch and change nothing. A set that catches the same slips in at least two sessions over its first week moves to `fix` by itself, and one whose corrected replies keep failing moves back to log-only. A level you set with `rules level` stays where you put it. Claude Code tells you about each change once, in a message only you see, with a four-digit code: send `no` and the code to undo it, within a week. Send `dotonce` to see what you can still undo.
 - Two kinds of change still wait for your OK: one Claude proposes to a set at `fix`, and one to a set you turned off. Send `yes` and the code to use it, or `no` and the code to drop it. Only hooks that Claude Code runs make changes or take a code: Claude running dotonce from its own shell gets none, and neither do runs without a person, like headless and SDK runs, where sets are approved from a terminal as before. The codes live in `~/.dotonce/chat.json`, which the guard keeps out of Claude's reach like approvals.
 - `dotonce rules propose FILE`: Claude can write a rule set and propose it. Every applied, replaced, undone or dropped file is kept in `~/.dotonce/proposals/done/`.
@@ -23,7 +24,6 @@ Every release of dotonce is listed here. Versions follow semantic versioning.
 - Speaker names are matched exactly, so a question that names a person finds the turn it asks about, not every turn that person wrote.
 - `dotonce bench-serve`, a JSON-lines server that keeps running on bad input.
 - Benchmark adapter, installer, smoke test, and comparison script for the agent-memory-benchmark runner.
-- The dotonce mark: the music repeat sign with one dot taken away, so it plays once.
 - Markdown fact files with frontmatter, in one or more store folders. An existing folder of notes, like a knowledge base, works as a store without copying.
 - `dotonce init`, `save`, `search`, `index`, and `hook-config`, with the index kept in sync with the files on every call.
 - Claude Code hooks: `dotonce hook prompt` adds the matching facts before each prompt, and `dotonce hook session-start` adds pinned facts at the start of a session and after compaction. A failing hook adds nothing and never stops Claude Code. Private facts only show inside the folders you list in the config, and facts saved from inside those folders are private by default.
