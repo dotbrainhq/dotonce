@@ -388,7 +388,6 @@ pub fn failing(set: &RuleSet, check: &Check, draft: &str, seen: &Seen) -> Option
 /// The line that breaks the check, cut for messages, or None when the text
 /// passes. `set` names the check's set when a pattern doesn't compile. A
 /// skill-loaded check needs the session, so it passes here: see `failing`.
-/// A model check passes too: the judge runs it at Stop (see judge.rs).
 pub fn failing_line(set: &str, check: &Check, text: &str) -> Option<String> {
     match &check.kind {
         CheckKind::Forbid(list) => list.iter().find_map(|p| find_phrase(text, p)).map(cut),
@@ -401,7 +400,7 @@ pub fn failing_line(set: &str, check: &Check, text: &str) -> Option<String> {
         CheckKind::RepeatOf { pattern, max } => repeat(text, usable(set, pattern)?, *max).map(cut),
         CheckKind::MaxParagraphs(max) => paragraphs(text).get(*max).copied().map(cut),
         CheckKind::MaxWords(max) => over_words(text, *max).map(cut),
-        CheckKind::SkillLoaded(_) | CheckKind::Model(_) => None,
+        CheckKind::SkillLoaded(_) => None,
     }
 }
 

@@ -5,11 +5,9 @@
 //! broken moves back to log-only. The user sees each change once, with a
 //! code that undoes it (see chat.rs).
 //!
-//! Three things still wait for the user: a proposal that would change a set
-//! at fix, which could weaken a check that is working, one for a set the
-//! user turned off, and a move to fix for a set with a model check. A wrong
-//! model catch that Claude "fixes" logs as fixed, so that set's numbers
-//! can't tell a right catch from a wrong one; doctor names it instead. Rule files are the user's own, since Claude can't
+//! Two things still wait for the user: a proposal that would change a set
+//! at fix, which could weaken a check that is working, and one for a set
+//! the user turned off. Rule files are the user's own, since Claude can't
 //! write them, so an edited one keeps its level.
 //!
 //! It runs only where the user sees its notice (`chat::interactive`), so
@@ -95,41 +93,8 @@ fn count(
     (n, sessions.len())
 }
 
-/// The catches and sessions that move a log-only set to fix, once it has
-/// been on `TRIAL_DAYS` since `since`. None before that or with too few.
-fn earned_fix(
-    log: &[Catch],
-    set: &str,
-    since: DateTime<Utc>,
-    now: DateTime<Utc>,
-) -> Option<(usize, usize)> {
-    if now - since < Duration::days(TRIAL_DAYS) {
-        return None;
-    }
-    let (catches, sessions) = count(log, set, Outcome::Caught, since, now, CATCH_DAYS);
-    (catches >= MIN_CATCHES && sessions >= MIN_SESSIONS).then_some((catches, sessions))
-}
-
-/// A log-only set with a model check that has the catches a move to fix
-/// needs, and those counts. The autopilot leaves it at log-only for the
-/// user to move.
-pub fn ready_for_fix(
-    a: &Approvals,
-    set: &RuleSet,
-    log: &[Catch],
-    now: DateTime<Utc>,
-) -> Option<(usize, usize)> {
-    if !set.has_model_check() || a.state(set) != State::On(Level::Warn) {
-        return None;
-    }
-    let r = a.sets.get(&set.id).filter(|r| !r.pinned)?;
-    let since = parse_time(&r.changed).or_else(|| parse_time(&r.approved))?;
-    earned_fix(log, &set.id, since, now)
-}
-
 /// Moves sets between log-only and fix on what the catch log shows, and
-/// returns each move. Pinned sets and sets in `skip` stay as they are, and
-/// a set with a model check never moves to fix by itself.
+/// returns each move. Pinned sets and sets in `skip` stay as they are.
 pub fn review(
     a: &mut Approvals,
     sets: &[RuleSet],
@@ -153,8 +118,10 @@ pub fn review(
             continue;
         }
         match level {
-            Level::Warn if !set.has_model_check() => {
-                if let Some((catches, sessions)) = earned_fix(log, &set.id, since, now) {
+            Level::Warn if now - since >= Duration::days(TRIAL_DAYS) => {
+                let (catches, sessions) =
+                    count(log, &set.id, Outcome::Caught, since, now, CATCH_DAYS);
+                if catches >= MIN_CATCHES && sessions >= MIN_SESSIONS {
                     r.level = Level::Fix;
                     r.promoted.clone_from(&stamp);
                     r.changed.clone_from(&stamp);
@@ -386,29 +353,6 @@ mod tests {
         let skip = BTreeSet::from(["acme".to_string()]);
         assert!(review(&mut a.clone(), &sets, &recent, now, &skip).is_empty());
         assert_eq!(review(&mut a, &sets, &recent, now, &none).len(), 1);
-    }
-
-    #[test]
-    fn a_set_with_a_model_check_waits_for_the_user_to_move_it() {
-        let src = "id = \"acme\"\n[draft]\nfence = [\"\"]\n[[check]]\nid = \"c\"\nkind = \"model\"\nask = \"Answers every question.\"\nwhy = \"w\"\n";
-        let s = rules::parse(src, Path::new("/r/acme.toml")).unwrap();
-        let sets = vec![s.clone()];
-        let mut a = Approvals::default();
-        a.adopt(&s, Level::Warn, "2026-11-01T00:00:00Z");
-        let log = vec![
-            catch("acme", "s1", "2026-11-05T00:00:00Z", Outcome::Caught),
-            catch("acme", "s1", "2026-11-06T00:00:00Z", Outcome::Caught),
-            catch("acme", "s2", "2026-11-07T00:00:00Z", Outcome::Caught),
-        ];
-        let now = at("2026-11-08T00:00:00Z");
-        assert!(review(&mut a, &sets, &log, now, &BTreeSet::new()).is_empty());
-        assert_eq!(a.state(&s), State::On(Level::Warn));
-        assert_eq!(ready_for_fix(&a, &s, &log, now), Some((3, 2)));
-        assert_eq!(
-            ready_for_fix(&a, &s, &log, at("2026-11-07T01:00:00Z")),
-            None
-        );
-        assert_eq!(ready_for_fix(&a, &set("acme"), &log, now), None);
     }
 
     #[test]

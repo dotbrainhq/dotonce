@@ -11,7 +11,6 @@ pub mod facts;
 pub mod fuse;
 pub mod hook;
 pub mod index;
-pub mod judge;
 pub mod model;
 pub mod names;
 pub mod plugin;
