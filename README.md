@@ -300,6 +300,19 @@ Send `no 4821` to undo the change, any time in the next week. dotonce does the s
 
 Claude can write a rule set and run `dotonce rules propose FILE`. A new set, or a change to a set at `warn` or `remind`, goes on at the end of that turn, with the same kind of message. A change to a set at `fix`, or to one you turned off, waits for you instead: send `yes` and the code to use it, or `no` and the code to drop it. Every file that was applied, replaced, undone or dropped is kept in `~/.dotonce/proposals/done/`.
 
+When your prompt reads like a correction of Claude's last reply, dotonce asks Claude to fix what you asked first, then propose a rule set that would catch the same mistake, if a pattern can. Claude proposes it with `dotonce rules propose FILE --ask --note "..."`, and that set waits for your yes instead of going on by itself:
+
+```
+acme-links (a rule from your correction): turns on at fix, 1 check.
+  - inline-links: Links go inline as anchor text.
+  Scope: ~/acme.
+  Last 14 days: 4 hits in 2 sessions, in ~/acme (4).
+  Claude's note: You asked for links as anchor text, not pasted URLs.
+  Send yes 4821 to turn it on at fix, or no 4821 to drop it.
+```
+
+Send `yes` and the code to turn it on at `fix`, or at the file's own `level` if it names one. You get a code that undoes it for a week. Send `no` and the code to drop it. With no answer, it goes after 7 days. The note never comes on the first prompt of a session, or in headless and SDK runs.
+
 The codes only work when Claude Code itself runs the hook. Claude running dotonce from its own shell gets no code, and headless and SDK runs change nothing. There, and in tools without Claude Code's hooks, turn sets on from a terminal:
 
 ```
