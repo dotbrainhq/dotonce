@@ -155,7 +155,17 @@ const BLOCK_TAGS: &[&str] = &[
     "ci-monitor-event",
 ];
 
-const DICT: &str = "/usr/share/dict/words";
+/// Where systems keep a word list: macOS, then Debian and Ubuntu with a
+/// words package.
+const WORD_LISTS: [&str; 3] = [
+    "/usr/share/dict/words",
+    "/usr/share/dict/american-english",
+    "/usr/share/dict/british-english",
+];
+
+fn system_words() -> Option<String> {
+    WORD_LISTS.iter().find_map(|p| fs::read_to_string(p).ok())
+}
 
 struct Lexicon {
     words: BTreeSet<&'static str>,
@@ -298,13 +308,16 @@ fn near_word(tok: &str) -> Option<&'static str> {
         .map(|(_, w)| *w)
 }
 
-/// Drops from `near` every word the system dictionary has, in one read of
-/// it, and only when some word may be a typo.
-fn keep_typos(near: &mut HashMap<&str, &'static str>) {
+/// Drops from `near` every word the word list has, read once and only when
+/// some word may be a typo. With no word list it drops them all: a real
+/// word one letter off a lexicon word, like "ship" for "skip", would
+/// otherwise read as a typo.
+fn keep_typos(near: &mut HashMap<&str, &'static str>, words: impl FnOnce() -> Option<String>) {
     if near.is_empty() {
         return;
     }
-    let Ok(dict) = fs::read_to_string(DICT) else {
+    let Some(dict) = words() else {
+        near.clear();
         return;
     };
     // One search for every word at once, as a whole line, is far quicker
@@ -331,6 +344,10 @@ fn keep_typos(near: &mut HashMap<&str, &'static str>) {
 /// The text as the patterns read it: lowercase words joined by single
 /// spaces, with typos mapped to lexicon words.
 pub fn normalize(s: &str) -> String {
+    normalize_with(s, system_words)
+}
+
+fn normalize_with(s: &str, words: impl FnOnce() -> Option<String>) -> String {
     let lower = s.to_lowercase().replace('\u{2019}', "'");
     let glued = SPLIT_RE.replace_all(&lower, "${1}re");
     let toks: Vec<&str> = WORD.find_iter(&glued).map(|m| m.as_str()).collect();
@@ -342,7 +359,7 @@ pub fn normalize(s: &str) -> String {
             near.insert(t, w);
         }
     }
-    keep_typos(&mut near);
+    keep_typos(&mut near, words);
     toks.iter()
         .map(|t| near.get(t).copied().unwrap_or(t))
         .collect::<Vec<_>>()
@@ -498,14 +515,33 @@ mod tests {
         }
     }
 
+    /// A small word list, so the tests read the same on every system.
+    fn words() -> Option<String> {
+        Some("the\nrules\nship\nShip\nYou\n".to_string())
+    }
+
     #[test]
     fn typos_map_to_the_word_they_miss() {
-        assert_eq!(normalize("teh rules"), "the rules");
-        assert_eq!(normalize("you shoudlnt chekc"), "you shouldn't check");
-        assert_eq!(normalize("udnerstand"), "understand");
+        assert_eq!(normalize_with("teh rules", words), "the rules");
+        assert_eq!(
+            normalize_with("you shoudlnt chekc", words),
+            "you shouldn't check"
+        );
+        assert_eq!(normalize_with("udnerstand", words), "understand");
         // "youa re" style splits glue back on.
-        assert_eq!(normalize("youa re"), "you're");
-        assert!(hits("why did yuo do that").contains(&"why"));
+        assert_eq!(normalize_with("youa re", words), "you're");
+        assert_eq!(
+            normalize_with("why did yuo do that", words),
+            "why did you do that"
+        );
+    }
+
+    #[test]
+    fn a_word_in_the_word_list_or_with_no_list_is_not_a_typo() {
+        // A list without "ship" leaves it one letter off "skip".
+        assert_ne!(normalize_with("ship it", || Some(String::new())), "ship it");
+        assert_eq!(normalize_with("ship it", words), "ship it");
+        assert_eq!(normalize_with("teh ship", || None), "teh ship");
     }
 
     #[test]
