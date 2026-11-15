@@ -19,6 +19,9 @@ Every release of dotonce is listed here. Versions follow semantic versioning.
 - `dotonce rules propose FILE`: Claude can write a rule set and propose it. Every applied, replaced, undone or dropped file is kept in `~/.dotonce/proposals/done/`.
 - A starter from `dotonce rules new` stays off until you edit it, so its examples never run.
 - When Claude tries to change a rule file, the guard now tells it to propose the set instead of asking you to run a command.
+- The guard stops Claude from running `dotonce rules new`, which left a starter in the rules folder that Claude couldn't change or remove. The reason points it to `dotonce rules propose FILE --ask --note "..."`.
+- A Bash command that only reads can name the rules folder and the guarded files: `ls`, `cat`, `head`, `grep`, `wc`, `diff` and a few more readers, with no output to a file. `find` with `-delete`, `-exec` or another action, and `file -C`, don't count as reads.
+- The guard reads `>|`, `>&file` and a `$(...)` redirect target as writes to a file.
 - An `aliases:` frontmatter list and `dotonce save --aliases`: other names for a fact's topic, matched like its title. The line on how to save a fact asks for at most three short ones and no general words.
 - `ignore_paths` in the config: inside those folders the hooks add nothing, check nothing and change nothing. The guard that keeps rule files out of Claude's reach still runs there.
 - `dotonce init` and `dotonce doctor` print the line to add to your shell config when dotonce's folder isn't on your PATH. They never edit a shell file.
