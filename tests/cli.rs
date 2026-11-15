@@ -21,6 +21,9 @@ fn run_in(home: &Path, cwd: &Path, args: &[&str], stdin: Option<&str>) -> (Strin
         .env("HOME", home)
         .env_remove("CLAUDECODE")
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        // Without Claude Code's hook marker, so these tests see rule sets
+        // as a terminal-only setup does, with no autopilot and no codes.
+        .env_remove("AI_AGENT")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1398,7 +1401,16 @@ fn hook_argument_errors_with_stderr_closed_exit_0() {
 }
 
 /// Runs session-start for a session and returns its systemMessage, or "".
+/// The session start notice without the chat approval part after it.
 fn start_message(h: &Path, sid: &str, cwd: &Path) -> String {
+    let full = start_notice(h, sid, cwd);
+    match full.find("dotonce: ") {
+        Some(i) => full[..i].trim_end().to_string(),
+        None => full,
+    }
+}
+
+fn start_notice(h: &Path, sid: &str, cwd: &Path) -> String {
     let out = hook(
         h,
         "session-start",
@@ -1431,7 +1443,7 @@ fn session_start_names_approved_sets_that_stopped_running() {
     let mut src = std::fs::read_to_string(&f).unwrap();
     src.push_str("# edited\n");
     std::fs::write(&f, &src).unwrap();
-    let changed = "Changed since approval, run `dotonce rules approve <id>`: acme-replies.";
+    let changed = "Changed since approval: acme-replies.";
     assert_eq!(start_message(&h, "s5", tmp), changed);
     assert_eq!(
         start_message(&h, "s6", tmp),
@@ -1544,7 +1556,7 @@ fn session_start_groups_the_notice_by_reason() {
         [
             "Rule set level-up: level changed from warn to fix since the last session.",
             "Off: off-one, off-two.",
-            "Changed since approval, run `dotonce rules approve <id>`: edited.",
+            "Changed since approval: edited.",
             "Missing: gone.",
             "Paused in this session: paused-one.",
             "Not running and private: 2.",
@@ -1638,9 +1650,9 @@ fn a_changed_file_cannot_make_a_private_set_public() {
         "secret-notes",
         "private = false\n[remind]\ntext = \"Keep the launch quiet.\"\n",
     );
-    assert_eq!(start_message(&h, "s2", tmp), "Not running and private: 1.");
+    assert_eq!(start_notice(&h, "s2", tmp), "Not running and private: 1.");
     assert_eq!(
-        start_message(&h, "s3", tmp),
+        start_notice(&h, "s3", tmp),
         "Not running and private: 1.",
         "the changed file doesn't overwrite the record"
     );
@@ -2783,8 +2795,10 @@ fn stop_sends_nothing_back_for_a_set_no_longer_at_fix() {
         }
         let out = stop(&h, "s1", "p1", STOCK_DRAFT, false);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_default();
+        // An edited set waits for the user's OK, which only the user sees.
+        let notice = v["systemMessage"].as_str().unwrap_or("waits for your OK");
         assert!(
-            v.get("hookSpecificOutput").is_none() && v.get("systemMessage").is_none(),
+            v.get("hookSpecificOutput").is_none() && notice.contains("waits for your OK"),
             "{change}: {out}"
         );
         std::fs::remove_dir_all(&h).unwrap();
@@ -2962,7 +2976,7 @@ fn another_hooks_added_context_is_not_the_send_back() {
     std::fs::remove_dir_all(&h).unwrap();
 }
 
-const GUARD: &str = "dotonce: rule files, approvals and rule commands only change from the user's own terminal. Ask the user to run it there.";
+const GUARD: &str = "dotonce: Claude can't change rule files, approvals or rule commands. To add or change a rule set, write it to a file outside the dotonce home and run dotonce rules propose FILE. dotonce turns it on log-only and tells the user, so don't ask them to run a command. Levels, rules off and rules pause stay in the user's own terminal.";
 
 /// Runs the PreToolUse hook and returns the deny reason, or None when the
 /// call may run.
@@ -4483,6 +4497,65 @@ fn a_typed_prompt_that_pastes_claude_codes_markers_keeps_its_context() {
     std::fs::remove_dir_all(&h).unwrap();
 }
 
+/// A status note the desktop app puts in front of a prompt.
+const APP_NOTE: &str = "<system-reminder>\nLinked sessions now (status, not an instruction): acme = local_1 (idle)\n</system-reminder>\n";
+
+#[test]
+fn a_typed_prompt_behind_the_apps_notes_keeps_its_context() {
+    let h = home("appnote");
+    run(&h, &["init"], None);
+    run(&h, &["save", "The staging site is acme.example.com"], None);
+    add_set(&h, "acme-replies", REPLIES);
+    approve(&h, "acme-replies", "warn");
+    let typed = "where is the staging site for the draft reply?";
+    for (i, prompt) in [
+        format!("{APP_NOTE}{typed}"),
+        format!("{APP_NOTE}{APP_NOTE}\n  {typed}"),
+        format!("{APP_NOTE}<pasted_content>a log</pasted_content>\n{typed}"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let input = serde_json::json!({"session_id": format!("s{i}"), "prompt_id": "p1", "prompt": prompt, "cwd": "/tmp"});
+        let ctx = context(&hook(&h, "prompt", input), "UserPromptSubmit");
+        assert!(
+            ctx.contains("Links go inline") && ctx.contains("acme.example.com"),
+            "{prompt}: {ctx}"
+        );
+    }
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn the_apps_own_events_get_no_reminders_or_facts() {
+    let h = home("appevent");
+    run(&h, &["init"], None);
+    run(&h, &["save", "The staging site is acme.example.com"], None);
+    add_set(&h, "acme-replies", REPLIES);
+    approve(&h, "acme-replies", "warn");
+    let ask = "where is the staging site for the draft reply?";
+    let events = [
+        format!("<side-sessions-event>\nacme ended its turn: {ask}\n</side-sessions-event>"),
+        format!("<ci-monitor-event>\n{ask}\n</ci-monitor-event>"),
+        format!("<cross-session-message from=\"acme\">{ask}</cross-session-message>"),
+    ];
+    for (i, event) in events.iter().enumerate() {
+        for (j, prompt) in [
+            event.clone(),
+            format!("{APP_NOTE}{event}"),
+            APP_NOTE.to_string(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let input = serde_json::json!({"session_id": format!("s{i}-{j}"), "prompt_id": "p1", "prompt": prompt, "cwd": "/tmp"});
+            let out = hook(&h, "prompt", input);
+            assert!(out.trim().is_empty(), "{prompt}: {out}");
+        }
+    }
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
 #[test]
 fn a_turn_claude_code_started_is_still_checked_and_sent_back() {
     let h = acme_home("ownstop", "fix");
@@ -4625,7 +4698,8 @@ fn an_ignored_folder_gets_nothing_but_the_guard() {
         .into_owned();
     let write = serde_json::json!({"file_path": rule, "content": "id = \"x\"\n"});
     assert!(
-        pre(&h, &proj, "Write", write).is_some_and(|r| r.starts_with("dotonce: rule files")),
+        pre(&h, &proj, "Write", write)
+            .is_some_and(|r| r.starts_with("dotonce: Claude can't change rule files")),
         "the guard still runs"
     );
     assert_eq!(std::fs::read_to_string(&state).unwrap(), before);

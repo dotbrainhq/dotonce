@@ -566,7 +566,8 @@ pub fn load_checked() -> Result<Loaded> {
 }
 
 const STARTER: &str = r##"# dotonce rule set. See the README, "Rules and reply checks".
-# A set does nothing until you approve it in a terminal: dotonce rules approve SET_ID
+# dotonce turns the set on by itself once you edit this file. It starts log-only
+# (warn) and moves to fix when its checks keep catching the same slips.
 id = "SET_ID"
 # remind: only add the reminder. warn: also run the checks and log what fails.
 # fix: also send a failing draft back once, and deny a tool call that fails.
@@ -640,6 +641,11 @@ why = "Under 300 words."
 const DRAFT_TABLE: &str = "# Drafts are fenced blocks with these info strings, like ```markdown.\n# \"\" means a fence with no info string. Drop this table to check whole\n# replies instead.\n[draft]\nfence = [\"markdown\", \"draft\"]\n";
 
 const WHOLE_TABLE: &str = "# No [draft] table, so the checks read the whole reply. To check only\n# fenced drafts, add:\n# [draft]\n# fence = [\"markdown\", \"draft\"]\n";
+
+/// Whether the set's file is still the starter `rules new` wrote, unedited.
+pub fn is_starter(set: &RuleSet) -> bool {
+    set.src == starter(&set.id, false) || set.src == starter(&set.id, true)
+}
 
 /// A commented starter file with one example of each check kind.
 pub fn starter(id: &str, whole: bool) -> String {

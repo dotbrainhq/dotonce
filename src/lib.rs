@@ -1,5 +1,7 @@
 pub mod approvals;
+pub mod autopilot;
 pub mod catches;
+pub mod chat;
 pub mod checks;
 pub mod commands;
 pub mod config;

@@ -235,6 +235,22 @@ fn now_text() -> String {
     chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
+pub fn rules_propose(file: &Path) -> Result<()> {
+    let set = crate::chat::propose(file)?;
+    let n = set.checks.len();
+    println!(
+        "Proposed {}: {n} check{}.",
+        printable(&set.id),
+        if n == 1 { "" } else { "s" }
+    );
+    println!(
+        "dotonce turns it on log-only at the end of this turn and tells the user. A change to a \
+         set at fix, or one the user turned off, waits for the user's OK in the chat instead. \
+         Don't ask them to run a command."
+    );
+    Ok(())
+}
+
 pub fn rules_approve(id: &str) -> Result<()> {
     approvals::refuse_agent()?;
     let set = find_set(id)?;

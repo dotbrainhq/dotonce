@@ -6,6 +6,11 @@ Every release of dotonce is listed here. Versions follow semantic versioning.
 
 ### Added
 
+- Rule sets turn on by themselves. A new rule file, or a set Claude proposes, starts log-only (`warn`): its checks note what they catch and change nothing. A set that catches the same slips in at least two sessions over its first week moves to `fix` by itself, and one whose corrected replies keep failing moves back to log-only. A level you set with `rules level` stays where you put it. Claude Code tells you about each change once, in a message only you see, with a four-digit code: send `no` and the code to undo it, within a week. Send `dotonce` to see what you can still undo.
+- Two kinds of change still wait for your OK: one Claude proposes to a set at `fix`, and one to a set you turned off. Send `yes` and the code to use it, or `no` and the code to drop it. Only hooks that Claude Code runs make changes or take a code: Claude running dotonce from its own shell gets none, and neither do runs without a person, like headless and SDK runs, where sets are approved from a terminal as before. The codes live in `~/.dotonce/chat.json`, which the guard keeps out of Claude's reach like approvals.
+- `dotonce rules propose FILE`: Claude can write a rule set and propose it. Every applied, replaced, undone or dropped file is kept in `~/.dotonce/proposals/done/`.
+- A starter from `dotonce rules new` stays off until you edit it, so its examples never run.
+- When Claude tries to change a rule file, the guard now tells it to propose the set instead of asking you to run a command.
 - An `aliases:` frontmatter list and `dotonce save --aliases`: other names for a fact's topic, matched like its title. The save hint in each facts block asks for at most three short ones and no general words.
 - `ignore_paths` in the config: inside those folders the hooks add nothing, check nothing and change nothing. The guard that keeps rule files out of Claude's reach still runs there.
 - `dotonce init` and `dotonce doctor` print the line to add to your shell config when dotonce's folder isn't on your PATH. They never edit a shell file.
@@ -39,6 +44,7 @@ Every release of dotonce is listed here. Versions follow semantic versioning.
 
 - A short status message, like "done, next batch", stops pulling in facts that share only common words with it.
 - Hooks ignore Claude Code's own messages (task notifications, agent reports, system reminders), so they add no facts or reminders there. Only a prompt that starts with one counts, so a prompt you type that pastes one keeps its facts and reminders. Reply checks still run in those turns.
+- A prompt you type keeps its facts and reminders when the desktop app puts a note in front of it, such as a status line about linked sessions. Only the typed words are matched. The app's own events (side-session, CI and cross-session messages) get none, alone or behind a note.
 - A rule set's reminder comes once per session, and again after compaction or when its file changes, instead of on every turn.
 - Prompt-word triggers read only text the user typed, and a trigger of several words matches only as the whole phrase.
 - A hook could panic while writing to a stderr that Claude Code had closed. The hook path never writes to stderr now, even for bad arguments.

@@ -22,14 +22,21 @@ const MAX_LOGGED: usize = 200;
 const PASTE_OPEN: &str = "<pasted_content";
 const PASTE_CLOSE: &str = "</pasted_content";
 /// Marks of a prompt Claude Code sends itself: a background task's notice, a
-/// subagent's hand-back, a message from another agent, a system notice.
-const FROM_CLAUDE_CODE: [&str; 5] = [
+/// subagent's hand-back, a message from another agent or session, a system
+/// notice, and the desktop app's events.
+const FROM_CLAUDE_CODE: [&str; 7] = [
     "<task-notification>",
     "[Subagent hand-back]",
     "<agent-message",
+    "<cross-session-message",
     "[SYSTEM NOTIFICATION",
-    "<system-reminder>",
+    "<side-sessions-event>",
+    "<ci-monitor-event>",
 ];
+/// The desktop app can put these blocks in front of a prompt the user typed,
+/// such as a status line about linked sessions.
+const NOTE_OPEN: &str = "<system-reminder>";
+const NOTE_CLOSE: &str = "</system-reminder>";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -306,13 +313,21 @@ pub fn typed_text(prompt: &str) -> String {
     out
 }
 
-/// Whether the prompt is one Claude Code sent itself rather than the user,
-/// such as a task notification. Such a prompt turns nothing on. Only a
-/// prompt that opens with a mark counts: one the user typed can paste or
-/// quote a mark further down.
-pub fn from_claude_code(prompt: &str) -> bool {
-    let start = prompt.trim_start();
-    FROM_CLAUDE_CODE.iter().any(|m| start.starts_with(m))
+/// The part of the prompt the user typed, after any notes the app put in
+/// front, or None when Claude Code sent the prompt itself, such as a task
+/// notification or a prompt that is only notes. Such a prompt turns nothing
+/// on. Only a mark at the start counts: one the user typed can paste or
+/// quote a mark further down. A note with no end is the app's too.
+pub fn typed_prompt(prompt: &str) -> Option<&str> {
+    let mut rest = prompt.trim_start();
+    let mut noted = false;
+    while let Some(after) = rest.strip_prefix(NOTE_OPEN) {
+        let end = after.find(NOTE_CLOSE)?;
+        rest = after[end + NOTE_CLOSE.len()..].trim_start();
+        noted = true;
+    }
+    let from_app = FROM_CLAUDE_CODE.iter().any(|m| rest.starts_with(m));
+    (!from_app && !(noted && rest.is_empty())).then_some(rest)
 }
 
 fn words(s: &str) -> Vec<String> {
@@ -758,22 +773,58 @@ mod tests {
             "<task-notification>\n<status>completed</status>\n</task-notification>",
             "[Subagent hand-back] the acme review is done",
             "<agent-message from=\"acme\">hi</agent-message>",
+            "<cross-session-message from=\"acme\">hi</cross-session-message>",
             "[SYSTEM NOTIFICATION - acme]",
+            "<side-sessions-event>acme ended its turn</side-sessions-event>",
+            "<ci-monitor-event>checks passed</ci-monitor-event>",
             "<system-reminder>x</system-reminder>",
+            "<system-reminder>x</system-reminder>\n<system-reminder>y</system-reminder>\n",
+            "<system-reminder>x</system-reminder>\n<side-sessions-event>z</side-sessions-event>",
+            "<system-reminder>x with no end, then words",
             "\n  \t<task-notification>\n</task-notification>",
         ] {
-            assert!(from_claude_code(p), "{p}");
+            assert_eq!(typed_prompt(p), None, "{p}");
         }
-        for p in [
-            "did the task notification reach acme?",
-            "see this\n<system-reminder>x</system-reminder>",
-            "what is this?\n```\n<system-reminder>x</system-reminder>\n```",
-            "```\n<task-notification>\n</task-notification>\n```\nwhy did it stop?",
-            "<pasted_content id=\"1\"><system-reminder>x</system-reminder></pasted_content>",
-            "> <agent-message from=\"acme\">hi</agent-message>\nwho sent this?",
-            "the log says [Subagent hand-back] twice",
+        for (p, typed) in [
+            (
+                "did the task notification reach acme?",
+                "did the task notification reach acme?",
+            ),
+            ("<system-reminder>x</system-reminder>\nship it", "ship it"),
+            (
+                "<system-reminder>x</system-reminder>\n<system-reminder>y</system-reminder>\n  ship it",
+                "ship it",
+            ),
+            (
+                "<system-reminder>x</system-reminder><pasted_content>a</pasted_content> why?",
+                "<pasted_content>a</pasted_content> why?",
+            ),
+            (
+                "see this\n<system-reminder>x</system-reminder>",
+                "see this\n<system-reminder>x</system-reminder>",
+            ),
+            (
+                "what is this?\n```\n<system-reminder>x</system-reminder>\n```",
+                "what is this?\n```\n<system-reminder>x</system-reminder>\n```",
+            ),
+            (
+                "```\n<task-notification>\n</task-notification>\n```\nwhy did it stop?",
+                "```\n<task-notification>\n</task-notification>\n```\nwhy did it stop?",
+            ),
+            (
+                "<pasted_content id=\"1\"><system-reminder>x</system-reminder></pasted_content>",
+                "<pasted_content id=\"1\"><system-reminder>x</system-reminder></pasted_content>",
+            ),
+            (
+                "> <agent-message from=\"acme\">hi</agent-message>\nwho sent this?",
+                "> <agent-message from=\"acme\">hi</agent-message>\nwho sent this?",
+            ),
+            (
+                "the log says [Subagent hand-back] twice",
+                "the log says [Subagent hand-back] twice",
+            ),
         ] {
-            assert!(!from_claude_code(p), "{p}");
+            assert_eq!(typed_prompt(p), Some(typed), "{p}");
         }
     }
 
