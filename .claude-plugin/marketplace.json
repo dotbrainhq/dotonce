@@ -1,0 +1,16 @@
+{
+  "name": "dotonce",
+  "owner": {
+    "name": "Dotbrain LLC"
+  },
+  "metadata": {
+    "description": "Memory and mistake checks for AI coding agents. Correct your agent once."
+  },
+  "plugins": [
+    {
+      "name": "dotonce",
+      "source": "./plugin",
+      "description": "Memory and mistake checks for AI coding agents. Correct your agent once."
+    }
+  ]
+}

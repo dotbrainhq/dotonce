@@ -21,6 +21,7 @@ fn run_in(home: &Path, cwd: &Path, args: &[&str], stdin: Option<&str>) -> (Strin
         .env("HOME", home)
         .env_remove("CLAUDECODE")
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        .env_remove("CLAUDE_PLUGIN_ROOT")
         // Without Claude Code's hook marker, so these tests see rule sets
         // as a terminal-only setup does, with no autopilot and no codes.
         .env_remove("AI_AGENT")
@@ -2940,6 +2941,57 @@ fn display_labels_only_when_dotonce_runs_at_stop() {
         show_draft(&h, &h, "s1", "p1", "m2"),
         labeled(),
         "the settings are read again at each call"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn display_labels_when_the_plugin_runs_dotonce_at_stop() {
+    let h = acme_home("displayplugin", "fix");
+    for sid in ["s1", "s2", "s3"] {
+        use_skill(&h, sid, "p1");
+    }
+    let show = |sid: &str, root: &Path| {
+        let input = serde_json::json!({"session_id": sid, "prompt_id": "p1", "message_id": "m1", "index": 0, "final": true, "delta": STOCK_DRAFT, "cwd": h});
+        let root = root.to_string_lossy();
+        let (out, err, ok) = run_env(
+            &h,
+            &h,
+            &["hook", "display"],
+            Some(&input.to_string()),
+            &[("CLAUDE_PLUGIN_ROOT", &root)],
+        );
+        assert!(ok, "{err}");
+        let v: serde_json::Value = serde_json::from_str(&out).ok()?;
+        v["hookSpecificOutput"]["displayContent"]
+            .as_str()
+            .map(String::from)
+    };
+    let plugin = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin");
+    assert_eq!(
+        show("s1", &plugin),
+        labeled(),
+        "no Stop hook in settings, but the plugin that runs display has one"
+    );
+    let other = h.join("other-plugin");
+    std::fs::create_dir_all(other.join("hooks")).unwrap();
+    let hooks = serde_json::json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/opt/acme/bin/notify stop"}]}]}});
+    std::fs::write(other.join("hooks/hooks.json"), hooks.to_string()).unwrap();
+    assert_eq!(
+        show("s2", &other),
+        None,
+        "another plugin's Stop hook doesn't count"
+    );
+    std::fs::create_dir_all(h.join(".claude")).unwrap();
+    std::fs::write(
+        h.join(".claude/settings.json"),
+        r#"{"disableAllHooks": true}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        show("s3", &plugin),
+        None,
+        "settings that turn every hook off win"
     );
     std::fs::remove_dir_all(&h).unwrap();
 }

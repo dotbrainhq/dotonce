@@ -15,6 +15,7 @@ use crate::catches;
 use crate::checks::{self, Failure};
 use crate::config;
 use crate::hook;
+use crate::plugin;
 use crate::retrieve::estimate_tokens;
 use crate::rules::{self, FileError, Level, Loaded, RuleSet, printable};
 use crate::session::{self, Event, State, Trigger};
@@ -571,8 +572,9 @@ fn home_overrides(files: &[PathBuf]) -> Vec<String> {
     out
 }
 
-/// Reads the settings files Claude Code merges hooks from (never writes
-/// them) and lists the dotonce hooks that are there and missing.
+/// Reads the settings files Claude Code merges hooks from and its list of
+/// installed plugins (never writes them), and lists the dotonce hooks that
+/// are there, missing, or run twice.
 pub fn doctor() -> Result<()> {
     let user = config::expand("~/.claude/settings.json");
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -603,27 +605,75 @@ pub fn doctor() -> Result<()> {
             ),
         }
     }
+    let plugins = plugin::installed(&parsed, &cwd);
+    let on: Vec<&plugin::Plugin> = plugins.iter().filter(|p| p.on).collect();
     let mut missing = 0;
+    let mut twice = 0;
+    let mut twice_files = BTreeSet::new();
     for &(event, arg, matcher) in hook::HOOKS {
-        match parsed
+        let from_plugins: Vec<String> = on
+            .iter()
+            .filter(|p| has_hook(&p.hooks, event, arg, matcher))
+            .map(|p| format!("plugin {}", printable(&p.id)))
+            .collect();
+        // Any matcher counts here: a narrower one still runs the hook a
+        // second time for the tools it names.
+        let in_settings: Vec<String> = parsed
+            .iter()
+            .filter(|(_, v)| has_hook(v, event, arg, None))
+            .map(|(f, _)| printable(&f.to_string_lossy()))
+            .collect();
+        if !from_plugins.is_empty() && from_plugins.len() + in_settings.len() > 1 {
+            twice += 1;
+            twice_files.extend(in_settings.iter().cloned());
+            let from = [from_plugins, in_settings].concat().join(" and ");
+            println!("{:<8} {event} (dotonce hook {arg}) from {from}", "twice");
+        } else if let Some(p) = from_plugins.first() {
+            println!("{:<8} {event} (dotonce hook {arg}) in {p}", "ok");
+        } else if let Some((f, _)) = parsed
             .iter()
             .find(|(_, v)| has_hook(v, event, arg, matcher))
         {
-            Some((f, _)) => println!(
+            println!(
                 "{:<8} {event} (dotonce hook {arg}) in {}",
                 "ok",
                 printable(&f.to_string_lossy())
-            ),
-            None => {
-                missing += 1;
-                println!("{:<8} {event} (dotonce hook {arg})", "missing");
-            }
+            );
+        } else {
+            missing += 1;
+            println!("{:<8} {event} (dotonce hook {arg})", "missing");
         }
     }
-    if missing > 0 {
+    if twice > 0 {
+        let fix = if twice_files.is_empty() {
+            "Turn all but one dotonce plugin off with claude plugin disable.".to_string()
+        } else {
+            let files: Vec<String> = twice_files.into_iter().collect();
+            format!(
+                "Keep the plugin and remove the dotonce hooks from {}; dotonce never edits settings files.",
+                files.join(" and ")
+            )
+        };
         println!(
-            "{missing} hook(s) missing from every settings file doctor read. Run dotonce hook-config and add them to {}; dotonce never edits that file.",
-            user.display()
+            "warning  {twice} hook(s) run twice, so each prompt gets its facts twice and each draft is checked twice. {fix}"
+        );
+    }
+    if missing > 0 {
+        match on.first() {
+            Some(p) => println!(
+                "{missing} hook(s) missing from plugin {id}. Update it with claude plugin update {id}, then restart Claude Code.",
+                id = printable(&p.id)
+            ),
+            None => println!(
+                "{missing} hook(s) missing. Install the plugin with claude plugin marketplace add dotbrainhq/dotonce, then claude plugin install dotonce@dotonce. Or run dotonce hook-config and add them to {}; dotonce never edits that file.",
+                user.display()
+            ),
+        }
+    }
+    for p in plugins.iter().filter(|p| !p.on) {
+        println!(
+            "note     plugin {id} is installed but off here, so its hooks don't run. Turn it on with claude plugin enable {id}.",
+            id = printable(&p.id)
         );
     }
     for line in home_overrides(&files) {
@@ -649,7 +699,8 @@ pub fn doctor() -> Result<()> {
 }
 
 /// Prints the hooks block for Claude Code's settings.json, with this
-/// binary's absolute path.
+/// binary's absolute path. The plugin's hooks/hooks.json is the same block
+/// with its wrapper script in place of the path.
 pub fn hook_config() -> Result<()> {
     let exe = std::env::current_exe()?;
     let bin = hook::shell_word(&exe.to_string_lossy());

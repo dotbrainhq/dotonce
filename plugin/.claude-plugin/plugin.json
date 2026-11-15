@@ -1,0 +1,12 @@
+{
+  "name": "dotonce",
+  "version": "0.0.1",
+  "description": "Memory and mistake checks for AI coding agents. Correct your agent once.",
+  "author": {
+    "name": "Dotbrain LLC"
+  },
+  "homepage": "https://github.com/dotbrainhq/dotonce",
+  "repository": "https://github.com/dotbrainhq/dotonce",
+  "license": "MIT",
+  "keywords": ["memory", "hooks", "rules", "claude-code"]
+}
