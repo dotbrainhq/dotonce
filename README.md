@@ -25,6 +25,7 @@ dotonce is free and open source. It's in early development, and there's no relea
 - **Context before each prompt:** a Claude Code hook finds the few facts that match what you just asked and adds them, with their dates and files, before Claude answers. Pinned facts are added at the start of every session and again after the context is compacted. Each fact comes once a session, and again after compaction or when it changes, so a long session doesn't fill up with the same facts.
 - **Private facts stay private:** a fact marked private only shows when Claude Code runs inside a folder you list as private. Facts you save from inside one of those folders are private by default.
 - **Rules and reply checks:** rule sets you write turn on when Claude uses a skill, works in a folder, or gets a prompt with certain words. They remind Claude right then, check each reply's drafts and each tool call, and send a broken draft back once with the exact line and the reason. Every catch is logged, so you can see which rules earn their place.
+- **Plugin install:** two commands add every Claude Code hook, and `dotonce doctor` checks them, including hooks that would run twice.
 - **Search engine:** keyword search, typo-tolerant matching, names, and dates, merged and fitted into a token budget. With 100,000 stored turns a search takes about 26 ms, and 95% finish within 31 ms on an Apple M3 Pro. The prompt hook runs in about 20 ms on a store of 550 facts.
 - **Benchmark adapter:** runs dotonce on LongMemEval and LoCoMo, two of the most used tests for AI agent memory, through the open [agent-memory-benchmark](https://github.com/vectorize-io/agent-memory-benchmark) runner. That puts it side by side with other memory tools, with the same answering model and the same judge.
 
@@ -72,7 +73,7 @@ If `dotonce` then says "command not found", `~/.cargo/bin` isn't on your PATH (t
 echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.zshrc
 ```
 
-On bash, use `~/.bashrc`. `dotonce doctor` checks this for you and prints the line to use. The hooks use absolute paths, so they work either way.
+On bash, use `~/.bashrc`. `dotonce doctor` checks this for you and prints the line to use. The hooks find the binary either way.
 
 Save a fact and find it again:
 
@@ -83,15 +84,26 @@ dotonce search "staging site"
 
 `--aliases` takes other names for the same topic, at most three short ones, like "stg" and "preprod" here. The prompt filter matches them like the fact's name, so leave out general words like "server", "test" or "deploy": an alias like "test server" sends this fact with prompts like "restart the server". In a fact file they go in an `aliases:` list in the frontmatter.
 
-Print the hooks block, then add its entries to the `hooks` section of `~/.claude/settings.json`:
+Add the hooks with the dotonce plugin for Claude Code:
+
+```
+claude plugin marketplace add dotbrainhq/dotonce
+claude plugin install dotonce@dotonce
+```
+
+Inside Claude Code, `/plugin marketplace add dotbrainhq/dotonce` and `/plugin install dotonce@dotonce` do the same. Start a new session after the install. The plugin runs the `dotonce` binary from your PATH or from `~/.cargo/bin`, and does nothing until the binary is installed.
+
+From then on, each prompt gets the facts that match it. If a hook goes wrong, it adds nothing, blocks nothing, and writes the error to `~/.dotonce/errors.log`.
+
+Run `dotonce doctor` to check that every hook is there. It only reads your settings files and Claude Code's plugin list, and never changes them.
+
+To add the hooks by hand instead, print the hooks block and add its entries to the `hooks` section of `~/.claude/settings.json`:
 
 ```
 dotonce hook-config
 ```
 
-From then on, each prompt gets the facts that match it. If a hook goes wrong, it adds nothing, blocks nothing, and writes the error to `~/.dotonce/errors.log`.
-
-Run `dotonce doctor` to check that every hook is there. It only reads your settings files and never changes them.
+Use the plugin or the hooks block, not both. With both, every hook runs twice, and `dotonce doctor` warns about it.
 
 ### Use a folder you already have
 
@@ -309,9 +321,9 @@ The log keeps ids and outcomes, never reply text. Lines for private sets go to t
 
 ### Set up the hooks
 
-`dotonce hook-config` prints seven hook entries: UserPromptSubmit, SessionStart, Stop, PostToolUse for the Skill tool, UserPromptExpansion, PreToolUse for tool checks and the guard, and MessageDisplay for the line under a broken draft. Coming from v0.1, you have the first two.
+The plugin and `dotonce hook-config` cover the same seven hooks: UserPromptSubmit, SessionStart, Stop, PostToolUse for the Skill tool, UserPromptExpansion, PreToolUse for tool checks and the guard, and MessageDisplay for the line under a broken draft. Coming from v0.1, you have the first two in settings.json. Remove them when you install the plugin.
 
-`dotonce doctor` reads `~/.claude/settings.json` and the project's `.claude/settings.json` and `.claude/settings.local.json`, and lists the hooks that are missing. It also warns when one of those files sets `DOTONCE_HOME`, because the hooks would then read approvals from that folder instead of your dotonce home. It never changes the files.
+`dotonce doctor` reads `~/.claude/settings.json`, the project's `.claude/settings.json` and `.claude/settings.local.json`, and Claude Code's list of installed plugins. It lists the hooks that are missing and the ones that run twice, and says when the plugin is installed but off. It also warns when one of those files sets `DOTONCE_HOME`, because the hooks would then read approvals from that folder instead of your dotonce home. It never changes the files.
 
 A rule file with an error is skipped whole, never half-loaded. The next session start tells you which file and why, and `dotonce rules check` prints the details.
 
