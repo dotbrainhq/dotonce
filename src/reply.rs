@@ -1,7 +1,5 @@
 //! Stop: checks this turn's drafts against the active rule sets, logs every
-//! result, and sends a failing draft of a fix set back once per turn. A fix
-//! set's model checks are judged here too, so their catch can go back; a warn
-//! set's run in the background judge hook (see judge.rs).
+//! result, and sends a failing draft of a fix set back once per turn.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -16,8 +14,7 @@ use crate::chat;
 use crate::checks::{self, Failure};
 use crate::config;
 use crate::hook::{log_error, prompt_id, session_id};
-use crate::judge::{self, Verdict};
-use crate::rules::{CheckKind, Level};
+use crate::rules::CheckKind;
 use crate::session::{self, Nudge, Pending};
 use crate::skills::Seen;
 
@@ -64,7 +61,7 @@ fn stop_output(text: Option<&str>, notice: Option<&str>) -> Option<String> {
 }
 
 /// The last `TAIL_BYTES` of the file, from its first whole line.
-pub(crate) fn read_tail(path: &Path) -> Option<String> {
+fn read_tail(path: &Path) -> Option<String> {
     let mut f = File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
     let skip = len.saturating_sub(TAIL_BYTES);
@@ -84,7 +81,7 @@ pub(crate) fn read_tail(path: &Path) -> Option<String> {
 
 /// A user entry that starts a turn: typed text, not a tool result or a
 /// message Claude Code added itself.
-pub(crate) fn starts_turn(e: &Value) -> bool {
+fn starts_turn(e: &Value) -> bool {
     if e.get("isMeta").and_then(Value::as_bool) == Some(true) {
         return false;
     }
@@ -164,8 +161,8 @@ fn scan(src: &str) -> (Vec<String>, Option<usize>) {
 
 /// One turn's assistant text, and what is known about where a send-back
 /// continued it.
-pub(crate) struct Turn {
-    pub(crate) parts: Vec<String>,
+struct Turn {
+    parts: Vec<String>,
     /// How many parts came from the session record.
     recorded: usize,
     /// How many parts came before the record's last continuation entry.
@@ -174,7 +171,7 @@ pub(crate) struct Turn {
 
 /// This turn's assistant text: the turn's messages from the session record,
 /// then `last` unless the record already ends with it.
-pub(crate) fn read_turn(transcript: Option<&Path>, last: Option<&str>) -> Turn {
+fn read_turn(transcript: Option<&Path>, last: Option<&str>) -> Turn {
     let (mut parts, continued_at) = transcript
         .and_then(read_tail)
         .map(|s| scan(&s))
@@ -211,14 +208,11 @@ fn fresh_start(p: &Pending, turn: &Turn) -> Option<usize> {
 
 /// After a send-back, logs whether each sent-back check is fixed in
 /// `fresh`, the text that came after it. None when the cut can't be found.
-/// A model check's outcome comes from the judge's `verdict` on `fresh`, and
-/// is unverified without one.
 fn recheck(
     p: &Pending,
     live: &[Live],
     fresh: Option<&str>,
     seen: &Seen,
-    verdict: Option<&Verdict>,
     log: &dyn Fn(&Live, &str, Outcome),
 ) {
     for (set_id, check_id) in &p.checks {
@@ -228,11 +222,6 @@ fn recheck(
         let Some(c) = l.set.checks.iter().find(|c| &c.id == check_id) else {
             continue;
         };
-        if let CheckKind::Model(_) = c.kind {
-            let outcome = verdict.map_or(Outcome::Unverified, |v| v.outcome(set_id, check_id));
-            log(l, check_id, outcome);
-            continue;
-        }
         let drafts = fresh.map(|f| checks::drafts(&l.set, f)).unwrap_or_default();
         let outcome = if drafts.is_empty() {
             Outcome::Unverified
@@ -333,45 +322,11 @@ fn send_back(v: &Value, cwd: &Path, now: i64, sid: &str, dir: &Path) -> Result<O
         }
         fails
     };
-    // A fix set's model checks: the judge reads the drafts here, inside Stop,
-    // so a catch can still go back. `fix` is empty once the turn went back,
-    // and the rewrite still needs its verdict.
-    let fix_model: Vec<&Live> = checking
-        .iter()
-        .copied()
-        .filter(|l| l.level == Level::Fix && judge::has_model(l))
-        .collect();
-    let run = judge::Run {
-        sid,
-        now,
-        transcript: v
-            .get("transcript_path")
-            .and_then(Value::as_str)
-            .filter(|p| !p.is_empty())
-            .map(Path::new),
-        limit: judge::FIX_LIMIT,
-    };
-    let judged = |state: &mut session::State, text: &str| -> Option<Verdict> {
-        let verdict = judge::judge(&run, &fix_model, text)?;
-        for b in &verdict.breaks {
-            let set = fix_model.iter().find(|l| l.set.id == b.set);
-            if let Some(l) = set
-                && state.first_log(&turn, &b.set, &b.check)
-            {
-                log(l, &b.check, Outcome::Caught);
-            }
-        }
-        Some(verdict)
-    };
     let mut fails = Vec::new();
     let out = if again {
         if let Some(p) = state.take_pending(&turn) {
             let fresh = fresh_start(&p, &turn_read).map(|start| parts[start..].join("\n\n"));
-            let verdict = match &fresh {
-                Some(f) if !fix_model.is_empty() => judged(&mut state, f),
-                _ => None,
-            };
-            recheck(&p, &live, fresh.as_deref(), &seen, verdict.as_ref(), &log);
+            recheck(&p, &live, fresh.as_deref(), &seen, &log);
             // The corrected draft can break a check the first one passed.
             if let Some(f) = &fresh {
                 fails = caught(&mut state, f);
@@ -379,24 +334,12 @@ fn send_back(v: &Value, cwd: &Path, now: i64, sid: &str, dir: &Path) -> Result<O
         }
         None
     } else {
-        let text = parts.join("\n\n");
-        fails = caught(&mut state, &text);
-        let mut send: Vec<Failure> = fails
+        fails = caught(&mut state, &parts.join("\n\n"));
+        let send: Vec<Failure> = fails
             .iter()
             .filter(|(l, _)| fix.contains(&l.set.id))
             .map(|(_, f)| f.clone())
             .collect();
-        // A draft a pattern already sends back waits: the judge reads the
-        // rewrite instead.
-        if send.is_empty() && !fix_model.is_empty() {
-            let breaks = judged(&mut state, &text).map(|v| v.breaks);
-            send.extend(breaks.unwrap_or_default().into_iter().map(|b| Failure {
-                why: b.why(),
-                set: b.set,
-                check: b.check,
-                line: b.quote,
-            }));
-        }
         if send.is_empty() {
             None
         } else {

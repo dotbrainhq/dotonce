@@ -24,7 +24,7 @@ dotonce is free and open source. It's in early development, and there's no relea
 - **Your facts, as plain files:** every fact is a markdown file with its source and date. Point dotonce at a folder you already keep notes in, and it reads those files as they are.
 - **Context before each prompt:** a Claude Code hook finds the few facts that match what you just asked and adds them, with their dates and files, before Claude answers. Pinned facts are added at the start of every session and again after the context is compacted. Each fact comes once a session, and again after compaction or when it changes, so a long session doesn't fill up with the same facts.
 - **Private facts stay private:** a fact marked private only shows when Claude Code runs inside a folder you list as private. Facts you save from inside one of those folders are private by default.
-- **Rules and reply checks:** rule sets you write turn on when Claude uses a skill, works in a folder, or gets a prompt with certain words. They remind Claude right then, check each reply's drafts and each tool call, and send a broken draft back once with the exact line and the reason. Every catch is logged, so you can see which rules earn their place. A `model` check has a second model judge a draft against a rule no pattern can hold, like "answer every question", through your own Claude Code login.
+- **Rules and reply checks:** rule sets you write turn on when Claude uses a skill, works in a folder, or gets a prompt with certain words. They remind Claude right then, check each reply's drafts and each tool call, and send a broken draft back once with the exact line and the reason. Every catch is logged, so you can see which rules earn their place.
 - **Plugin install:** two commands add every Claude Code hook, and `dotonce doctor` checks them, including hooks that would run twice.
 - **Search engine:** keyword search, typo-tolerant matching, names, and dates, merged and fitted into a token budget. With 100,000 stored turns a search takes about 26 ms, and 95% finish within 31 ms on an Apple M3 Pro. The prompt hook runs in about 20 ms on a store of 550 facts.
 - **Benchmark adapter:** runs dotonce on LongMemEval and LoCoMo, two of the most used tests for AI agent memory, through the open [agent-memory-benchmark](https://github.com/vectorize-io/agent-memory-benchmark) runner. That puts it side by side with other memory tools, with the same answering model and the same judge.
@@ -36,9 +36,9 @@ dotonce is free and open source. It's in early development, and there's no relea
 
 ## How it's built
 
-- **Local only:** dotonce makes no network calls of its own. No telemetry, no auto-update. The one exception is a `model` check you add yourself, which runs Claude Code's `claude` command.
+- **Local only:** dotonce makes no network calls. No telemetry, no auto-update.
 - **One small binary:** written in Rust, with SQLite built in. Nothing else to install or keep running.
-- **No extra AI cost by default:** the agent you already use does the reasoning. Only a rule set with a `model` check calls a model, a small one, on the Claude Code plan you already have.
+- **No extra AI cost:** the agent you already use does the reasoning, so dotonce adds no model calls of its own.
 - **Facts keep their source:** when something changes, the old fact is marked as replaced, never silently rewritten.
 
 ## Build from source
@@ -162,10 +162,10 @@ A tool call that breaks a `fix` set's tool check is denied. Claude sees which ru
 | Level | What it does |
 |---|---|
 | `remind` | Adds the set's reminder when it turns on. No checks. |
-| `warn` | Reminds and runs the checks, but only logs what fails. Nothing is sent back or denied. After a `skill-loaded` catch, your next prompt in that session tells Claude to load the skill before the next draft, once. A `model` check's catch comes back as a note on your next turn. |
+| `warn` | Reminds and runs the checks, but only logs what fails. Nothing is sent back or denied. After a `skill-loaded` catch, your next prompt in that session tells Claude to load the skill before the next draft, once. |
 | `fix` | Reminds, runs the checks, sends a failing draft back once, and denies a tool call that fails a tool check. |
 
-A new set starts at `warn`, so it only logs. Once it catches the same slips in at least two sessions over its first week, dotonce moves it to `fix` by itself and tells you. A set with a `model` check is the exception: see [Model checks](#model-checks). If replies still break it after Claude corrects them, dotonce moves it back. To pick a level yourself, run this in a terminal. dotonce leaves a level you picked alone.
+A new set starts at `warn`, so it only logs. Once it catches the same slips in at least two sessions over its first week, dotonce moves it to `fix` by itself and tells you. If replies still break it after Claude corrects them, dotonce moves it back. To pick a level yourself, run this in a terminal. dotonce leaves a level you picked alone.
 
 ```
 dotonce rules level support-replies fix
@@ -251,7 +251,6 @@ A draft is a fenced block whose info string is in `fence`. Use `""` for fences w
 | `require = [phrases]` | None of the phrases appears. |
 | `kind = "bare-url"` | A URL sits outside `[text](url)` and outside code. |
 | `kind = "skill-loaded"` | The draft reads as prose and none of the skills in `skills` has loaded in the session. |
-| `kind = "model"` | A second model reads the draft and finds a clear break of the rule in `ask`. |
 | `repeat_of = '...'` and `max = N` | The text the pattern's one group captures appears more than N times after its first match. |
 | `max_paragraphs = N` | The draft has more than N paragraphs. |
 | `max_words = N` | The draft has more than N words. |
@@ -267,30 +266,6 @@ why = "Load the writing skill that fits before you write a draft."
 ```
 
 It needs a `[draft]` table, and only a draft that reads as prose counts: 25 words or more, real sentences, and at most one line in five that looks like a command or code. A skill counts once Claude calls it, you run it as a slash command, or Claude reads its `SKILL.md`, at any point in the session, compaction included. Leave `skills` out to use the installed skills whose names start with `writing` or end in `reply`, `replies` or `descriptions`. With none of those installed, the check passes. `dotonce rules test` runs it as a session with no skill loaded yet.
-
-#### Model checks
-
-Some rules no pattern can hold: a claim nothing in the session checked, a promise made before the check, a question left unanswered. A model check has a second model judge the draft against one of them:
-
-```
-[[check]]
-id = "every-ask"
-kind = "model"
-ask = "The draft answers every question in the message it replies to."
-why = "Answer what was asked, all of it."
-```
-
-Write the rule in `ask` as one plain sentence. A model check needs a `[draft]` table.
-
-At the end of a turn with a draft, dotonce runs Claude Code's `claude` command with your login and the `judge_model` from `~/.dotonce/config.toml`, `haiku` unless you change it. The model reads the rules, the drafts, the reply around them, and the session so far from its record: the messages you typed, cut when long, and up to the last 60 tool calls with the start of each input and of what it returned. Nothing else: no files, no memory, no settings, and no tools of its own. It has to quote the exact words that break a rule, and a quote that isn't in the draft is dropped.
-
-Every model check that applies goes in one call, each draft is judged once, and a session makes at most 40 calls a day. A call takes about 7 seconds. When `claude` is missing, not logged in, too slow, or sends back something dotonce can't read, the draft passes and the reason goes in `~/.dotonce/judge.log`.
-
-At `warn` the check runs in the background after the turn ends, and a catch comes back as a note on your next turn. At `fix` it runs before the turn ends, so a turn with a draft waits those seconds, and a broken draft goes back once like any other check.
-
-A set with a model check never moves to `fix` by itself. A wrong catch that Claude fixes looks the same in the log as a right one, so the numbers can't tell them apart. `dotonce doctor` says when the set has the catches it would need, and `dotonce rules level` moves it. `dotonce rules test` doesn't call the model; it names the sets with model checks instead.
-
-Model checks are an experiment. On a week of real sessions the judge was right on about one catch in seven, mostly because the proof for a claim sat in tool output or turns it couldn't see. Keep them at `warn` and read a catch as a hint.
 
 A tool check adds `on = "tool"` and a `tool`: `"Bash"`, `"Write"`, `"Edit"`, `"MultiEdit"` or `"NotebookEdit"`. It reads the command, or the file path and the new text. `path = ["*.rs"]` limits it to matching files. Tool checks turn on the same way reply checks do, so a coder's set usually uses `folders`. MCP tools that write files aren't covered.
 
@@ -355,13 +330,11 @@ dotonce rules pause support-replies
 
 `stats` counts catches per check over 7 and 30 days, with how many were fixed on the send-back, how many were still broken, and how many tool calls were denied. Its last column is the repeat-mistake rate, catches per week. A check that keeps catching shows the mistake keeps happening. One that never catches may not be earning its place.
 
-`~/.dotonce/judge.log` has one line per model call: the time, the checks asked, the result, the milliseconds and the tokens. No draft text. `dotonce doctor` sums up the last week: drafts judged, catches, and drafts let through because the call failed.
-
 The log keeps ids and outcomes, never reply text. Lines for private sets go to their own file and only show inside `private_paths`. `rules pause` turns a set off for the current session only, from your terminal.
 
 ### Set up the hooks
 
-The plugin and `dotonce hook-config` cover the same eight hooks: UserPromptSubmit, SessionStart, Stop, a second Stop that runs model checks in the background, PostToolUse for the Skill tool, UserPromptExpansion, PreToolUse for tool checks and the guard, and MessageDisplay for the line under a broken draft. Coming from v0.1, you have the first two in settings.json. Remove them when you install the plugin.
+The plugin and `dotonce hook-config` cover the same seven hooks: UserPromptSubmit, SessionStart, Stop, PostToolUse for the Skill tool, UserPromptExpansion, PreToolUse for tool checks and the guard, and MessageDisplay for the line under a broken draft. Coming from v0.1, you have the first two in settings.json. Remove them when you install the plugin.
 
 `dotonce doctor` reads `~/.claude/settings.json`, the project's `.claude/settings.json` and `.claude/settings.local.json`, and Claude Code's list of installed plugins. It lists the hooks that are missing and the ones that run twice, and says when the plugin is installed but off. It also warns when one of those files sets `DOTONCE_HOME`, because the hooks would then read approvals from that folder instead of your dotonce home. It never changes the files.
 
@@ -387,11 +360,11 @@ Those files are loaded in full at the start of a session, and the agent decides 
 
 ### Does my code or chat history leave my machine?
 
-Not through dotonce, unless you add a `model` check. dotonce makes no network calls, and everything stays in a local SQLite file you can open, copy, or delete. A model check hands the draft, the reply around it, the messages you typed in the session, and the start of each tool call and its result to Claude Code's `claude` command, which sends them to Anthropic under the login your session already uses. No one new sees them.
+No. dotonce makes no network calls. Everything stays in a local SQLite file you can open, copy, or delete.
 
 ### Do I need an API key?
 
-Not for dotonce itself, model checks included: they use your Claude Code login. The benchmark runner needs one for its answering model, because that's how the test is scored.
+Not for dotonce itself. The benchmark runner needs one for its answering model, because that's how the test is scored.
 
 ### How does it compare with Hindsight, Mem0, or claude-mem?
 
