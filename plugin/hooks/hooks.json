@@ -33,7 +33,17 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/dotonce\" hook stop",
-            "timeout": 5
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/dotonce\" hook judge",
+            "timeout": 30,
+            "async": true
           }
         ]
       }

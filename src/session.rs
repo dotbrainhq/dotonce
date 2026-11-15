@@ -199,7 +199,7 @@ pub fn dir() -> Result<PathBuf> {
 
 /// The session id with anything but letters, digits, `-` and `_` taken out,
 /// so it can never point outside the sessions folder.
-fn safe_name(session_id: &str) -> Result<String> {
+pub(crate) fn safe_name(session_id: &str) -> Result<String> {
     let safe: String = session_id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')

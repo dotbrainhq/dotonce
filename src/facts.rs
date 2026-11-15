@@ -1092,6 +1092,7 @@ mod tests {
             save_store: "kb".into(),
             prompt_budget: 1_500,
             session_budget: 1_500,
+            judge_model: "haiku".into(),
         }
     }
 

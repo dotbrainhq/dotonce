@@ -3862,20 +3862,22 @@ fn hook_config_prints_every_hook_and_doctor_accepts_it() {
     assert!(ok, "{out}");
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     let want = [
-        ("UserPromptSubmit", "prompt", None),
-        ("SessionStart", "session-start", None),
-        ("Stop", "stop", None),
-        ("PostToolUse", "skill", Some("Skill")),
-        ("UserPromptExpansion", "expansion", None),
+        ("UserPromptSubmit", 0, "prompt", None),
+        ("SessionStart", 0, "session-start", None),
+        ("Stop", 0, "stop", None),
+        ("Stop", 1, "judge", None),
+        ("PostToolUse", 0, "skill", Some("Skill")),
+        ("UserPromptExpansion", 0, "expansion", None),
         (
             "PreToolUse",
+            0,
             "pre-tool",
             Some("Bash|Write|Edit|MultiEdit|NotebookEdit"),
         ),
-        ("MessageDisplay", "display", None),
+        ("MessageDisplay", 0, "display", None),
     ];
-    for (event, arg, matcher) in want {
-        let g = &v["hooks"][event][0];
+    for (event, i, arg, matcher) in want {
+        let g = &v["hooks"][event][i];
         let cmd = g["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.ends_with(&format!("dotonce hook {arg}")), "{cmd}");
         match matcher {
@@ -3883,6 +3885,14 @@ fn hook_config_prints_every_hook_and_doctor_accepts_it() {
             None => assert!(g.get("matcher").is_none(), "{event}"),
         }
     }
+    // The judge runs in the background with room for the model's call;
+    // Stop waits long enough for a fix set's judge.
+    let stop = &v["hooks"]["Stop"];
+    assert_eq!(stop[1]["hooks"][0]["async"], true);
+    assert_eq!(stop[1]["hooks"][0]["timeout"], 30);
+    assert_eq!(stop[0]["hooks"][0]["timeout"], 30);
+    assert!(stop[0]["hooks"][0].get("async").is_none());
+    assert_eq!(v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["timeout"], 5);
     std::fs::create_dir_all(h.join(".claude")).unwrap();
     std::fs::write(h.join(".claude/settings.json"), &out).unwrap();
     let (out, _) = run(&h, &["doctor"], None);
@@ -4143,7 +4153,7 @@ fn doctor_finds_hooks_in_project_settings_and_names_the_file() {
     }
     assert_eq!(
         out.lines().filter(|l| l.starts_with("ok ")).count(),
-        7,
+        8,
         "{out}"
     );
     // Some hooks in the user file, the rest in the local file.
