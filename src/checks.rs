@@ -137,15 +137,15 @@ pub fn fenced_blocks(text: &str) -> Vec<Block> {
 }
 
 /// The texts a set's reply checks read: the bodies of fenced blocks whose
-/// info string is in the set's `[draft] fence` list, or the whole text when
-/// the set has no `[draft]` table.
+/// info string is in the set's `[draft] fence` list and that no `skip`
+/// pattern matches, or the whole text when the set has no `[draft]` table.
 pub fn drafts(set: &RuleSet, text: &str) -> Vec<String> {
     match &set.draft {
         None if text.trim().is_empty() => Vec::new(),
         None => vec![text.to_string()],
         Some(d) => fenced_blocks(text)
             .into_iter()
-            .filter(|b| d.fence.contains(&b.info))
+            .filter(|b| d.is_draft(&b.info, &b.body))
             .map(|b| b.body)
             .collect(),
     }
@@ -503,6 +503,16 @@ mod tests {
         assert_eq!(
             drafts(&blank, "a\n```\nHi Sam,\n```\n```bash\nls\n```"),
             vec!["Hi Sam,".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_skip_pattern_leaves_a_block_out_of_the_drafts() {
+        let s = set("[draft]\nfence = [\"\"]\nskip = ['\\A\\s*Summary:', '^Status: draft$']\n");
+        let text = "```\nSummary: acme order 1001\nOwner: Sam\n```\n```\nHi Sam,\nSummary: it shipped.\n```\n```\nHi Lee,\nStatus: draft\n```";
+        assert_eq!(
+            drafts(&s, text),
+            vec!["Hi Sam,\nSummary: it shipped.".to_string()]
         );
     }
 
