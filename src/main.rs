@@ -116,7 +116,17 @@ enum RulesCmd {
     },
     /// Keep a rule set file as a proposal. It turns on when the user sends the
     /// code dotonce shows them in Claude Code.
-    Propose { file: PathBuf },
+    Propose {
+        file: PathBuf,
+        /// Wait for the user's yes instead of turning on by itself, for a rule
+        /// Claude writes from the user's correction. A yes turns it on at fix.
+        #[arg(long)]
+        ask: bool,
+        /// One line for the user: what the rule fixes, or a line in the loaded
+        /// instructions that says the opposite.
+        #[arg(long, requires = "ask")]
+        note: Option<String>,
+    },
     /// Approve a set as its file is now. Needs a terminal and the typed id.
     Approve { id: String },
     /// Set an approved set's level: remind, warn or fix. Needs a terminal and the typed id.
@@ -171,7 +181,9 @@ fn rules_cmd(cmd: RulesCmd) -> Result<()> {
             tool,
             path,
         } => commands::rules_test(&id, &file, json, tool.as_deref(), path.as_deref()),
-        RulesCmd::Propose { file } => commands::rules_propose(&file),
+        RulesCmd::Propose { file, ask, note } => {
+            commands::rules_propose(&file, ask, note.as_deref().unwrap_or(""))
+        }
         RulesCmd::Approve { id } => commands::rules_approve(&id),
         RulesCmd::Level { id, level } => commands::rules_level(&id, &level),
         RulesCmd::Off { id } => commands::rules_off(&id),

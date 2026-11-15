@@ -27,6 +27,7 @@ use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::approvals::{self, Approvals, State};
+use crate::ask::{self, Ask};
 use crate::autopilot::{Change, Event};
 use crate::config::home_dir;
 use crate::hook;
@@ -43,12 +44,15 @@ const UNDO_DAYS: i64 = 7;
 const CODE: &str = "\u{0}";
 
 /// Why a proposal waits for the user's OK.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Wait {
     /// It changes a set at fix.
     Fix,
     /// It changes a set the user turned off.
     Off,
+    /// Claude proposed it from a correction, to turn on at fix once the
+    /// user says yes (see ask.rs).
+    Ask(Box<Ask>),
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +88,9 @@ struct Code {
     /// When the change was made, for an undo.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     since: String,
+    /// The user turned it on with a yes, so it didn't change by itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    asked: bool,
 }
 
 /// chat.json: the current code of each shown change, by set id.
@@ -182,10 +189,26 @@ pub fn parse_reply(typed: &str) -> Option<Reply> {
     }
 }
 
+/// A rule set file read and checked as a proposal, not kept yet.
+pub struct Proposal {
+    pub set: RuleSet,
+    pub src: String,
+}
+
 /// Checks a rule set file and keeps it in the proposals folder. Anyone can
 /// propose, Claude included. The autopilot turns it on log-only at the end
 /// of the turn, unless it changes a set at fix or one the user turned off.
+/// An ask left from an earlier `--ask` proposal of the set goes, so this
+/// one takes the autopilot's path.
 pub fn propose(file: &Path) -> Result<RuleSet> {
+    let p = read_proposal(file)?;
+    ask::archive(&p.set.id, &format!("{}-superseded", p.set.id))?;
+    keep(&p)?;
+    Ok(p.set)
+}
+
+/// Reads and checks a rule set file as a proposal.
+pub fn read_proposal(file: &Path) -> Result<Proposal> {
     let src = fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
     let table: toml::Table = toml::from_str(&src).context("parse the rule set")?;
     let id = table
@@ -210,30 +233,43 @@ pub fn propose(file: &Path) -> Result<RuleSet> {
             set.id
         );
     }
-    fs::create_dir_all(&dir)?;
-    let tmp = dir.join(format!(".{id}.toml.{}.tmp", std::process::id()));
-    fs::write(&tmp, &src)?;
-    fs::rename(&tmp, &target)?;
-    Ok(set)
+    Ok(Proposal { set, src })
 }
 
-/// Proposals that wait for the user's OK: those that change a set at fix
-/// or one the user turned off. The autopilot takes the rest.
+/// Puts a proposal in the proposals folder, where the autopilot or the
+/// user's OK picks it up.
+pub fn keep(p: &Proposal) -> Result<()> {
+    let dir = proposals_dir()?;
+    let id = &p.set.id;
+    fs::create_dir_all(&dir)?;
+    let tmp = dir.join(format!(".{id}.toml.{}.tmp", std::process::id()));
+    fs::write(&tmp, &p.src)?;
+    fs::rename(&tmp, dir.join(format!("{id}.toml")))?;
+    Ok(())
+}
+
+/// Proposals that wait for the user's OK: those Claude proposed from a
+/// correction, and those that change a set at fix or one the user turned
+/// off. The autopilot takes the rest. An ask past its days waits no more.
 pub fn waiting(a: &Approvals) -> Result<Vec<Waiting>> {
     let loaded = rules::load()?;
     let recorded = hook::recorded_private();
+    let now = Utc::now();
     let mut out = Vec::new();
     for set in rules::load_dir(&proposals_dir()?)?.sets {
-        let Some(old) = loaded.sets.iter().find(|s| s.id == set.id) else {
-            continue;
-        };
-        let wait = match a.state(old) {
-            State::On(Level::Fix) => Wait::Fix,
-            State::Off => Wait::Off,
-            _ => continue,
+        let old = loaded.sets.iter().find(|s| s.id == set.id);
+        let wait = match (ask::load(&set.id), old) {
+            (Some(q), _) if q.expired(now) => continue,
+            (Some(q), _) => Wait::Ask(Box::new(q)),
+            (None, Some(old)) => match a.state(old) {
+                State::On(Level::Fix) => Wait::Fix,
+                State::Off => Wait::Off,
+                _ => continue,
+            },
+            (None, None) => continue,
         };
         out.push(Waiting {
-            private: set.private || old.private || recorded.contains(&set.id),
+            private: set.private || old.is_some_and(|o| o.private) || recorded.contains(&set.id),
             wait,
             set,
         });
@@ -316,6 +352,7 @@ struct Block {
     file: String,
     undo: Option<Undo>,
     since: String,
+    asked: bool,
     /// The text, with `CODE` where the code goes.
     text: String,
 }
@@ -361,6 +398,7 @@ fn event_block(e: &Event, since: &str) -> Block {
         file: approvals::hash(&e.set.src),
         undo: Some(undo),
         since: since.to_string(),
+        asked: false,
         text,
     }
 }
@@ -369,6 +407,12 @@ fn event_block(e: &Event, since: &str) -> Block {
 fn undo_block(set: &RuleSet, c: &Code) -> Option<Block> {
     let id = rules::printable(&set.id);
     let text = match c.undo.as_ref()? {
+        Undo::Off if c.asked => {
+            format!("{id} turned on after your yes. Send no {CODE} to turn it off.")
+        }
+        Undo::Restore { .. } if c.asked => {
+            format!("{id} changed after your yes. Send no {CODE} to put the old version back.")
+        }
         Undo::Off => format!("{id} turned on by itself. Send no {CODE} to turn it off."),
         Undo::Restore { .. } => {
             format!("{id} changed by itself. Send no {CODE} to put the old version back.")
@@ -385,6 +429,7 @@ fn undo_block(set: &RuleSet, c: &Code) -> Option<Block> {
         file: c.file.clone(),
         undo: c.undo.clone(),
         since: c.since.clone(),
+        asked: c.asked,
         text,
     })
 }
@@ -392,9 +437,27 @@ fn undo_block(set: &RuleSet, c: &Code) -> Option<Block> {
 fn waiting_block(w: &Waiting, a: &Approvals) -> Block {
     let id = rules::printable(&w.set.id);
     let level = a.sets.get(&w.set.id).map_or(w.set.level, |p| p.level);
-    let what = match w.wait {
+    let what = match &w.wait {
         Wait::Fix => "a change to a set at fix",
         Wait::Off => "a change to a set you turned off",
+        Wait::Ask(q) => {
+            let level = q.level.as_str();
+            let text = format!(
+                "{id} (a rule from your correction): turns on at {level}, {}.\n{}{}  Send yes \
+                 {CODE} to turn it on at {level}, or no {CODE} to drop it.",
+                checks_word(w.set.checks.len()),
+                details(&w.set),
+                ask::notice_lines(&w.set, q)
+            );
+            return Block {
+                id: w.set.id.clone(),
+                file: approvals::hash(&w.set.src),
+                undo: None,
+                since: String::new(),
+                asked: false,
+                text,
+            };
+        }
     };
     let text = format!(
         "{id} ({what}): runs at {}, {}.\n{}  Send yes {CODE} to use it, or no {CODE} to drop it.",
@@ -407,6 +470,7 @@ fn waiting_block(w: &Waiting, a: &Approvals) -> Block {
         file: approvals::hash(&w.set.src),
         undo: None,
         since: String::new(),
+        asked: false,
         text,
     }
 }
@@ -433,6 +497,7 @@ fn issue(
                 session: sid.to_string(),
                 undo: b.undo.clone(),
                 since: b.since.clone(),
+                asked: b.asked,
             },
         );
         out.push(b.text.replace(CODE, &code));
@@ -466,8 +531,13 @@ fn notice(
     let private_note = " Only you see this message and its codes.";
     if !changes.is_empty() {
         let texts = issue(store, changes, &mut taken, sid)?;
+        let by = if changes.iter().any(|b| b.asked) {
+            ""
+        } else {
+            " by itself"
+        };
         parts.push(format!(
-            "dotonce changed {} by itself.{private_note}\n\n{}",
+            "dotonce changed {}{by}.{private_note}\n\n{}",
             plural(changes.len(), "rule set", "rule sets"),
             texts.join("\n\n")
         ));
@@ -684,6 +754,41 @@ fn use_proposal(w: &Waiting, now: &str) -> Result<Level> {
     Ok(level)
 }
 
+/// Uses a proposal Claude made from a correction: it becomes the rule file
+/// and turns on at the ask's level, as the user said yes to. At fix it
+/// counts as moved there, so replies that stay broken still move it back
+/// to log-only. Returns the set and what `no <code>` does next.
+fn use_ask(w: &Waiting, q: &Ask, now: &str) -> Result<(RuleSet, Undo)> {
+    let old = rules::load()?
+        .sets
+        .into_iter()
+        .find(|s| s.id == w.set.id)
+        .map(|s| s.file);
+    let (set, replaced) = install(&w.set, old.as_deref())?;
+    ask::archive(&set.id, &format!("{}-applied", set.id))?;
+    let mut a = approvals::load()?;
+    a.adopt(&set, q.level, now);
+    if q.level == Level::Fix
+        && let Some(r) = a.sets.get_mut(&set.id)
+    {
+        r.promoted = now.to_string();
+    }
+    approvals::save(&a)?;
+    hook::note_live(&[(set.id.clone(), Some(q.level), w.private)]);
+    let undo = match replaced {
+        Some(from) if old.is_some() => Undo::Restore { from },
+        _ => Undo::Off,
+    };
+    Ok((set, undo))
+}
+
+/// Drops a proposal Claude made from a correction that waited `ask::DAYS`
+/// with no answer.
+pub fn drop_expired(set: &RuleSet) -> Result<()> {
+    archive(&set.file, &format!("{}-expired", set.id))?;
+    ask::archive(&set.id, &format!("{}-expired", set.id))
+}
+
 /// Everything `dotonce` lists: changes that can still be undone and
 /// proposals that wait, split into those this folder shows and a count of
 /// the private rest.
@@ -808,12 +913,36 @@ pub fn answer(
                     "dotonce: {shown_id} changed after you saw it, so nothing changed. Here it is now.\n\n{text}"
                 )));
             }
-            if matches!(reply, Reply::Yes(_)) {
-                let level = use_proposal(w, &stamp)?;
-                format!("dotonce: {shown_id} is on at {}.", level.as_str())
-            } else {
-                archive(&w.set.file, &format!("{id}-dropped"))?;
-                format!("dotonce: dropped the proposed {shown_id}. Nothing changed.")
+            match (&w.wait, reply) {
+                (Wait::Ask(q), Reply::Yes(_)) => {
+                    let (set, how) = use_ask(w, q, &stamp)?;
+                    let after = match how {
+                        Undo::Restore { .. } => "put the old version back",
+                        _ => "turn it off",
+                    };
+                    let block = Block {
+                        id: set.id.clone(),
+                        file: approvals::hash(&set.src),
+                        undo: Some(how),
+                        since: stamp.clone(),
+                        asked: true,
+                        text: format!(
+                            "dotonce: {shown_id} is on at {}. Send no {CODE} within \
+                             {UNDO_DAYS} days to {after}.",
+                            q.level.as_str()
+                        ),
+                    };
+                    issue(&mut store, &[block], &mut BTreeSet::new(), sid)?.concat()
+                }
+                (_, Reply::Yes(_)) => {
+                    let level = use_proposal(w, &stamp)?;
+                    format!("dotonce: {shown_id} is on at {}.", level.as_str())
+                }
+                _ => {
+                    archive(&w.set.file, &format!("{id}-dropped"))?;
+                    ask::archive(&id, &format!("{id}-dropped"))?;
+                    format!("dotonce: dropped the proposed {shown_id}. Nothing changed.")
+                }
             }
         }
     };

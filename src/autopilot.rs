@@ -20,6 +20,7 @@ use anyhow::Result;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 
 use crate::approvals::{self, Approvals, State};
+use crate::ask;
 use crate::catches::{self, Catch, Outcome};
 use crate::chat;
 use crate::hook;
@@ -195,6 +196,14 @@ pub fn run(now: DateTime<Utc>) -> Result<Vec<Event>> {
     }
 
     for p in proposals {
+        // Claude proposed it from a correction: it waits for the user's
+        // yes, and goes once it has waited too long.
+        if let Some(q) = ask::load(&p.id) {
+            if q.expired(now) {
+                chat::drop_expired(&p)?;
+            }
+            continue;
+        }
         let old = loaded.sets.iter().find(|s| s.id == p.id);
         let safe = match old.map(|s| a.state(s)) {
             None => true,

@@ -19,6 +19,7 @@ use crate::approvals::{self, Approvals, State};
 use crate::autopilot;
 use crate::chat;
 use crate::config::{self, Config, MAX_BUDGET};
+use crate::correction;
 use crate::facts;
 use crate::retrieve::estimate_tokens;
 use crate::rules::{self, FileError, Level, Loaded, RuleSet};
@@ -207,7 +208,10 @@ fn prompt(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
     if let Some(block) = chat::parse_reply(text).and_then(|r| chat_reply(v, &r, &cfg, cwd)) {
         return Ok(Some(block));
     }
-    let (rules_text, used) = reminders_for(v, &cfg, cwd, Event::Prompt(text));
+    let (mut rules_text, used) = reminders_for(v, &cfg, cwd, Event::Prompt(text));
+    if let Some(note) = correction_note(v, text) {
+        rules_text.push_str(&note);
+    }
     // Without a config, dotonce isn't set up yet: leave no index behind.
     let facts_block = file_cfg.is_some().then(|| {
         facts_or_log(|| {
@@ -231,6 +235,17 @@ fn prompt(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
         })
     });
     Ok(compose(&rules_text, facts_block.flatten()).map(|b| context("UserPromptSubmit", &b)))
+}
+
+/// The note that asks Claude to turn a correction into a rule set, when the
+/// typed prompt reads like one and Claude has replied in this session. Only
+/// where the user can answer the proposal (`chat::interactive`).
+fn correction_note(v: &Value, text: &str) -> Option<String> {
+    if !chat::interactive() || correction::flagged(text).is_empty() {
+        return None;
+    }
+    let transcript = v.get("transcript_path").and_then(Value::as_str)?;
+    correction::answered(Path::new(transcript)).then(|| correction::note(&self_command()))
 }
 
 /// The user's answer to a chat approval code, stopped before it reaches

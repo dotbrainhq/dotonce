@@ -1,10 +1,13 @@
 pub mod approvals;
+pub mod ask;
 pub mod autopilot;
+pub mod backtest;
 pub mod catches;
 pub mod chat;
 pub mod checks;
 pub mod commands;
 pub mod config;
+pub mod correction;
 pub mod display;
 pub mod fact;
 pub mod facts;
