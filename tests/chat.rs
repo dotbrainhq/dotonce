@@ -1,7 +1,8 @@
 //! The autopilot and the chat: rule sets turn on log-only by themselves,
 //! move to fix on their catches, and each change comes with a code only the
-//! user sees. Only a proposal that would change a set at fix, or one the
-//! user turned off, waits for the user's code.
+//! user sees. A proposal waits for the user's code when it would change a
+//! set at fix or one the user turned off, or when Claude proposed it from a
+//! correction with `--ask`.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -55,6 +56,7 @@ fn run_with(
         .env("DOTONCE_HOME", h.join("dotonce"))
         .env("HOME", h)
         .env_remove("CLAUDECODE")
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
         .env_remove("AI_AGENT")
         .envs(env.iter().copied())
@@ -691,4 +693,325 @@ fn claude_running_the_hook_itself_changes_nothing() {
     assert!(ok);
     assert_eq!(blocked(&out), None, "{out}");
     assert_eq!(state(&h, "acme"), "warn");
+}
+
+/// A rule Claude writes from a correction, on in the test home.
+fn asked_rule(h: &Path) -> String {
+    format!(
+        "id = \"acme\"\n[when]\nfolders = [\"{}\"]\n[[check]]\nid = \"inline-links\"\nkind = \"bare-url\"\nwhy = \"Links go inline as anchor text.\"\n",
+        h.display()
+    )
+}
+
+/// `rules propose FILE --ask`, with `extra` flags after it.
+fn propose_ask(h: &Path, src: &str, extra: &[&str]) -> String {
+    let file = h.join("acme.toml");
+    std::fs::write(&file, src).unwrap();
+    let mut args = vec!["rules", "propose", file.to_str().unwrap(), "--ask"];
+    args.extend_from_slice(extra);
+    let (out, ok) = run(h, h, &args, None, None);
+    assert!(ok, "{out}");
+    out
+}
+
+/// A session record in the test home's Claude Code folder: one prompt and
+/// one reply in `cwd`. Returns its path.
+fn transcript(h: &Path, sid: &str, cwd: &Path, reply: Option<&str>) -> PathBuf {
+    let dashed: String = cwd
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let dir = h.join(".claude/projects").join(dashed);
+    std::fs::create_dir_all(&dir).unwrap();
+    let now = days_ago(0);
+    let mut text = serde_json::json!({"type": "user", "isSidechain": false, "cwd": cwd, "sessionId": sid, "timestamp": now, "message": {"role": "user", "content": "Add the docs link to the acme readme."}}).to_string() + "\n";
+    if let Some(r) = reply {
+        text += &(serde_json::json!({"type": "assistant", "isSidechain": false, "cwd": cwd, "sessionId": sid, "timestamp": now, "message": {"role": "assistant", "content": [{"type": "text", "text": r}]}}).to_string() + "\n");
+    }
+    let f = dir.join(format!("{sid}.jsonl"));
+    std::fs::write(&f, text).unwrap();
+    f
+}
+
+fn proposals(h: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(h.join("dotonce/proposals"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn an_asked_rule_waits_for_a_yes_and_turns_on_at_fix() {
+    let h = home("ask-yes");
+    transcript(
+        &h,
+        "old-session",
+        &h,
+        Some("The steps are at https://example.com/docs today."),
+    );
+    let out = propose_ask(
+        &h,
+        &asked_rule(&h),
+        &["--note", "Links go inline, as asked."],
+    );
+    assert!(out.contains("Proposed acme: 1 check."), "{out}");
+    assert!(
+        out.contains("waits for the user's yes, and turns on at fix"),
+        "{out}"
+    );
+    assert!(out.contains("Last 14 days: 1 hit in 1 session"), "{out}");
+    assert!(out.contains("https://example.com/docs"), "{out}");
+    assert_eq!(proposals(&h), ["acme.ask.json", "acme.toml"]);
+
+    // The end of the turn shows it and leaves it waiting.
+    let notice = stop(&h, "s1", &h, None);
+    assert!(
+        notice.contains("acme (a rule from your correction): turns on at fix, 1 check."),
+        "{notice}"
+    );
+    assert!(
+        notice.contains(&format!("  Scope: {}.", h.display())),
+        "{notice}"
+    );
+    assert!(
+        notice.contains("  Last 14 days: 1 hit in 1 session"),
+        "{notice}"
+    );
+    assert!(
+        notice.contains("  Claude's note: Links go inline, as asked."),
+        "{notice}"
+    );
+    assert!(notice.contains("Send yes "), "{notice}");
+    assert_eq!(state(&h, "acme"), "");
+    // Another session's turn ends: it shows the same ask with a new code.
+    let notice = stop(&h, "s2", &h, None);
+    assert_eq!(
+        state(&h, "acme"),
+        "",
+        "the autopilot turned on an asked rule"
+    );
+
+    let code = code_for(&notice, "acme");
+    let reason = blocked(&prompt(&h, "s2", &h, &format!("yes {code}"), None)).unwrap();
+    assert!(
+        reason.contains("dotonce: acme is on at fix. Send no "),
+        "{reason}"
+    );
+    assert!(reason.contains("within 7 days to turn it off."), "{reason}");
+    assert_eq!(level_of(&h, "acme"), "fix");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(h.join("dotonce/approvals.json")).unwrap())
+            .unwrap();
+    assert!(
+        !v["sets"]["acme"]["promoted"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "a yes at fix must still let replies that stay broken move it back"
+    );
+    assert!(proposals(&h).is_empty(), "{:?}", proposals(&h));
+    let archived = done(&h);
+    assert!(
+        archived
+            .iter()
+            .any(|n| n.starts_with("acme-applied-") && n.ends_with(".toml"))
+    );
+    assert!(
+        archived
+            .iter()
+            .any(|n| n.starts_with("acme-applied-") && n.ends_with(".ask.json"))
+    );
+
+    // `dotonce` lists it as the user's change, and its code undoes it.
+    let list = blocked(&prompt(&h, "s2", &h, "dotonce", None)).unwrap();
+    assert!(list.contains("dotonce changed 1 rule set."), "{list}");
+    assert!(list.contains("acme turned on after your yes."), "{list}");
+    let code = code_for(&list, "acme");
+    let reason = blocked(&prompt(&h, "s2", &h, &format!("no {code}"), None)).unwrap();
+    assert_eq!(reason, "dotonce: acme is off.");
+    assert_eq!(level_of(&h, "acme"), "off");
+}
+
+#[test]
+fn an_asked_change_to_a_live_set_names_it_and_undoes_to_the_old_version() {
+    let h = home("ask-replace");
+    let f = rule(&h, "acme", &asked_rule(&h));
+    start(&h, "s0", &h, None);
+    assert_eq!(level_of(&h, "acme"), "warn");
+    let out = propose_ask(
+        &h,
+        &format!(
+            "{}\n[[check]]\nid = \"no-todo\"\nwhy = \"No TODO left in replies.\"\nforbid = [\"TODO\"]\n",
+            asked_rule(&h)
+        ),
+        &[],
+    );
+    assert!(
+        out.contains("Overlap: acme is on now at warn, with 1 check: a yes replaces it."),
+        "{out}"
+    );
+    let notice = stop(&h, "s1", &h, None);
+    assert!(
+        notice.contains("  Overlap: acme is on now at warn"),
+        "{notice}"
+    );
+    let code = code_for(&notice, "acme");
+    let reason = blocked(&prompt(&h, "s1", &h, &format!("yes {code}"), None)).unwrap();
+    assert!(
+        reason.contains("within 7 days to put the old version back."),
+        "{reason}"
+    );
+    assert_eq!(level_of(&h, "acme"), "fix");
+    assert!(std::fs::read_to_string(&f).unwrap().contains("no-todo"));
+
+    let code = reason[reason.find("Send no ").unwrap() + 8..][..4].to_string();
+    let reason = blocked(&prompt(&h, "s1", &h, &format!("no {code}"), None)).unwrap();
+    assert!(
+        reason.contains("back to the version before the change"),
+        "{reason}"
+    );
+    assert!(!std::fs::read_to_string(&f).unwrap().contains("no-todo"));
+}
+
+#[test]
+fn no_drops_an_asked_rule() {
+    let h = home("ask-no");
+    propose_ask(&h, &asked_rule(&h), &[]);
+    let notice = stop(&h, "s1", &h, None);
+    let code = code_for(&notice, "acme");
+    let reason = blocked(&prompt(&h, "s1", &h, &format!("no {code}"), None)).unwrap();
+    assert_eq!(
+        reason,
+        "dotonce: dropped the proposed acme. Nothing changed."
+    );
+    assert!(proposals(&h).is_empty(), "{:?}", proposals(&h));
+    let archived = done(&h);
+    assert!(
+        archived
+            .iter()
+            .any(|n| n.starts_with("acme-dropped-") && n.ends_with(".toml"))
+    );
+    assert!(
+        archived
+            .iter()
+            .any(|n| n.starts_with("acme-dropped-") && n.ends_with(".ask.json"))
+    );
+    stop(&h, "s2", &h, None);
+    assert_eq!(state(&h, "acme"), "");
+}
+
+#[test]
+fn an_asked_rule_with_no_answer_goes_after_seven_days() {
+    let h = home("ask-expire");
+    propose_ask(&h, &asked_rule(&h), &[]);
+    let f = h.join("dotonce/proposals/acme.ask.json");
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+    v["created"] = days_ago(8).into();
+    std::fs::write(&f, v.to_string()).unwrap();
+
+    let notice = stop(&h, "s1", &h, None);
+    assert!(!notice.contains("acme"), "{notice}");
+    assert!(proposals(&h).is_empty(), "{:?}", proposals(&h));
+    let archived = done(&h);
+    assert!(
+        archived
+            .iter()
+            .any(|n| n.starts_with("acme-expired-") && n.ends_with(".toml"))
+    );
+    assert!(
+        archived
+            .iter()
+            .any(|n| n.starts_with("acme-expired-") && n.ends_with(".ask.json"))
+    );
+    assert_eq!(state(&h, "acme"), "");
+}
+
+#[test]
+fn a_plain_propose_after_an_ask_takes_the_autopilot_path() {
+    let h = home("ask-plain");
+    propose_ask(&h, &asked_rule(&h), &[]);
+    propose(&h, &asked_rule(&h));
+    assert_eq!(proposals(&h), ["acme.toml"]);
+    assert!(done(&h).iter().any(|n| n.starts_with("acme-superseded-")));
+    let notice = stop(&h, "s1", &h, None);
+    assert!(
+        notice.contains("dotonce changed 1 rule set by itself."),
+        "{notice}"
+    );
+    assert_eq!(level_of(&h, "acme"), "warn");
+}
+
+#[test]
+fn a_note_needs_ask_and_a_bad_pattern_fails_at_propose() {
+    let h = home("ask-flags");
+    let file = h.join("acme.toml");
+    std::fs::write(&file, asked_rule(&h)).unwrap();
+    let (_, ok) = run(
+        &h,
+        &h,
+        &["rules", "propose", file.to_str().unwrap(), "--note", "x"],
+        None,
+        None,
+    );
+    assert!(!ok);
+    std::fs::write(
+        &file,
+        format!(
+            "id = \"acme\"\n[when]\nfolders = [\"{}\"]\n[[check]]\nid = \"look\"\nwhy = \"x\"\nforbid_regex = '(?=acme)'\n",
+            h.display()
+        ),
+    )
+    .unwrap();
+    let (_, ok) = run(
+        &h,
+        &h,
+        &["rules", "propose", file.to_str().unwrap(), "--ask"],
+        None,
+        None,
+    );
+    assert!(
+        !ok,
+        "a pattern Rust regex can't compile must fail at propose"
+    );
+    assert!(!h.join("dotonce/proposals/acme.ask.json").exists());
+}
+
+/// What the prompt hook adds for `text`, with `transcript` as the session.
+fn prompt_with(h: &Path, text: &str, transcript: &Path, entry: Option<&str>) -> String {
+    hook(
+        h,
+        "prompt",
+        serde_json::json!({"session_id": "s1", "prompt": text, "cwd": h, "transcript_path": transcript}),
+        entry,
+    )
+}
+
+#[test]
+fn a_correction_after_a_reply_gets_the_rule_note() {
+    let h = home("note");
+    let fresh = transcript(&h, "fresh", &h, None);
+    let replied = transcript(&h, "replied", &h, Some("Here is the acme readme."));
+    let note = "This prompt may be a correction.";
+    let correction = "Why did you paste a bare link?";
+
+    assert!(!prompt_with(&h, correction, &fresh, None).contains(note));
+    let out = prompt_with(&h, correction, &replied, None);
+    assert!(out.contains(note), "{out}");
+    assert!(out.contains("rules propose FILE --ask --note"), "{out}");
+    assert!(
+        !prompt_with(
+            &h,
+            "Add a link to example.com in the acme readme.",
+            &replied,
+            None
+        )
+        .contains(note)
+    );
+    assert!(!prompt_with(&h, correction, &replied, Some("sdk-cli")).contains(note));
 }

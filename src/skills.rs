@@ -66,7 +66,7 @@ fn record_text(v: &Value) -> String {
 
 /// The skills one session record entry loads: a `Skill` call, a `Read` of a
 /// skill's `SKILL.md`, or the note Claude Code adds when a skill loads.
-fn loads_in(v: &Value) -> Vec<String> {
+pub(crate) fn loads_in(v: &Value) -> Vec<String> {
     if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
         return Vec::new();
     }

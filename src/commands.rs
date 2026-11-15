@@ -242,7 +242,10 @@ fn now_text() -> String {
     chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-pub fn rules_propose(file: &Path) -> Result<()> {
+pub fn rules_propose(file: &Path, ask: bool, note: &str) -> Result<()> {
+    if ask {
+        return rules_propose_ask(file, note);
+    }
     let set = crate::chat::propose(file)?;
     let n = set.checks.len();
     println!(
@@ -255,6 +258,62 @@ pub fn rules_propose(file: &Path) -> Result<()> {
          set at fix, or one the user turned off, waits for the user's OK in the chat instead. \
          Don't ask them to run a command."
     );
+    Ok(())
+}
+
+/// `rules propose --ask`: checks the set against the sets on now and the
+/// last two weeks of sessions, then keeps it to wait for the user's yes.
+fn rules_propose_ask(file: &Path, note: &str) -> Result<()> {
+    use crate::{ask, backtest, chat};
+    let p = chat::read_proposal(file)?;
+    rules::validate(&p.set)?;
+    let level = ask::level_for(&p.src, &p.set);
+    let loaded = rules::load()?;
+    let hide = hidden_ids(&loaded.sets, &loaded.errors)?;
+    let found = ask::overlaps(&p.set, &loaded.sets, &approvals::load()?, &hide);
+    let cfg = config::load()?;
+    let private_ok = cfg.private_allowed(&std::env::current_dir().unwrap_or_default());
+    let report = backtest::projects_dir()
+        .map(|dir| backtest::run(&p.set, &dir, &cfg, private_ok, std::time::SystemTime::now()));
+    let mut q = ask::Ask::new(level, note, chrono::Utc::now());
+    q.backtest = report
+        .as_ref()
+        .map(backtest::Report::line)
+        .unwrap_or_default();
+    q.overlaps = found.notes.clone();
+    q.also_on = found.sets.clone();
+    // The ask goes first, so the autopilot of a session ending meanwhile
+    // never takes the set for one to turn on by itself.
+    ask::save(&p.set.id, &q)?;
+    chat::keep(&p)?;
+
+    let n = p.set.checks.len();
+    println!(
+        "Proposed {}: {n} check{}. It waits for the user's yes, and turns on at {} if they say \
+         it. dotonce shows them the code at the end of this turn, so don't ask them to run a \
+         command or repeat the notice.",
+        printable(&p.set.id),
+        if n == 1 { "" } else { "s" },
+        level.as_str()
+    );
+    if let Some(r) = &report {
+        println!("{}", r.line());
+        for h in &r.examples {
+            println!("  {} {} {}: {}", h.day, h.folder, h.check, h.line);
+        }
+        if r.hits > 0 {
+            println!(
+                "If a hit is one the user would call fine, narrow the scope or add a [draft] \
+                 skip, then propose the file again."
+            );
+        }
+    }
+    for o in &found.notes {
+        println!("Overlap: {o}");
+    }
+    if !found.checks.is_empty() {
+        println!("Also on in this scope: {}.", found.checks.join(", "));
+    }
     Ok(())
 }
 
