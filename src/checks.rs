@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use crate::hook::log_error;
 use crate::rules::{Check, CheckKind, On, Pattern, RuleSet};
+use crate::skills::Seen;
 
 /// A failing line is cut to this many characters in messages.
 pub const LINE_CHARS: usize = 120;
@@ -18,6 +19,20 @@ static URL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bhttps?://\S").expect("url pattern"));
 static REF_DEF: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^ {0,3}\[[^\]]+\]:\s").expect("reference pattern"));
+/// A line that reads as a command, code or a log rather than prose.
+static CODE_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"^(\$ |#!|#\d|[A-Z_][A-Z0-9_]*=|",
+        r"(cd|git|npm|npx|pnpm|yarn|cargo|python3?|pip3?|curl|wget|ls|cat|sudo|wp|brew|gh|open|echo|export|rm|mv|cp|mkdir|chmod|docker|composer|php|node|make)\s)",
+        r"|[;{}]$|=>|::|</|/>|\(\)|&&|\|\|",
+        r"|^(fn|def|function|class|import|from|use|let|const|var|return|if|for|while)\b.*[({:=]",
+    ))
+    .expect("code line pattern")
+});
+static SENTENCE_END: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?m)[\p{L}\d)"'][.?!](\s|$)"#).expect("sentence pattern"));
+/// A draft has at least this many words before it counts as prose.
+const PROSE_WORDS: usize = 25;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Failure {
@@ -317,8 +332,62 @@ fn usable<'a>(set: &str, p: &'a Pattern) -> Option<&'a Regex> {
         .ok()
 }
 
+/// Whether a draft reads as prose someone would send: enough words, real
+/// sentences, and at most one line in five that looks like a command, code
+/// or a log. Inline code doesn't count against a line.
+pub fn prose(text: &str) -> bool {
+    let words = text
+        .split_whitespace()
+        .filter(|w| w.chars().filter(|c| c.is_alphabetic()).count() >= 2)
+        .count();
+    if words < PROSE_WORDS || !SENTENCE_END.is_match(text) {
+        return false;
+    }
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let code = lines
+        .iter()
+        .filter(|l| CODE_LINE.is_match(strip_code(l).trim()))
+        .count();
+    code * 5 <= lines.len()
+}
+
+/// The draft's first line with text, cut for messages.
+fn first_line(text: &str) -> String {
+    cut(text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or_default())
+}
+
+/// The line that breaks the check and why, or None when the draft passes.
+/// A skill-loaded check fails a prose draft when none of its skills has
+/// loaded and there is one to load.
+pub fn failing(set: &RuleSet, check: &Check, draft: &str, seen: &Seen) -> Option<(String, String)> {
+    let CheckKind::SkillLoaded(list) = &check.kind else {
+        return failing_line(&set.id, check, draft).map(|l| (l, check.why.clone()));
+    };
+    if !prose(draft) {
+        return None;
+    }
+    let choices = seen.choices(list);
+    if choices.is_empty() || seen.any(list) {
+        return None;
+    }
+    let why = format!(
+        "{} Writing skills: {}.",
+        check.why.trim_end(),
+        choices.join(", ")
+    );
+    Some((first_line(draft), why))
+}
+
 /// The line that breaks the check, cut for messages, or None when the text
-/// passes. `set` names the check's set when a pattern doesn't compile.
+/// passes. `set` names the check's set when a pattern doesn't compile. A
+/// skill-loaded check needs the session, so it passes here: see `failing`.
 pub fn failing_line(set: &str, check: &Check, text: &str) -> Option<String> {
     match &check.kind {
         CheckKind::Forbid(list) => list.iter().find_map(|p| find_phrase(text, p)).map(cut),
@@ -331,12 +400,13 @@ pub fn failing_line(set: &str, check: &Check, text: &str) -> Option<String> {
         CheckKind::RepeatOf { pattern, max } => repeat(text, usable(set, pattern)?, *max).map(cut),
         CheckKind::MaxParagraphs(max) => paragraphs(text).get(*max).copied().map(cut),
         CheckKind::MaxWords(max) => over_words(text, *max).map(cut),
+        CheckKind::SkillLoaded(_) => None,
     }
 }
 
 /// Runs the set's reply checks on each of its drafts in `text`. Each check
 /// fails at most once, with the first line that breaks it.
-pub fn run_reply(set: &RuleSet, text: &str) -> Vec<Failure> {
+pub fn run_reply(set: &RuleSet, text: &str, seen: &Seen) -> Vec<Failure> {
     let drafts = drafts(set, text);
     set.checks
         .iter()
@@ -344,12 +414,12 @@ pub fn run_reply(set: &RuleSet, text: &str) -> Vec<Failure> {
         .filter_map(|c| {
             drafts
                 .iter()
-                .find_map(|d| failing_line(&set.id, c, d))
-                .map(|line| Failure {
+                .find_map(|d| failing(set, c, d, seen))
+                .map(|(line, why)| Failure {
                     set: set.id.clone(),
                     check: c.id.clone(),
                     line,
-                    why: c.why.clone(),
+                    why,
                 })
         })
         .collect()
@@ -363,6 +433,10 @@ mod tests {
 
     fn set(body: &str) -> RuleSet {
         parse(&format!("id = \"t\"\n{body}"), Path::new("/r/t.toml")).unwrap()
+    }
+
+    fn no_skills() -> Seen<'static> {
+        Seen::new(&[], None, Path::new("/"))
     }
 
     fn fails(kind: &str, text: &str) -> Option<String> {
@@ -549,11 +623,16 @@ mod tests {
         assert!(
             run_reply(
                 &s,
-                "Sorry for the wait, I checked.\n```markdown\nHi Sam,\n```"
+                "Sorry for the wait, I checked.\n```markdown\nHi Sam,\n```",
+                &no_skills()
             )
             .is_empty()
         );
-        let f = run_reply(&s, "Draft:\n```markdown\nHi Sam,\nSorry for the wait.\n```");
+        let f = run_reply(
+            &s,
+            "Draft:\n```markdown\nHi Sam,\nSorry for the wait.\n```",
+            &no_skills(),
+        );
         assert_eq!(
             f,
             vec![Failure {
@@ -563,5 +642,72 @@ mod tests {
                 why: "Open with a line from the thread.".to_string(),
             }]
         );
+    }
+
+    const PROSE: &str = "Hi Sam,\n\nThanks for the details on the checkout page. I tested the same steps on a fresh store and the coupon applies there. Could you share the plugin list from your store so I can compare the two?\n";
+
+    #[test]
+    fn prose_means_sentences_not_commands_or_code() {
+        assert!(prose(PROSE));
+        assert!(prose(
+            "Run `npm run build` first. Then open Settings -> Payments and check that the test mode toggle is on, since the sandbox keys only work there. If it still fails, send me the log from that page and I'll take a look at it."
+        ));
+        assert!(!prose("Hi Sam,\nThanks, that works."), "too short");
+        assert!(
+            !prose(
+                "cd ~/acme\ngit pull origin main\nnpm install\nnpm run build\nThe build writes to the dist folder and takes about a minute on a fresh checkout, then the server restarts on its own."
+            ),
+            "mostly commands"
+        );
+        assert!(
+            !prose(
+                "fn main() {\n    let store = Store::open(\"acme\");\n    store.sync();\n}\nThis opens the store and syncs it with the remote copy before the first request comes in from the client."
+            ),
+            "code"
+        );
+        assert!(
+            !prose(
+                "acme checkout coupon cart totals shipping zones tax classes product variations stock levels order notes refund reasons payment gateways webhooks endpoints customers accounts sessions"
+            ),
+            "no sentence"
+        );
+    }
+
+    #[test]
+    fn skill_loaded_fails_a_prose_draft_until_a_listed_skill_loads() {
+        let s = set(
+            "[draft]\nfence = [\"\", \"markdown\"]\n[[check]]\nid = \"skill-first\"\nkind = \"skill-loaded\"\nskills = [\"acme-writer\", \"acme-notes\"]\nwhy = \"Load the writing skill that fits first.\"\n",
+        );
+        let reply = format!("Here it is:\n\n```\n{PROSE}```\n");
+        let f = run_reply(&s, &reply, &no_skills());
+        assert_eq!(
+            f,
+            vec![Failure {
+                set: "t".to_string(),
+                check: "skill-first".to_string(),
+                line: "Hi Sam,".to_string(),
+                why: "Load the writing skill that fits first. Writing skills: acme-writer, acme-notes."
+                    .to_string(),
+            }]
+        );
+        let loaded = vec!["acme:acme-notes".to_string()];
+        let seen = Seen::new(&loaded, None, Path::new("/"));
+        assert!(run_reply(&s, &reply, &seen).is_empty());
+        let other = vec!["code-review".to_string()];
+        let seen = Seen::new(&other, None, Path::new("/"));
+        assert_eq!(run_reply(&s, &reply, &seen).len(), 1);
+        let commands = "Run these:\n\n```\ncd ~/acme\ngit pull\nnpm install\nnpm run build\n```\n";
+        assert!(run_reply(&s, commands, &no_skills()).is_empty());
+        assert!(
+            run_reply(&s, PROSE, &no_skills()).is_empty(),
+            "not in a fence"
+        );
+        let bash = format!("```bash\n{PROSE}```\n");
+        assert!(
+            run_reply(&s, &bash, &no_skills()).is_empty(),
+            "not a draft fence"
+        );
+        // Text-only callers can't see the session, so it passes there.
+        assert_eq!(failing_line("t", &s.checks[0], PROSE), None);
     }
 }

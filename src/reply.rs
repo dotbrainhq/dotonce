@@ -14,12 +14,16 @@ use crate::chat;
 use crate::checks::{self, Failure};
 use crate::config;
 use crate::hook::{log_error, prompt_id, session_id};
-use crate::session::{self, Pending};
+use crate::rules::CheckKind;
+use crate::session::{self, Nudge, Pending};
+use crate::skills::Seen;
 
 pub const SEND_BACK_END: &str =
     "Write the draft again with these fixed. Add one line saying what you fixed.";
 pub const SEND_BACK_START: &str =
     "dotonce checked the draft in your reply against the user's rule sets. It breaks these rules:";
+/// How the next prompt's line starts after a skill-loaded catch at warn.
+pub const NUDGE_START: &str = "Your last reply had a draft and no writing skill was loaded.";
 const TAIL_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PARTS: usize = 200;
 
@@ -204,7 +208,13 @@ fn fresh_start(p: &Pending, turn: &Turn) -> Option<usize> {
 
 /// After a send-back, logs whether each sent-back check is fixed in
 /// `fresh`, the text that came after it. None when the cut can't be found.
-fn recheck(p: &Pending, live: &[Live], fresh: Option<&str>, log: &dyn Fn(&Live, &str, Outcome)) {
+fn recheck(
+    p: &Pending,
+    live: &[Live],
+    fresh: Option<&str>,
+    seen: &Seen,
+    log: &dyn Fn(&Live, &str, Outcome),
+) {
     for (set_id, check_id) in &p.checks {
         let Some(l) = live.iter().find(|l| &l.set.id == set_id) else {
             continue;
@@ -217,7 +227,7 @@ fn recheck(p: &Pending, live: &[Live], fresh: Option<&str>, log: &dyn Fn(&Live, 
             Outcome::Unverified
         } else if drafts
             .iter()
-            .any(|d| checks::failing_line(set_id, c, d).is_some())
+            .any(|d| checks::failing(&l.set, c, d, seen).is_some())
         {
             Outcome::StillBroken
         } else {
@@ -279,6 +289,13 @@ fn send_back(v: &Value, cwd: &Path, now: i64, sid: &str, dir: &Path) -> Result<O
         )
     };
     let parts = &turn_read.parts;
+    let record = v
+        .get("transcript_path")
+        .and_then(Value::as_str)
+        .filter(|p| !p.is_empty())
+        .map(|p| (Path::new(p), state.skills_read));
+    let skills = state.skills.clone();
+    let seen = Seen::new(&skills, record, cwd);
     let time = catches::timestamp(now);
     let log = |l: &Live, check: &str, outcome: Outcome| {
         let c = Catch {
@@ -296,7 +313,7 @@ fn send_back(v: &Value, cwd: &Path, now: i64, sid: &str, dir: &Path) -> Result<O
     let caught = |state: &mut session::State, text: &str| {
         let mut fails = Vec::new();
         for &l in &checking {
-            for f in checks::run_reply(&l.set, text) {
+            for f in checks::run_reply(&l.set, text, &seen) {
                 if state.first_log(&turn, &l.set.id, &f.check) {
                     log(l, &f.check, Outcome::Caught);
                 }
@@ -305,21 +322,23 @@ fn send_back(v: &Value, cwd: &Path, now: i64, sid: &str, dir: &Path) -> Result<O
         }
         fails
     };
+    let mut fails = Vec::new();
     let out = if again {
         if let Some(p) = state.take_pending(&turn) {
             let fresh = fresh_start(&p, &turn_read).map(|start| parts[start..].join("\n\n"));
-            recheck(&p, &live, fresh.as_deref(), &log);
+            recheck(&p, &live, fresh.as_deref(), &seen, &log);
             // The corrected draft can break a check the first one passed.
             if let Some(f) = &fresh {
-                caught(&mut state, f);
+                fails = caught(&mut state, f);
             }
         }
         None
     } else {
-        let send: Vec<Failure> = caught(&mut state, &parts.join("\n\n"))
-            .into_iter()
+        fails = caught(&mut state, &parts.join("\n\n"));
+        let send: Vec<Failure> = fails
+            .iter()
             .filter(|(l, _)| fix.contains(&l.set.id))
-            .map(|(_, f)| f)
+            .map(|(_, f)| f.clone())
             .collect();
         if send.is_empty() {
             None
@@ -336,8 +355,34 @@ fn send_back(v: &Value, cwd: &Path, now: i64, sid: &str, dir: &Path) -> Result<O
             Some(send_back_text(&send))
         }
     };
+    // A warn set's skill-loaded catch leaves a line for the next prompt:
+    // drafts come in rounds, so it lands before the next one.
+    if let Some((l, f)) = fails
+        .iter()
+        .find(|(l, f)| !fix.contains(&l.set.id) && skill_check(l, &f.check))
+    {
+        state.nudge = Some(Nudge {
+            set: l.set.id.clone(),
+            check: f.check.clone(),
+            text: format!("{NUDGE_START} {}", f.why),
+        });
+    }
+    if let Some((names, end)) = seen.read_from_record() {
+        for n in names {
+            state.saw_skill(n);
+        }
+        state.skills_read = *end;
+    }
     session::save(dir, sid, &state)?;
     Ok(out)
+}
+
+/// Whether the set's check with this id is a skill-loaded check.
+fn skill_check(l: &Live, check: &str) -> bool {
+    l.set
+        .checks
+        .iter()
+        .any(|c| c.id == check && matches!(c.kind, CheckKind::SkillLoaded(_)))
 }
 
 #[cfg(test)]

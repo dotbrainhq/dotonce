@@ -12,13 +12,16 @@ use crate::approvals::{self, Live};
 use crate::checks::{fence_closes, fence_open};
 use crate::config::{self, Config, home_dir, path_inside};
 use crate::facts::word_match;
-use crate::rules::Level;
+use crate::rules::{CheckKind, Level};
+use crate::skills;
 
 /// The Skill tool's input field that names the skill (task 1, D1).
 pub const SKILL_FIELD: &str = "skill";
 const KEEP: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_SENT_BACK: usize = 50;
 const MAX_LOGGED: usize = 200;
+/// Skills remembered as loaded in one session.
+const MAX_SKILLS: usize = 100;
 /// Facts remembered as given in one session. Past this, the oldest can come
 /// again, which costs a few lines and no more.
 const MAX_GIVEN_FACTS: usize = 300;
@@ -72,6 +75,22 @@ pub struct Pending {
     pub checks: Vec<(String, String)>,
 }
 
+/// The line the next prompt gives Claude after a draft broke a warn set's
+/// skill-loaded check.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Nudge {
+    pub set: String,
+    pub check: String,
+    pub text: String,
+}
+
+impl Nudge {
+    /// The label it's given under, apart from the set's own reminder.
+    pub fn label(&self) -> String {
+        format!("{}/{}", self.set, self.check)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
@@ -102,6 +121,20 @@ pub struct State {
     /// don't come again until the fact changes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub facts: Vec<(String, String)>,
+    /// The skills the session loaded, as the Skill and slash-command hooks
+    /// and the session record showed them. Kept through compaction: the
+    /// skill was still loaded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
+    /// The byte of the session record that reading it for skills reached.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub skills_read: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nudge: Option<Nudge>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl State {
@@ -119,6 +152,18 @@ impl State {
         self.pending.push(p);
         while self.pending.len() > MAX_SENT_BACK {
             self.pending.remove(0);
+        }
+    }
+
+    /// Remembers a skill the session loaded.
+    pub fn saw_skill(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() || self.skills.iter().any(|s| s == name) {
+            return;
+        }
+        self.skills.push(name.to_string());
+        while self.skills.len() > MAX_SKILLS {
+            self.skills.remove(0);
         }
     }
 
@@ -520,6 +565,10 @@ pub fn refresh(
     event: Event,
 ) {
     let private_ok = cfg.private_allowed(cwd);
+    if let Event::Skill(name) = event {
+        state.saw_skill(name);
+        drop_nudge(state, live, name);
+    }
     let new_turn = match prompt_id {
         Some(p) => state.prompt_id.as_deref() != Some(p),
         None => matches!(event, Event::Prompt(_)),
@@ -622,6 +671,25 @@ pub fn pending_reminders(state: &State, live: &[Live]) -> Vec<(String, String)> 
         .filter(|a| a.by != Trigger::Prompt || !given(state, live, &a.id))
         .filter_map(|a| reminder(live, &a.id))
         .collect()
+}
+
+/// Drops the nudge once the skill that loaded is one it asked for, or its
+/// check is gone.
+fn drop_nudge(state: &mut State, live: &[Live], skill: &str) {
+    let Some(n) = &state.nudge else {
+        return;
+    };
+    let list = live
+        .iter()
+        .find(|l| l.set.id == n.set)
+        .and_then(|l| l.set.checks.iter().find(|c| c.id == n.check))
+        .and_then(|c| match &c.kind {
+            CheckKind::SkillLoaded(list) => Some(list),
+            _ => None,
+        });
+    if list.is_none_or(|list| skills::wanted(list, skill)) {
+        state.nudge = None;
+    }
 }
 
 /// Records that these sets' reminders were given.

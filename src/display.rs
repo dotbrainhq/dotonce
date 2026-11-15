@@ -16,6 +16,7 @@ use crate::checks::{self, fence_closes, fence_open};
 use crate::hook::{log_error, prompt_id, session_id, str_field};
 use crate::plugin;
 use crate::session;
+use crate::skills::Seen;
 
 /// The line shown below a draft that breaks the checks with these ids.
 pub fn label(ids: &[String]) -> String {
@@ -64,7 +65,7 @@ fn marks_drafts(l: &Live, info: &str) -> bool {
 /// The ids of the checks the copied draft breaks, for the sets that mark
 /// its fence. A whole-reply set checks the full reply at Stop, never one
 /// block of it.
-fn broken(buf: &mut DraftCopy, sets: &[&Live]) -> Vec<String> {
+fn broken(buf: &mut DraftCopy, sets: &[&Live], seen: &Seen) -> Vec<String> {
     let text = buf.lines.concat();
     buf.lines.clear();
     let info = text
@@ -75,7 +76,7 @@ fn broken(buf: &mut DraftCopy, sets: &[&Live]) -> Vec<String> {
         .unwrap_or_default();
     let mut ids: Vec<String> = Vec::new();
     for l in sets.iter().filter(|l| marks_drafts(l, &info)) {
-        for f in checks::run_reply(&l.set, &text) {
+        for f in checks::run_reply(&l.set, &text, seen) {
             if !ids.contains(&f.check) {
                 ids.push(f.check);
             }
@@ -86,7 +87,7 @@ fn broken(buf: &mut DraftCopy, sets: &[&Live]) -> Vec<String> {
 
 /// Reads one whole line of the message and returns the ids to label when
 /// it closes a draft that breaks a set in `sets`.
-fn read_line(buf: &mut DraftCopy, line: &str, sets: &[&Live]) -> Vec<String> {
+fn read_line(buf: &mut DraftCopy, line: &str, sets: &[&Live], seen: &Seen) -> Vec<String> {
     let bare = line.trim_end_matches(['\n', '\r']);
     match buf.fence {
         Some((ch, len, draft)) => {
@@ -96,7 +97,7 @@ fn read_line(buf: &mut DraftCopy, line: &str, sets: &[&Live]) -> Vec<String> {
             if fence_closes(bare, ch, len) {
                 buf.fence = None;
                 if draft {
-                    return broken(buf, sets);
+                    return broken(buf, sets, seen);
                 }
             }
         }
@@ -124,13 +125,14 @@ fn forget(buf: &mut DraftCopy) {
 /// draft that breaks a set in `sets`, the fix sets whose drafts get labeled.
 /// A blank line comes before and after the label, so it never joins the
 /// next line or turns a following `---` into a heading. `last` is the
-/// message's final batch.
+/// message's final batch. `seen` holds the session's skills for a
+/// skill-loaded check.
 ///
 /// Only whole lines are read: a batch's unfinished last line waits in
 /// `partial` for the rest of it, except at the last batch. The batch's own
 /// text is never changed; the one newline added is at the last batch, to
 /// end a closing fence line before its label.
-pub fn step(buf: &mut DraftCopy, delta: &str, last: bool, sets: &[&Live]) -> String {
+pub fn step(buf: &mut DraftCopy, delta: &str, last: bool, sets: &[&Live], seen: &Seen) -> String {
     let mut text = std::mem::take(&mut buf.partial);
     let carried = text.len();
     text.push_str(delta);
@@ -144,7 +146,7 @@ pub fn step(buf: &mut DraftCopy, delta: &str, last: bool, sets: &[&Live]) -> Str
             buf.partial = line.to_string();
             break;
         }
-        let ids = read_line(buf, line, sets);
+        let ids = read_line(buf, line, sets, seen);
         if ids.is_empty() {
             continue;
         }
@@ -216,7 +218,16 @@ pub fn display(v: &Value, cwd: &Path) -> Result<Option<String>> {
                 forget(&mut buf);
                 delta.to_string()
             } else {
-                step(&mut buf, delta, last, &fix.iter().collect::<Vec<_>>())
+                let record = str_field(v, "transcript_path");
+                let record = (!record.is_empty()).then(|| Path::new(record));
+                let seen = Seen::new(&state.skills, record.map(|r| (r, state.skills_read)), cwd);
+                step(
+                    &mut buf,
+                    delta,
+                    last,
+                    &fix.iter().collect::<Vec<_>>(),
+                    &seen,
+                )
             }
         }
         Err(e) => {
@@ -310,6 +321,17 @@ mod tests {
     use super::*;
     use crate::rules::{Level, parse};
     use std::path::Path;
+
+    /// `step` for a session that loaded no skill.
+    fn step(buf: &mut DraftCopy, delta: &str, last: bool, sets: &[&Live]) -> String {
+        super::step(
+            buf,
+            delta,
+            last,
+            sets,
+            &Seen::new(&[], None, Path::new("/")),
+        )
+    }
 
     fn live() -> Live {
         let src = "id = \"t\"\n[draft]\nfence = [\"markdown\"]\n[[check]]\nid = \"stock\"\nforbid = [\"sorry for the wait\"]\nwhy = \"w\"\n";

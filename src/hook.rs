@@ -168,8 +168,16 @@ fn turn_on(
     session::refresh(&mut state, &live, cfg, cwd, prompt_id(v), event);
     let mut out = (String::new(), 0);
     if let Some(budget) = budget {
-        let (text, used, given) =
-            reminder_section(&session::pending_reminders(&state, &live), budget);
+        let mut rem = session::pending_reminders(&state, &live);
+        // The nudge a skill-loaded catch left comes once, with the next
+        // prompt, under a label of its own so it marks no set reminded.
+        let nudge = matches!(event, Event::Prompt(_))
+            .then(|| state.nudge.take())
+            .flatten();
+        if let Some(n) = &nudge {
+            rem.push((n.label(), n.text.clone()));
+        }
+        let (text, used, given) = reminder_section(&rem, budget);
         session::mark_reminded(&mut state, &live, &given);
         out = (text, used);
     }

@@ -151,9 +151,15 @@ pub enum CheckKind {
     ForbidRegex(Pattern),
     Require(Vec<String>),
     BareUrl,
-    RepeatOf { pattern: Pattern, max: usize },
+    RepeatOf {
+        pattern: Pattern,
+        max: usize,
+    },
     MaxParagraphs(usize),
     MaxWords(usize),
+    /// A draft in the reply needs one of these skills loaded first. Empty
+    /// means the installed skills named like writing skills.
+    SkillLoaded(Vec<String>),
 }
 
 impl CheckKind {
@@ -166,6 +172,7 @@ impl CheckKind {
             CheckKind::RepeatOf { .. } => "repeat_of",
             CheckKind::MaxParagraphs(_) => "max_paragraphs",
             CheckKind::MaxWords(_) => "max_words",
+            CheckKind::SkillLoaded(_) => "skill-loaded",
         }
     }
 }
@@ -279,6 +286,7 @@ struct RawCheck {
     max: Option<usize>,
     max_paragraphs: Option<usize>,
     max_words: Option<usize>,
+    skills: Option<Vec<String>>,
 }
 
 pub fn rules_dir() -> Result<PathBuf> {
@@ -337,7 +345,7 @@ fn check(raw: RawCheck, n: usize) -> Result<Check> {
     .count();
     if kinds == 0 {
         bail!(
-            "check {id} has no kind: give one of forbid, forbid_regex, require, kind = \"bare-url\", repeat_of, max_paragraphs or max_words"
+            "check {id} has no kind: give one of forbid, forbid_regex, require, kind = \"bare-url\", kind = \"skill-loaded\", repeat_of, max_paragraphs or max_words"
         );
     }
     if kinds > 1 {
@@ -346,6 +354,9 @@ fn check(raw: RawCheck, n: usize) -> Result<Check> {
     if raw.max.is_some() && raw.repeat_of.is_none() {
         bail!("check {id}: max only goes with repeat_of");
     }
+    if raw.skills.is_some() && raw.kind.as_deref() != Some("skill-loaded") {
+        bail!("check {id}: skills only goes with kind = \"skill-loaded\"");
+    }
     let kind = if let Some(list) = raw.forbid {
         CheckKind::Forbid(phrases(list, &id, "forbid")?)
     } else if let Some(re) = raw.forbid_regex {
@@ -353,10 +364,25 @@ fn check(raw: RawCheck, n: usize) -> Result<Check> {
     } else if let Some(list) = raw.require {
         CheckKind::Require(phrases(list, &id, "require")?)
     } else if let Some(k) = raw.kind {
-        if k != "bare-url" {
-            bail!("check {id}: unknown kind {k}: the only named kind is bare-url");
+        match k.as_str() {
+            "bare-url" => CheckKind::BareUrl,
+            "skill-loaded" => {
+                if raw.on == On::Tool {
+                    bail!("check {id}: skill-loaded checks replies, not tools");
+                }
+                let skills: Vec<String> = raw
+                    .skills
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                CheckKind::SkillLoaded(skills)
+            }
+            _ => {
+                bail!("check {id}: unknown kind {k}: the named kinds are bare-url and skill-loaded")
+            }
         }
-        CheckKind::BareUrl
     } else if let Some(re) = raw.repeat_of {
         let pattern = Pattern::new(re, format!("check {id}: repeat_of"), Some(2));
         let max = raw
@@ -476,6 +502,14 @@ fn parse_lazy(src: &str, file: &Path) -> Result<RuleSet> {
         let c = check(rc, i + 1)?;
         if checks.iter().any(|x| x.id == c.id) {
             bail!("two checks have the id {}", c.id);
+        }
+        // A whole reply reads as prose almost every time, so this check
+        // would catch every reply.
+        if matches!(c.kind, CheckKind::SkillLoaded(_)) && draft.is_none() {
+            bail!(
+                "check {}: skill-loaded checks drafts: add a [draft] table with the fences that mark one",
+                c.id
+            );
         }
         checks.push(c);
     }
@@ -636,6 +670,15 @@ why = "Under 300 words."
 # tool = "Bash"
 # forbid_regex = 'git\s+push\b.*(--force|-f\b)'
 # why = "Never force push. Ask first."
+
+# A skill-loaded check catches a draft written before a writing skill loaded.
+# It needs the [draft] table. Leave skills out to use the installed skills
+# named like writing skills.
+# [[check]]
+# id = "skill-first"
+# kind = "skill-loaded"
+# skills = ["example-skill"]
+# why = "Load the writing skill before you write a draft."
 "##;
 
 const DRAFT_TABLE: &str = "# Drafts are fenced blocks with these info strings, like ```markdown.\n# \"\" means a fence with no info string. Drop this table to check whole\n# replies instead.\n[draft]\nfence = [\"markdown\", \"draft\"]\n";
@@ -767,6 +810,36 @@ why = "No TODOs in Rust files."
         assert!(!globs.is_match("/code/notes.md"));
         assert_eq!(s.src, FULL);
         assert_eq!(s.file, PathBuf::from("/rules/acme-mail.toml"));
+    }
+
+    #[test]
+    fn skill_loaded_checks_drafts_for_the_listed_skills() {
+        let head =
+            "id = \"acme-mail\"\n[draft]\nfence = [\"\"]\n[[check]]\nid = \"first\"\nwhy = \"w\"\n";
+        let s = p(&format!(
+            "{head}kind = \"skill-loaded\"\nskills = [\" acme-writer \", \"\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(s.checks[0].kind.name(), "skill-loaded");
+        assert!(matches!(&s.checks[0].kind, CheckKind::SkillLoaded(l) if l == &["acme-writer"]));
+        let s = p(&format!("{head}kind = \"skill-loaded\"\n")).unwrap();
+        assert!(matches!(&s.checks[0].kind, CheckKind::SkillLoaded(l) if l.is_empty()));
+        assert!(
+            err(&format!(
+                "{head}kind = \"skill-loaded\"\non = \"tool\"\ntool = \"Bash\"\n"
+            ))
+            .contains("skill-loaded checks replies, not tools")
+        );
+        assert!(
+            err(&format!(
+                "{head}forbid = [\"x\"]\nskills = [\"acme-writer\"]\n"
+            ))
+            .contains("skills only goes with kind = \"skill-loaded\"")
+        );
+        assert!(
+            err("id = \"acme-mail\"\n[[check]]\nid = \"first\"\nwhy = \"w\"\nkind = \"skill-loaded\"\n")
+                .contains("skill-loaded checks drafts: add a [draft] table")
+        );
     }
 
     #[test]
