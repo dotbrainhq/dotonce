@@ -29,4 +29,3 @@ cargo test --release --test speed -- --ignored --nocapture
 
 - dotonce makes no network calls and ships no AI model. A change that adds either won't be merged.
 - A change to search needs numbers: the speed check, and the benchmark result before and after if it changes what gets found.
-- If you changed the mark or icons, edit `brand/scripts/make_brand.py` and rebuild with it, rather than editing the SVGs by hand.

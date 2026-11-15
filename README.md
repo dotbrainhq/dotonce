@@ -91,7 +91,7 @@ claude plugin marketplace add dotbrainhq/dotonce
 claude plugin install dotonce@dotonce
 ```
 
-Inside Claude Code, `/plugin marketplace add dotbrainhq/dotonce` and `/plugin install dotonce@dotonce` do the same. Start a new session after the install. The plugin runs the `dotonce` binary from your PATH or from `~/.cargo/bin`, and does nothing until the binary is installed.
+Inside Claude Code, `/plugin marketplace add dotbrainhq/dotonce` and `/plugin install dotonce@dotonce` do the same. Start a new session after the install. The plugin runs the `dotonce` binary from your PATH or from `~/.cargo/bin`. If the binary is missing, or older than the plugin, Claude Code shows you a line about it at the start of each session.
 
 From then on, each prompt gets the facts that match it. If a hook goes wrong, it adds nothing, blocks nothing, and writes the error to `~/.dotonce/errors.log`.
 
@@ -299,7 +299,7 @@ Each set's record holds its file's hash in `~/.dotonce/approvals.json`, outside 
 
 Approving, changing a level, `rules off` and `rules pause` only run from your own terminal. Each needs a real terminal and the set's id typed in, and each refuses to run when `CLAUDECODE` or `CLAUDE_CODE_ENTRYPOINT` is set. Claude Code sets both for every command its Bash tool runs.
 
-A guard runs before every Bash, Write, Edit, MultiEdit and NotebookEdit call, with or without rule sets. It stops Claude from editing rule files or approval state, and from running those four commands. Claude can still read a rule file with its file-reading tool, but a Bash read of the rules folder, like `cat ~/.dotonce/rules/acme.toml`, is blocked. The codes in `~/.dotonce/chat.json` get the same guard.
+A guard runs before every Bash, Write, Edit, MultiEdit and NotebookEdit call, with or without rule sets. It stops Claude from editing rule files or approval state, and from running those four commands. Claude can still read a rule file with its file-reading tool, but a Bash read of the rules folder, like `cat ~/.dotonce/rules/acme.toml`, is blocked. The codes in `~/.dotonce/chat.json` get the same guard. It also stops Claude from turning the dotonce plugin off with `claude plugin disable` or `uninstall`, `claude plugin disable --all`, or `claude plugin marketplace remove dotonce`. You can still run those yourself.
 
 The guard has limits. An agent with a shell can't be fully stopped from changing files it can reach. The guard reads only the text of the command Claude sends, so a script file, a command built while it runs, an alias, or a `cd` into the dotonce home followed by relative paths can get past it. Every change still shows in `dotonce rules list`, and the next session start shows a notice for a level you didn't set, a set turned off, or a file changed since approval. Changes dotonce makes by itself come with their own message, so they don't show up there twice.
 
@@ -364,7 +364,7 @@ Many popular memory tools run a background server, or call an AI model every tim
 | `src/` | The search engine and the `dotonce` command. |
 | `tests/` | End-to-end and speed tests. |
 | `bench/amb/` | The benchmark adapter, installer, smoke test, and comparison script. |
-| `brand/` | The mark, icons, and the script that rebuilds them. |
+| `plugin/` | The Claude Code plugin: its hooks, the script that runs dotonce, and the session-start notice. |
 
 ## Contributing
 
