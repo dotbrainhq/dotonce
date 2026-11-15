@@ -1,7 +1,7 @@
 //! PreToolUse: rule sets' tool checks, and the always-on guard that keeps
 //! Claude from editing rule files, approvals.json, last-live.json or
-//! chat.json, and
-//! from running the `dotonce rules` commands that change approvals.
+//! chat.json, from running the `dotonce rules` commands that change
+//! approvals, and from turning the dotonce plugin off.
 
 use std::iter::Peekable;
 use std::path::{Path, PathBuf};
@@ -16,6 +16,7 @@ use crate::catches::{self, Catch, Outcome};
 use crate::checks::{Failure, failing_line};
 use crate::config::{home_dir, lexical_normalize, resolve};
 use crate::hook::{prompt_id, session_id, str_field};
+use crate::plugin;
 use crate::rules::{Level, On, RuleSet};
 use crate::session;
 
@@ -947,21 +948,49 @@ fn names_change(text: &str) -> bool {
 /// agent writes and then runs gets past it, and the approval's terminal
 /// check covers that.
 fn runs_rule_change(cmd: &str) -> bool {
-    changes_at(cmd, 0)
+    changes_at(cmd, 0, &RULE_CHANGE)
 }
 
-fn changes_at(cmd: &str, depth: usize) -> bool {
+/// True when the command runs `claude plugin` to turn dotonce off: disable,
+/// uninstall, disable all, or remove its marketplace. Read like rule changes.
+fn turns_plugin_off(cmd: &str) -> bool {
+    changes_at(cmd, 0, &PLUGIN_OFF)
+}
+
+/// A kind of command the guard denies, as it reads at each level.
+struct Change {
+    /// True when a simple command's words run it.
+    runs: fn(&[String]) -> bool,
+    /// True when text a shell reads on stdin names it.
+    names: fn(&str) -> bool,
+    /// Both words in a command quoted deeper than MAX_DEPTH deny it.
+    deep: [&'static str; 2],
+}
+
+const RULE_CHANGE: Change = Change {
+    runs: runs_change,
+    names: names_change,
+    deep: ["dotonce", "rules"],
+};
+
+const PLUGIN_OFF: Change = Change {
+    runs: plugin::turns_off,
+    names: plugin::names_off,
+    deep: ["claude", "plugin"],
+};
+
+fn changes_at(cmd: &str, depth: usize, change: &Change) -> bool {
     let cmds = simple_commands(cmd);
     cmds.iter().enumerate().any(|(k, c)| {
-        if runs_change(&c.words) {
+        if (change.runs)(&c.words) {
             return true;
         }
         let (quoted, stdin) = quoted_commands(&c.words);
         let nested = |q: &String| {
             if depth < MAX_DEPTH {
-                changes_at(q, depth + 1)
+                changes_at(q, depth + 1, change)
             } else {
-                q.contains("dotonce") && q.contains("rules")
+                change.deep.iter().all(|w| q.contains(w))
             }
         };
         if quoted.iter().any(nested) {
@@ -977,7 +1006,7 @@ fn changes_at(cmd: &str, depth: usize) -> bool {
             .flat_map(|f| f.words.iter().chain(&f.stdin))
             .map(String::as_str)
             .collect();
-        stdin && names_change(&text.join(" "))
+        stdin && (change.names)(&text.join(" "))
     })
 }
 
@@ -987,10 +1016,14 @@ fn deny(reason: &str) -> String {
 }
 
 /// The always-on guard alone: a deny when the call would change rule files,
-/// approvals or rule commands. It runs even in an ignored folder.
+/// approvals or rule commands, or turn the dotonce plugin off. It runs even
+/// in an ignored folder.
 pub fn guard_call(v: &Value, cwd: &Path) -> Result<Option<String>> {
     let tool = str_field(v, "tool_name");
     let input = v.get("tool_input").cloned().unwrap_or(Value::Null);
+    if tool == "Bash" && turns_plugin_off(str_field(&input, "command")) {
+        return Ok(Some(deny(plugin::OFF_REASON)));
+    }
     let home = home_dir()?;
     let user_home = std::env::var_os("HOME").map(PathBuf::from);
     Ok(guard(tool, &input, cwd, &home, user_home.as_deref()).then(|| deny(GUARD_REASON)))

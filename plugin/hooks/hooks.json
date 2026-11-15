@@ -18,6 +18,11 @@
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/dotonce\" hook session-start",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/notice\"",
+            "timeout": 5
           }
         ]
       }
