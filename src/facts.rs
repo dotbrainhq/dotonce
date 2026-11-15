@@ -17,6 +17,7 @@ use crate::index::Index;
 use crate::model::{SessionDoc, TurnIn};
 use crate::query;
 use crate::retrieve::{Options, estimate_tokens, rank};
+use crate::session;
 use crate::timeq::parse_ts;
 
 pub const USER: &str = "facts";
@@ -441,11 +442,14 @@ pub fn search(
         }
         said = titles.typed_matches(&typed, &order);
     }
-    let pasted = if material.is_empty() {
+    let mut pasted = if material.is_empty() {
         Vec::new()
     } else {
         titles.material_matches(&material, &typed)
     };
+    // A paste shares rare words with many facts by chance, and its second
+    // and third matches are as often wrong as its first, so it sends one.
+    pasted.truncate(1);
     // The best match for what was typed and the best for what was pasted
     // both get a place before the second best of either.
     let mut ids: Vec<String> = Vec::new();
@@ -494,7 +498,7 @@ const SHORT_PROMPT_WORDS: usize = 60;
 /// redirect", reports progress.
 const PROGRESS: &[&str] = &[
     "done", "next", "finished", "fine", "good", "clean", "worked", "moving", "continue", "passing",
-    "complete",
+    "complete", "waiting",
 ];
 /// Common past forms that don't end in "ed".
 const IRREGULAR_PAST: &[&str] = &[
@@ -549,6 +553,10 @@ const GENERIC: &[&str] = &[
     "something",
     "anything",
     "everything",
+    "both",
+    "all",
+    "either",
+    "rest",
 ];
 
 /// Characters that are common in code and logs and rare in typed text.
@@ -619,12 +627,24 @@ fn looks_like_code(line: &str) -> bool {
     marks * 10 > s.chars().count()
 }
 
-/// Splits a prompt into what was typed and what was pasted. A short prompt is
+/// Splits a prompt into what was typed and what was pasted. What the app
+/// marks as pasted (`<pasted_content ...>`) is pasted; the rest is split like
+/// an unmarked prompt.
+fn split_prompt(q: &str) -> (String, String) {
+    let (outside, inside) = session::split_pasted(q);
+    if inside.trim().is_empty() {
+        return split_unmarked(q);
+    }
+    let (typed, material) = split_unmarked(&outside);
+    (typed, format!("{material}\n{inside}"))
+}
+
+/// Splits a prompt with no marked paste. A short prompt is
 /// all typed. In a longer one, a short block after (or else before) the rest
 /// is what was typed, and so are one or two plain lines right before or after
 /// lines that look like code. Without either, the prompt is pasted when most
 /// of its lines look like code or a log, and typed otherwise.
-fn split_prompt(q: &str) -> (String, String) {
+fn split_unmarked(q: &str) -> (String, String) {
     let lines: Vec<&str> = q.trim().lines().collect();
     if lines.len() <= 2 && q.split_whitespace().count() <= SHORT_PROMPT_WORDS {
         return (q.to_string(), String::new());
@@ -818,6 +838,7 @@ impl Titles {
         if best < BEST_COVER {
             return Vec::new();
         }
+        let pos = |k: usize| order.get(&self.ids[k]).copied().unwrap_or(usize::MAX);
         if useful == 1 {
             // One word only says enough when it names a few facts.
             found.retain(|f| f.3 > 0);
@@ -825,7 +846,11 @@ impl Titles {
                 return Vec::new();
             }
         }
-        let pos = |k: usize| order.get(&self.ids[k]).copied().unwrap_or(usize::MAX);
+        // A fact whose name and aliases have none of the typed words is more
+        // often about something else its description mentions, unless the
+        // text search, which matches word forms like "logs" and "logging",
+        // ranks it first.
+        found.retain(|f| f.3 > 0 || pos(f.0) == 0);
         if useful > 1 {
             // Near the best title match, or near the top of the text search
             // too, which also reads the body.
@@ -851,7 +876,13 @@ impl Titles {
     /// description. The typed
     /// words count as part of the material.
     fn material_matches(&self, material: &str, typed: &str) -> Vec<String> {
-        let words = PastedWords::new(tokens(material).into_iter().chain(query::terms(typed)));
+        // A stop word would match any title word it starts, like "what" and
+        // "whatavatar", and a number of one or two digits is a count or part
+        // of a date, never a topic.
+        let pasted = tokens(material).into_iter().filter(|w| {
+            !query::is_stop(w) && !(w.len() <= 2 && w.chars().all(|c| c.is_ascii_digit()))
+        });
+        let words = PastedWords::new(pasted.chain(query::terms(typed)));
         let mut dfs: HashMap<&str, usize> = HashMap::new();
         let mut found: Vec<(usize, f64)> = Vec::new();
         for k in 0..self.len() {
@@ -986,22 +1017,31 @@ pub fn pinned(
     take_within(ix, ids, cfg.private_allowed(cwd), now, budget)
 }
 
+/// What a session records of a fact it was given: its id, and a hash of the
+/// line shown, so a fact that changes since comes again.
+pub fn given_key(h: &FactHit) -> (String, String) {
+    (h.doc_id.clone(), crate::approvals::hash(&h.line))
+}
+
 /// How to save a fact, with `{bin}` for the command that runs dotonce.
 /// Aliases are other names for the fact's topic; the prompt filter matches
 /// them like the fact's title, so a plain word there pulls the fact into any
 /// prompt that uses it.
 const SAVE_HINT: &str = "To keep something for next time, run: {bin} save \"<one line: the rule or fact>\" --source \"<where it came from>\" --aliases \"<at most 3 short other names for the same topic, comma separated, like: sev1, incident, on-call; never general words like server, test or deploy>\"";
 
-/// The block ends with how to save a fact, run as `bin`: the command that
-/// starts this dotonce, since it may not be on PATH.
-pub fn render_block(title: &str, hits: &[FactHit], bin: &str) -> String {
+/// With `save`, the block ends with how to save a fact, run as `save`: the
+/// command that starts this dotonce, since it may not be on PATH.
+pub fn render_block(title: &str, hits: &[FactHit], save: Option<&str>) -> String {
     let mut s = format!("<dotonce>\n{title}\n");
     for h in hits {
         s.push_str(&h.line);
         s.push('\n');
     }
-    s.push_str(&SAVE_HINT.replace("{bin}", bin));
-    s.push_str("\n</dotonce>");
+    if let Some(bin) = save {
+        s.push_str(&SAVE_HINT.replace("{bin}", bin));
+        s.push('\n');
+    }
+    s.push_str("</dotonce>");
     s
 }
 
@@ -1733,7 +1773,7 @@ mod tests {
             "{}",
             hits[0].line
         );
-        let block = render_block("Pinned:", &hits, "dotonce");
+        let block = render_block("Pinned:", &hits, Some("dotonce"));
         assert!(
             block.starts_with("<dotonce>\nPinned:\n- **always**"),
             "{block}"
@@ -1831,7 +1871,7 @@ mod tests {
         };
         assert_eq!(names(300), vec!["small"]);
         let hits = pinned(&ix, &cfg, Path::new("/tmp"), NOW, 300).unwrap();
-        assert!(estimate_tokens(&render_block("Pinned facts:", &hits, "dotonce")) <= 300);
+        assert!(estimate_tokens(&render_block("Pinned facts:", &hits, Some("dotonce"))) <= 300);
         let small_line = estimate_tokens(&hits[0].line);
         assert!(names(small_line + 10).is_empty());
         fs::remove_dir_all(&d).unwrap();
@@ -2059,6 +2099,33 @@ mod tests {
         let got = gate_names(&ix, &cfg, "how should I format code blocks in a reply?");
         assert!(got.contains(&"reply-layout".to_string()), "{got:?}");
         assert!(got.contains(&"block-labels".to_string()), "{got:?}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_match_on_the_description_alone_needs_the_top_text_rank() {
+        let (d, _, _) = small_store("desc-only");
+        write(
+            &d,
+            "rota.md",
+            &entry("weekly-rota", "Mira answers the night alarm", ""),
+        );
+        let cfg = cfg_for(&d, &[]);
+        let mut ix = open_at(":memory:").unwrap();
+        sync(&mut ix, &cfg).unwrap();
+        // No fact is named for these words, so the text search's first pick stays.
+        let q = "who answers the night alarm?";
+        assert_eq!(gate_names(&ix, &cfg, q), vec!["weekly-rota"]);
+        write(
+            &d,
+            "alarm.md",
+            &entry("night-alarm", "The night alarm is a bell by the shed", ""),
+        );
+        sync(&mut ix, &cfg).unwrap();
+        assert_eq!(
+            gate_names(&ix, &cfg, "the night alarm bell"),
+            vec!["night-alarm"]
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 

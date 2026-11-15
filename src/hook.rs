@@ -210,8 +210,16 @@ fn prompt(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
             facts::sync(&mut ix, &cfg)?;
             let budget = cfg.prompt_budget.min(MAX_BUDGET.saturating_sub(used));
             let hits = facts::search(&ix, &cfg, text, cwd, now, budget)?;
-            Ok((!hits.is_empty())
-                .then(|| facts::render_block(PROMPT_TITLE, &hits, &self_command())))
+            let (hits, save) = not_given(v, hits);
+            if hits.is_empty() {
+                return Ok(None);
+            }
+            let save = save.then(self_command);
+            Ok(Some(facts::render_block(
+                PROMPT_TITLE,
+                &hits,
+                save.as_deref(),
+            )))
         })
     });
     Ok(compose(&rules_text, facts_block.flatten()).map(|b| context("UserPromptSubmit", &b)))
@@ -236,6 +244,31 @@ fn chat_reply(v: &Value, reply: &chat::Reply, cfg: &Config, cwd: &Path) -> Optio
         })
         .to_string(),
     )
+}
+
+/// The facts not given yet in this session, and whether the line on how to
+/// save a fact goes with them. A session that can't be read or saved gets
+/// every fact and the line each time.
+fn not_given(v: &Value, hits: Vec<facts::FactHit>) -> (Vec<facts::FactHit>, bool) {
+    let Ok(sid) = session_id(v) else {
+        return (hits, true);
+    };
+    let keys: Vec<(String, String)> = hits.iter().map(facts::given_key).collect();
+    match session::dir().and_then(|dir| session::take_facts(&dir, sid, &keys)) {
+        Ok((new, save)) => {
+            let hits = hits
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| new.contains(i))
+                .map(|(_, h)| h)
+                .collect();
+            (hits, save)
+        }
+        Err(e) => {
+            log_error(&format!("facts: {e:#}"));
+            (hits, true)
+        }
+    }
 }
 
 /// The facts block from `f`. A failure, such as a locked index, is logged
@@ -399,6 +432,7 @@ fn compare(
     let empty = Approvals::default();
     let a = approved.unwrap_or(&empty);
     let recorded = |id: &str| prev.and_then(|p| p.private.get(id)).copied();
+    let was_live = |id: &str| prev.is_some_and(|p| p.live.contains_key(id));
     let mut next = LastLive {
         live: BTreeMap::new(),
         private: prev.map(|p| p.private.clone()).unwrap_or_default(),
@@ -472,7 +506,10 @@ fn compare(
                 }
             }
             Some(State::Changed) => Some(&mut changed),
-            Some(State::Off) => Some(&mut off),
+            // Off is the user's own choice, so it's named once, in the first
+            // session after the set stopped running.
+            Some(State::Off) if was_live(id) => Some(&mut off),
+            Some(State::Off) => None,
             Some(State::NotApproved) => None,
             // Reported with the file errors, once.
             None if broken_ids.contains(id) => None,
@@ -536,9 +573,11 @@ fn compare(
 }
 
 /// The SessionStart notice for rule sets: approved sets that aren't running,
-/// level changes since the last session, and rule files with errors. Each
-/// set is listed every session it isn't running, not only after a change,
-/// since the record of the last session is a file an agent could edit too.
+/// level changes since the last session, and rule files with errors. A set
+/// that changed since approval, went missing or broke is listed every
+/// session it isn't running, not only after a change, since the record of
+/// the last session is a file an agent could edit too. A set the user turned
+/// off is listed once: a notice every session teaches people to skip it.
 /// Saves this session's record for the next one.
 fn approval_lines(
     loaded: &Loaded,
@@ -659,8 +698,14 @@ fn session_start(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
             facts::sync(&mut ix, &cfg)?;
             let budget = cfg.session_budget.min(MAX_BUDGET.saturating_sub(used));
             let hits = facts::pinned(&ix, &cfg, cwd, now, budget)?;
+            if let Ok(sid) = session_id(v) {
+                let keys: Vec<(String, String)> = hits.iter().map(facts::given_key).collect();
+                session::dir()
+                    .and_then(|dir| session::start_facts(&dir, sid, &keys))
+                    .unwrap_or_else(|e| log_error(&format!("facts: {e:#}")));
+            }
             Ok((!hits.is_empty())
-                .then(|| facts::render_block(SESSION_TITLE, &hits, &self_command())))
+                .then(|| facts::render_block(SESSION_TITLE, &hits, Some(&self_command()))))
         })
     });
     let facts_block = facts_block.flatten();
@@ -886,8 +931,35 @@ mod tests {
             sets,
             errors: vec![],
         };
-        let (lines, _) = compare(None, &loaded, &no_raw(), Some(&a), false, &[]);
+        let prev = record(&[("a", false), ("b", false), ("c", false)]);
+        let (lines, _) = compare(Some(&prev), &loaded, &no_raw(), Some(&a), false, &[]);
         assert_eq!(lines, ["Off: a, b, c."]);
+    }
+
+    #[test]
+    fn a_set_turned_off_is_named_once() {
+        let sets = vec![set("quiet", false), set("loud", true)];
+        let mut a = approve_all(&sets);
+        for s in a.sets.values_mut() {
+            s.off = true;
+        }
+        let loaded = Loaded {
+            sets,
+            errors: vec![],
+        };
+        let prev = record(&[("quiet", false), ("loud", true)]);
+        let (lines, next) = compare(Some(&prev), &loaded, &no_raw(), Some(&a), false, &[]);
+        assert_eq!(lines, ["Off: quiet.", "Not running and private: 1."]);
+        assert!(next.live.is_empty(), "{next:?}");
+        for private_ok in [false, true] {
+            let (lines, _) = compare(Some(&next), &loaded, &no_raw(), Some(&a), private_ok, &[]);
+            assert!(lines.is_empty(), "still off, so nothing new: {lines:?}");
+        }
+        let (lines, _) = compare(None, &loaded, &no_raw(), Some(&a), true, &[]);
+        assert!(
+            lines.is_empty(),
+            "no record, so it didn't stop now: {lines:?}"
+        );
     }
 
     #[test]

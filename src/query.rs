@@ -10,6 +10,12 @@ const STOP: &[&str] = &[
     "just", "also", "into", "over",
 ];
 
+/// Whether `w`, lowercased, is a stop word: one that says nothing about a
+/// topic.
+pub fn is_stop(w: &str) -> bool {
+    STOP.contains(&w)
+}
+
 pub fn terms(q: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for w in q
@@ -17,7 +23,7 @@ pub fn terms(q: &str) -> Vec<String> {
         .filter(|w| w.chars().count() > 1)
     {
         let l = w.to_lowercase();
-        if !STOP.contains(&l.as_str()) && !out.contains(&l) {
+        if !is_stop(&l) && !out.contains(&l) {
             out.push(l);
         }
     }

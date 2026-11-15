@@ -19,6 +19,9 @@ pub const SKILL_FIELD: &str = "skill";
 const KEEP: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_SENT_BACK: usize = 50;
 const MAX_LOGGED: usize = 200;
+/// Facts remembered as given in one session. Past this, the oldest can come
+/// again, which costs a few lines and no more.
+const MAX_GIVEN_FACTS: usize = 300;
 const PASTE_OPEN: &str = "<pasted_content";
 const PASTE_CLOSE: &str = "</pasted_content";
 /// Marks of a prompt Claude Code sends itself: a background task's notice, a
@@ -90,6 +93,15 @@ pub struct State {
     /// so this keeps its reminder from coming back every turn.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub given: Vec<(String, String)>,
+    /// Whether a facts block since the session started or was last compacted
+    /// had the line on how to save a fact.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub save_hint: bool,
+    /// (fact id, hash of the line shown) of each fact given since the session
+    /// started or was last compacted. The context still holds those, so they
+    /// don't come again until the fact changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<(String, String)>,
 }
 
 impl State {
@@ -177,6 +189,49 @@ pub fn save(dir: &Path, session_id: &str, state: &State) -> Result<()> {
     Ok(())
 }
 
+/// Of the facts a prompt matched, as (fact id, hash of the line shown), the
+/// positions of those not given since the session started or was last
+/// compacted, now marked given, and whether the line on how to save a fact
+/// goes with them. That line comes once a session, and again after
+/// compaction.
+pub fn take_facts(
+    dir: &Path,
+    session_id: &str,
+    facts: &[(String, String)],
+) -> Result<(Vec<usize>, bool)> {
+    let mut state = load(dir, session_id)?;
+    let new: Vec<usize> = (0..facts.len())
+        .filter(|&i| !state.facts.contains(&facts[i]))
+        .collect();
+    if new.is_empty() {
+        return Ok((new, false));
+    }
+    let hint = !state.save_hint;
+    state.save_hint = true;
+    for &i in &new {
+        state.facts.retain(|(id, _)| id != &facts[i].0);
+        state.facts.push(facts[i].clone());
+    }
+    while state.facts.len() > MAX_GIVEN_FACTS {
+        state.facts.remove(0);
+    }
+    save(dir, session_id, &state)?;
+    Ok((new, hint))
+}
+
+/// Starts the record of given facts over with what the session start gave:
+/// after compaction the context no longer holds the earlier ones. With no
+/// pinned facts, the next facts block has the line on how to save a fact.
+pub fn start_facts(dir: &Path, session_id: &str, facts: &[(String, String)]) -> Result<()> {
+    let mut state = load(dir, session_id)?;
+    if state.facts != facts || state.save_hint == facts.is_empty() {
+        state.facts = facts.to_vec();
+        state.save_hint = !facts.is_empty();
+        save(dir, session_id, &state)?;
+    }
+    Ok(())
+}
+
 /// Where the MessageDisplay hook keeps its copy of a draft that is still
 /// streaming in, to check it once it closes.
 pub fn display_file(dir: &Path, session_id: &str) -> Result<PathBuf> {
@@ -252,6 +307,53 @@ fn find_paste_close(s: &str) -> Option<(usize, usize)> {
         from = after;
     }
     None
+}
+
+/// The prompt split into the text outside `<pasted_content ...>` blocks and
+/// the text inside them. A line goes to a side only when some of it is
+/// there, so a paste between two typed lines doesn't split them apart.
+pub fn split_pasted(prompt: &str) -> (String, String) {
+    let (mut outside, mut inside) = (String::new(), String::new());
+    let mut pasted = false;
+    for line in prompt.lines() {
+        let (out_was, in_was, started_pasted) = (outside.len(), inside.len(), pasted);
+        let mut rest = line;
+        loop {
+            if pasted {
+                match find_paste_close(rest) {
+                    Some((start, end)) => {
+                        inside.push_str(&rest[..start]);
+                        rest = &rest[end..];
+                        pasted = false;
+                    }
+                    None => {
+                        inside.push_str(rest);
+                        break;
+                    }
+                }
+            } else {
+                match rest.find(PASTE_OPEN) {
+                    Some(i) => {
+                        outside.push_str(&rest[..i]);
+                        let tag = &rest[i..];
+                        rest = tag.find('>').map_or("", |e| &tag[e + 1..]);
+                        pasted = true;
+                    }
+                    None => {
+                        outside.push_str(rest);
+                        break;
+                    }
+                }
+            }
+        }
+        if outside.len() > out_was || (!started_pasted && !pasted && line.trim().is_empty()) {
+            outside.push('\n');
+        }
+        if inside.len() > in_was || (started_pasted && pasted) {
+            inside.push('\n');
+        }
+    }
+    (outside, inside)
 }
 
 /// Adds the part of `line` outside pasted blocks to `out`, and tracks
@@ -713,6 +815,17 @@ mod tests {
         assert_eq!(prompt_match(&entries[1..2], p).as_deref(), Some("beta"));
         assert_eq!(prompt_match(&entries[0..1], p), None);
         assert_eq!(prompt_match(&entries[2..3], p), None);
+    }
+
+    #[test]
+    fn split_pasted_puts_each_side_on_its_own_lines() {
+        let p = "check this\n<pasted_content id=\"1\">error: disk full\nretry later</pasted_content id=\"1\"> and fix it\n\nthanks <pasted_content id=\"2\">inline</pasted_content id=\"2\">";
+        let (outside, inside) = split_pasted(p);
+        assert_eq!(outside, "check this\n and fix it\n\nthanks \n");
+        assert_eq!(inside, "error: disk full\nretry later\ninline\n");
+        let (outside, inside) = split_pasted("no paste here\nat all");
+        assert_eq!(outside, "no paste here\nat all\n");
+        assert!(inside.is_empty());
     }
 
     #[test]
