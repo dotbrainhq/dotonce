@@ -1,6 +1,7 @@
-//! Approvals: a rule set only reminds or checks after the user approved its
-//! exact file from a terminal. The record lives outside the rule file, since
-//! anything that can edit the file could approve it.
+//! Approvals: a rule set only reminds or checks once its exact file has a
+//! record here, made by the autopilot, by the user's reply in the chat, or
+//! from a terminal. The record lives outside the rule file, since anything
+//! that can edit the file could approve it.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -25,6 +26,12 @@ pub struct Approval {
     /// When approve, level or off last wrote this record (RFC 3339).
     #[serde(default)]
     pub changed: String,
+    /// The user chose this level, so the autopilot leaves it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
+    /// When the autopilot moved the set to fix, if it did.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub promoted: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -80,7 +87,19 @@ impl Approvals {
     /// Records the file as it is now. The first approval takes the file's
     /// level; a later one keeps the level the user chose. Returns the level.
     pub fn approve(&mut self, set: &RuleSet, now: &str) -> Level {
-        let level = self.sets.get(&set.id).map_or(set.level, |a| a.level);
+        if let Some(a) = self.sets.get_mut(&set.id) {
+            a.hash = hash(&set.src);
+            a.off = false;
+            a.approved = now.to_string();
+            a.changed = now.to_string();
+            return a.level;
+        }
+        self.adopt(set, set.level, now);
+        set.level
+    }
+
+    /// Records a set seen for the first time, on at `level`.
+    pub fn adopt(&mut self, set: &RuleSet, level: Level, now: &str) {
         self.sets.insert(
             set.id.clone(),
             Approval {
@@ -89,9 +108,23 @@ impl Approvals {
                 off: false,
                 approved: now.to_string(),
                 changed: now.to_string(),
+                pinned: false,
+                promoted: String::new(),
             },
         );
-        level
+    }
+
+    /// Records the file as it is now and keeps everything else, off
+    /// included. For an edit of a set that already has a record.
+    pub fn readopt(&mut self, set: &RuleSet, now: &str) {
+        match self.sets.get_mut(&set.id) {
+            Some(a) => {
+                a.hash = hash(&set.src);
+                a.approved = now.to_string();
+                a.changed = now.to_string();
+            }
+            None => self.adopt(set, set.level, now),
+        }
     }
 
     pub fn set_level(&mut self, set: &RuleSet, level: Level, now: &str) -> Result<()> {
@@ -113,6 +146,7 @@ impl Approvals {
         if let Some(a) = self.sets.get_mut(&set.id) {
             a.level = level;
             a.off = false;
+            a.pinned = true;
             a.changed = now.to_string();
         }
         Ok(())
@@ -394,6 +428,30 @@ mod tests {
             serde_json::from_str(r#"{"sets":{"acme":{"hash":"h","level":"warn","approved":"t"}}}"#)
                 .unwrap();
         assert_eq!(old.sets["acme"].changed, "");
+    }
+
+    #[test]
+    fn adopt_and_readopt_keep_what_the_user_chose() {
+        let s = set("id = \"acme\"\nlevel = \"fix\"\n");
+        let mut a = Approvals::default();
+        a.adopt(&s, Level::Warn, "t1");
+        assert_eq!(a.state(&s), State::On(Level::Warn));
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(
+            !json.contains("pinned") && !json.contains("promoted"),
+            "{json}"
+        );
+        a.set_level(&s, Level::Fix, "t2").unwrap();
+        assert!(a.sets["acme"].pinned);
+        a.turn_off("acme", "t3").unwrap();
+        let edited = set("id = \"acme\"\nlevel = \"warn\"\n");
+        assert_eq!(a.state(&edited), State::Changed);
+        a.readopt(&edited, "t4");
+        assert_eq!(a.state(&edited), State::Off);
+        assert!(a.sets["acme"].pinned);
+        assert_eq!(a.sets["acme"].changed, "t4");
+        assert_eq!(a.approve(&edited, "t5"), Level::Fix);
+        assert!(a.sets["acme"].pinned, "approving again keeps the pin");
     }
 
     #[test]

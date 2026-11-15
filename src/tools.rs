@@ -1,5 +1,6 @@
 //! PreToolUse: rule sets' tool checks, and the always-on guard that keeps
-//! Claude from editing rule files, approvals.json or last-live.json, and
+//! Claude from editing rule files, approvals.json, last-live.json or
+//! chat.json, and
 //! from running the `dotonce rules` commands that change approvals.
 
 use std::iter::Peekable;
@@ -18,12 +19,21 @@ use crate::hook::{prompt_id, session_id, str_field};
 use crate::rules::{Level, On, RuleSet};
 use crate::session;
 
-pub const GUARD_REASON: &str = "dotonce: rule files, approvals and rule commands only change from the user's own terminal. Ask the user to run it there.";
+pub const GUARD_REASON: &str = "dotonce: Claude can't change rule files, approvals or rule commands. To add or change a rule set, write it to a file outside the dotonce home and run dotonce rules propose FILE. dotonce turns it on log-only and tells the user, so don't ask them to run a command. Levels, rules off and rules pause stay in the user's own terminal.";
 
 const FILE_TOOLS: [&str; 4] = ["Write", "Edit", "MultiEdit", "NotebookEdit"];
 /// The files in the dotonce home that only the user changes. last-live.json
-/// feeds the session-start notice's level-change lines.
-const GUARDED_FILES: [&str; 2] = ["approvals.json", "last-live.json"];
+/// feeds the session-start notice's level-change lines, and chat.json holds
+/// the codes that approve rule sets from the chat.
+const GUARDED_FILES: [&str; 3] = ["approvals.json", "last-live.json", "chat.json"];
+/// The rules folder and the guarded files: the names a command can't give
+/// with the dotonce home.
+const GUARDED_NAMES: [&str; 4] = [
+    "rules",
+    GUARDED_FILES[0],
+    GUARDED_FILES[1],
+    GUARDED_FILES[2],
+];
 /// The `dotonce rules` subcommands that change what checks run.
 const RULE_CHANGES: [&str; 4] = ["approve", "level", "off", "pause"];
 /// Shells whose `-c` argument, or stdin, runs as a command.
@@ -266,9 +276,7 @@ fn glob_target(text: &str, base: &str) -> bool {
         match Glob::new(&name) {
             Ok(g) => {
                 let m = g.compile_matcher();
-                ["rules", GUARDED_FILES[0], GUARDED_FILES[1]]
-                    .iter()
-                    .any(|n| m.is_match(n))
+                GUARDED_NAMES.iter().any(|n| m.is_match(n))
             }
             Err(_) => true,
         }
@@ -376,7 +384,7 @@ pub fn mentions(cmd: &str, home: &Path, cwd: &Path, user_home: Option<&Path>) ->
             bases.push(fold(&format!("{pre}/{rest}")));
         }
     }
-    let named = ["rules", GUARDED_FILES[0], GUARDED_FILES[1]];
+    let named = GUARDED_NAMES;
     let mut needles: Vec<String> = bases
         .iter()
         .flat_map(|b| named.iter().map(move |n| format!("{b}/{n}")))
@@ -393,7 +401,7 @@ pub fn mentions(cmd: &str, home: &Path, cwd: &Path, user_home: Option<&Path>) ->
         return true;
     }
     let names_target = texts.iter().any(|t| {
-        ["rules", "approvals", "last-live"]
+        ["rules", "approvals", "last-live", "chat"]
             .iter()
             .any(|w| t.contains(w))
     });
@@ -1170,39 +1178,58 @@ mod tests {
     }
 
     #[test]
-    fn last_live_is_guarded_like_approvals() {
+    fn last_live_and_chat_codes_are_guarded_like_approvals() {
+        for name in ["last-live.json", "chat.json"] {
+            guarded_like_approvals(name);
+        }
+    }
+
+    fn guarded_like_approvals(name: &str) {
         let home = Path::new("/fake/sam/.dotonce");
         let user = Some(Path::new("/fake/sam"));
         let cwd = Path::new("/fake/sam/code");
         for cmd in [
-            "echo '{}' > /fake/sam/.dotonce/last-live.json",
-            "echo '{}' > ~/.dotonce/last-live.json",
-            "rm $HOME/.dotonce/last-live.json",
-            "vim ${HOME}/.dotonce/last-live.json",
-            "cp x.json .dotonce/last-live.json",
-            "cd ~/.dotonce && rm last-live.json",
+            "echo '{}' > /fake/sam/.dotonce/NAME",
+            "echo '{}' > ~/.dotonce/NAME",
+            "rm $HOME/.dotonce/NAME",
+            "vim ${HOME}/.dotonce/NAME",
+            "cp x.json .dotonce/NAME",
+            "cd ~/.dotonce && rm NAME",
         ] {
-            assert!(mentions(cmd, home, cwd, user), "{cmd}");
+            let cmd = cmd.replace("NAME", name);
+            assert!(mentions(&cmd, home, cwd, user), "{cmd}");
             assert!(
                 guard("Bash", &json!({"command": cmd}), cwd, home, user),
                 "{cmd}"
             );
         }
-        assert!(mentions("rm last-live.json", home, home, user));
-        assert!(!mentions("rm last-live.json", home, cwd, user));
+        let rm = format!("rm {name}");
+        assert!(mentions(&rm, home, home, user));
+        assert!(!mentions(&rm, home, cwd, user));
         for tool in FILE_TOOLS {
             let key = if tool == "NotebookEdit" {
                 "notebook_path"
             } else {
                 "file_path"
             };
-            let input = json!({key: "/fake/sam/.dotonce/last-live.json"});
-            assert!(guard(tool, &input, cwd, home, user), "{tool}");
+            let input = json!({key: format!("/fake/sam/.dotonce/{name}")});
+            assert!(guard(tool, &input, cwd, home, user), "{tool} {name}");
         }
-        let rel = json!({"file_path": "../.dotonce/last-live.json"});
+        let rel = json!({"file_path": format!("../.dotonce/{name}")});
         assert!(guard("Write", &rel, cwd, home, user));
-        let other = json!({"file_path": "/fake/sam/.dotonce/notes/last-live.json"});
+        let other = json!({"file_path": format!("/fake/sam/.dotonce/notes/{name}")});
         assert!(!guard("Write", &other, cwd, home, user));
+    }
+
+    #[test]
+    fn proposing_a_rule_set_is_left_to_claude() {
+        let home = Path::new("/fake/sam/.dotonce");
+        let user = Some(Path::new("/fake/sam"));
+        let cwd = Path::new("/fake/sam/code");
+        let propose = json!({"command": "dotonce rules propose /tmp/acme.toml"});
+        assert!(!guard("Bash", &propose, cwd, home, user));
+        let write = json!({"file_path": "/fake/sam/.dotonce/proposals/acme.toml"});
+        assert!(!guard("Write", &write, cwd, home, user));
     }
 
     #[test]
@@ -1214,7 +1241,12 @@ mod tests {
         std::os::unix::fs::symlink(&real, tmp.join("link")).unwrap();
         let home = real.join("dot");
         let cwd = Path::new("/elsewhere");
-        for name in ["last-live.json", "approvals.json", "rules/new.toml"] {
+        for name in [
+            "last-live.json",
+            "approvals.json",
+            "chat.json",
+            "rules/new.toml",
+        ] {
             let input = json!({"file_path": tmp.join("link/dot").join(name)});
             assert!(guard("Write", &input, cwd, &home, None), "{name}");
         }

@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::approvals::{self, Approvals, State};
+use crate::autopilot;
+use crate::chat;
 use crate::config::{self, Config, MAX_BUDGET};
 use crate::facts;
 use crate::retrieve::estimate_tokens;
@@ -194,6 +196,9 @@ fn prompt(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
     };
     let file_cfg = config::load_file()?;
     let cfg = file_cfg.clone().unwrap_or_default();
+    if let Some(block) = chat::parse_reply(text).and_then(|r| chat_reply(v, &r, &cfg, cwd)) {
+        return Ok(Some(block));
+    }
     let (rules_text, used) = reminders_for(v, &cfg, cwd, Event::Prompt(text));
     // Without a config, dotonce isn't set up yet: leave no index behind.
     let facts_block = file_cfg.is_some().then(|| {
@@ -210,6 +215,27 @@ fn prompt(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
         })
     });
     Ok(compose(&rules_text, facts_block.flatten()).map(|b| context("UserPromptSubmit", &b)))
+}
+
+/// The user's answer to a chat approval code, stopped before it reaches
+/// Claude, with what dotonce did in its place. None lets the prompt through.
+fn chat_reply(v: &Value, reply: &chat::Reply, cfg: &Config, cwd: &Path) -> Option<String> {
+    let sid = session_id(v).unwrap_or_default();
+    let reason = match chat::answer(reply, sid, cfg.private_allowed(cwd), chrono::Utc::now()) {
+        Ok(r) => r?,
+        Err(e) => {
+            log_error(&format!("chat: {e:#}"));
+            format!("dotonce couldn't do that, so nothing changed: {e:#}")
+        }
+    };
+    Some(
+        json!({
+            "decision": "block",
+            "reason": reason,
+            "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "suppressOriginalPrompt": true},
+        })
+        .to_string(),
+    )
 }
 
 /// The facts block from `f`. A failure, such as a locked index, is logged
@@ -264,11 +290,46 @@ fn says_private(src: &str) -> bool {
 }
 
 /// The last session's record, if it can be read.
+/// The sets the last session recorded as private. A set stays private here
+/// even when its file was edited to say otherwise.
+pub fn recorded_private() -> BTreeSet<String> {
+    read_last_live()
+        .map(|l| {
+            l.private
+                .into_iter()
+                .filter(|(_, p)| *p)
+                .map(|(id, _)| id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn read_last_live() -> Option<LastLive> {
     last_live_path()
         .ok()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+/// Records level changes made during a session, by the autopilot or by the
+/// user's reply, in the last session's record, so the next session start
+/// doesn't list them as changes nobody saw. A level of None takes the set
+/// out. Does nothing before the first record exists.
+pub fn note_live(changes: &[(String, Option<Level>, bool)]) {
+    let Some(mut record) = read_last_live() else {
+        return;
+    };
+    for (id, level, private) in changes {
+        match level {
+            Some(l) => record.live.insert(id.clone(), *l),
+            None => record.live.remove(id),
+        };
+        let p = record.private.entry(id.clone()).or_insert(false);
+        *p |= *private;
+    }
+    if let Err(e) = save_last_live(&record) {
+        log_error(&format!("rules: save last-live.json: {e:#}"));
+    }
 }
 
 /// The text of each broken rule file that can be read. A link could point
@@ -443,10 +504,7 @@ fn compare(
     }
     for (label, ids) in [
         ("Off", off),
-        (
-            "Changed since approval, run `dotonce rules approve <id>`",
-            changed,
-        ),
+        ("Changed since approval", changed),
         ("Missing", missing),
         ("Paused in this session", held),
     ] {
@@ -570,9 +628,27 @@ fn compact(
     Ok((text, used))
 }
 
+/// Runs the autopilot and logs a failure instead of returning it, so a
+/// broken rule file never stops a hook. Returns the changes it made.
+pub fn autopilot_or_log(now: i64) -> Vec<autopilot::Event> {
+    let at = chrono::DateTime::from_timestamp(now, 0).unwrap_or_default();
+    autopilot::run(at).unwrap_or_else(|e| {
+        log_error(&format!("autopilot: {e:#}"));
+        Vec::new()
+    })
+}
+
 fn session_start(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
     let file_cfg = config::load_file()?;
     let cfg = file_cfg.clone().unwrap_or_default();
+    // After compaction the user already saw this session's notice, so the
+    // autopilot waits for a moment the user sees.
+    let fresh = str_field(v, "source") != "compact";
+    let events = if fresh {
+        autopilot_or_log(now)
+    } else {
+        Vec::new()
+    };
     let (rules_text, used, system) = session_rules(v, &cfg, cwd).unwrap_or_else(|e| {
         log_error(&format!("rules: {e:#}"));
         (String::new(), 0, None)
@@ -588,6 +664,20 @@ fn session_start(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
         })
     });
     let facts_block = facts_block.flatten();
+    let waiting = fresh
+        .then(|| {
+            let sid = session_id(v).ok()?;
+            let at = chrono::DateTime::from_timestamp(now, 0).unwrap_or_default();
+            chat::notice_all(sid, cfg.private_allowed(cwd), &events, at)
+                .map_err(|e| log_error(&format!("chat: {e:#}")))
+                .ok()
+                .flatten()
+        })
+        .flatten();
+    let system = match (system, waiting) {
+        (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
+        (a, b) => a.or(b),
+    };
     let mut out = Map::new();
     if let Some(msg) = system {
         out.insert("systemMessage".to_string(), Value::String(msg));
@@ -775,7 +865,7 @@ mod tests {
             lines,
             [
                 "Off: off.",
-                "Changed since approval, run `dotonce rules approve <id>`: edited.",
+                "Changed since approval: edited.",
                 "Missing: gone.",
                 "Paused in this session: held.",
                 "File errors: cracked.toml (check 1 has no id). Run `dotonce rules check` for details.",

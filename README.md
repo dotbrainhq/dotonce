@@ -30,7 +30,7 @@ dotonce is free and open source. It's in early development, and there's no relea
 
 ## What's coming
 
-- **Rules from corrections:** when you correct Claude, dotonce drafts the rule set for you, and it only runs after you approve it.
+- **Rules from corrections:** when you correct Claude, dotonce drafts the rule set for you. It starts log-only and tells you, so nothing changes until it has proved itself.
 - **More agents:** an MCP server for Codex, Cursor, and any other MCP client.
 
 ## How it's built
@@ -131,7 +131,7 @@ A rule set is a small TOML file in `~/.dotonce/rules/`. It turns on when Claude 
 - Check the drafts in Claude's reply after it answers.
 - Check a tool call before it runs.
 
-dotonce ships no rules of its own. Every set is a file you write and approve. Sets are read only from `~/.dotonce/rules/`, never from a project folder, so a cloned repo can't bring rules that run without your yes.
+dotonce ships no rules of its own. Every set is a file you write, or one Claude proposes. Sets are read only from `~/.dotonce/rules/`, never from a project folder, so a cloned repo can't bring rules of its own.
 
 ### What you see
 
@@ -153,7 +153,7 @@ A tool call that breaks a `fix` set's tool check is denied. Claude sees which ru
 | `warn` | Reminds and runs the checks, but only logs what fails. Nothing is sent back or denied. |
 | `fix` | Reminds, runs the checks, sends a failing draft back once, and denies a tool call that fails a tool check. |
 
-A new set starts at `warn`, so it only logs. Run `dotonce rules test` on a few real replies, watch the catch log for a while, and move the set up once both look right:
+A new set starts at `warn`, so it only logs. Once it catches the same slips in at least two sessions over its first week, dotonce moves it to `fix` by itself and tells you. If replies still break it after Claude corrects them, dotonce moves it back. To pick a level yourself, run this in a terminal. dotonce leaves a level you picked alone.
 
 ```
 dotonce rules level support-replies fix
@@ -244,7 +244,7 @@ A draft is a fenced block whose info string is in `fence`. Use `""` for fences w
 
 A tool check adds `on = "tool"` and a `tool`: `"Bash"`, `"Write"`, `"Edit"`, `"MultiEdit"` or `"NotebookEdit"`. It reads the command, or the file path and the new text. `path = ["*.rs"]` limits it to matching files. Tool checks turn on the same way reply checks do, so a coder's set usually uses `folders`. MCP tools that write files aren't covered.
 
-Parsing is strict. An unknown field, a check with no kind or two kinds, or a missing `id` or `why` is an error, and the whole file is skipped. Try a set on a file before you approve it:
+Parsing is strict. An unknown field, a check with no kind or two kinds, or a missing `id` or `why` is an error, and the whole file is skipped. Try a set on a file first:
 
 ```
 dotonce rules check
@@ -259,7 +259,23 @@ no-force-push: "git push --force origin main"
   Never force push. Ask first.
 ```
 
-### Approve it
+### Changes and undo
+
+dotonce turns a new set on by itself, at `warn`. In Claude Code you get a message only you can see, like this one:
+
+```
+dotonce changed 1 rule set by itself. Only you see this message and its codes.
+
+support-replies is on, log-only, so it notes slips and changes nothing: 3 checks.
+  - no-stock-opener: Start with the answer.
+  Send no 4821 to turn it off.
+```
+
+Send `no 4821` to undo the change, any time in the next week. dotonce does the same when it moves a set to `fix` or back. Send `dotonce` to see what you can still undo.
+
+Claude can write a rule set and run `dotonce rules propose FILE`. A new set, or a change to a set at `warn` or `remind`, goes on at the end of that turn, with the same kind of message. A change to a set at `fix`, or to one you turned off, waits for you instead: send `yes` and the code to use it, or `no` and the code to drop it. Every file that was applied, replaced, undone or dropped is kept in `~/.dotonce/proposals/done/`.
+
+The codes only work when Claude Code itself runs the hook. Claude running dotonce from its own shell gets no code, and headless and SDK runs change nothing. There, and in tools without Claude Code's hooks, turn sets on from a terminal:
 
 ```
 dotonce rules approve support-replies
@@ -267,13 +283,13 @@ dotonce rules level support-replies fix
 dotonce rules off support-replies
 ```
 
-A set does nothing until you approve it. Approval records the file's hash in `~/.dotonce/approvals.json`, outside the rule file. The first approval takes the level from the file. After that the level lives with the approval, so `rules level` changes it and editing the file's `level` line doesn't. Any edit to the file turns the set off, and `dotonce rules list` shows it as "changed since approval" until you approve it again. To turn a set back on after `rules off`, give it a level with `rules level`.
+Each set's record holds its file's hash in `~/.dotonce/approvals.json`, outside the rule file. In Claude Code, an edit to your own file keeps the set's level. Without Claude Code's hooks, an edit turns the set off, and `dotonce rules list` shows it as "changed since approval" until you approve it again. A set you turned off stays off after an edit. To turn it back on, give it a level with `rules level`.
 
 Approving, changing a level, `rules off` and `rules pause` only run from your own terminal. Each needs a real terminal and the set's id typed in, and each refuses to run when `CLAUDECODE` or `CLAUDE_CODE_ENTRYPOINT` is set. Claude Code sets both for every command its Bash tool runs.
 
-A guard runs before every Bash, Write, Edit, MultiEdit and NotebookEdit call, with or without rule sets. It stops Claude from editing rule files or approval state, and from running those four commands. Claude can still read a rule file with its file-reading tool, but a Bash read of the rules folder, like `cat ~/.dotonce/rules/acme.toml`, is blocked.
+A guard runs before every Bash, Write, Edit, MultiEdit and NotebookEdit call, with or without rule sets. It stops Claude from editing rule files or approval state, and from running those four commands. Claude can still read a rule file with its file-reading tool, but a Bash read of the rules folder, like `cat ~/.dotonce/rules/acme.toml`, is blocked. The codes in `~/.dotonce/chat.json` get the same guard.
 
-The guard has limits. An agent with a shell can't be fully stopped from changing files it can reach. The guard reads only the text of the command Claude sends, so a script file, a command built while it runs, an alias, or a `cd` into the dotonce home followed by relative paths can get past it. Every change still shows in `dotonce rules list`, and the next session start shows a notice for a level you didn't set, a set turned off, or a file changed since approval.
+The guard has limits. An agent with a shell can't be fully stopped from changing files it can reach. The guard reads only the text of the command Claude sends, so a script file, a command built while it runs, an alias, or a `cd` into the dotonce home followed by relative paths can get past it. Every change still shows in `dotonce rules list`, and the next session start shows a notice for a level you didn't set, a set turned off, or a file changed since approval. Changes dotonce makes by itself come with their own message, so they don't show up there twice.
 
 ### See what it catches
 

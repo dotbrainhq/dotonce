@@ -114,6 +114,9 @@ enum RulesCmd {
         #[arg(long, requires = "tool")]
         path: Option<String>,
     },
+    /// Keep a rule set file as a proposal. It turns on when the user sends the
+    /// code dotonce shows them in Claude Code.
+    Propose { file: PathBuf },
     /// Approve a set as its file is now. Needs a terminal and the typed id.
     Approve { id: String },
     /// Set an approved set's level: remind, warn or fix. Needs a terminal and the typed id.
@@ -168,6 +171,7 @@ fn rules_cmd(cmd: RulesCmd) -> Result<()> {
             tool,
             path,
         } => commands::rules_test(&id, &file, json, tool.as_deref(), path.as_deref()),
+        RulesCmd::Propose { file } => commands::rules_propose(&file),
         RulesCmd::Approve { id } => commands::rules_approve(&id),
         RulesCmd::Level { id, level } => commands::rules_level(&id, &level),
         RulesCmd::Off { id } => commands::rules_off(&id),

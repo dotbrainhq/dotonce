@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 
 use crate::approvals::{self, Live};
 use crate::catches::{self, Catch, Outcome};
+use crate::chat;
 use crate::checks::{self, Failure};
+use crate::config;
 use crate::hook::{log_error, prompt_id, session_id};
 use crate::session::{self, Pending};
 
@@ -38,8 +40,20 @@ pub fn send_back_text(fails: &[Failure]) -> String {
 }
 
 /// Continues the turn with the send-back text (task 1, D4).
-fn stop_output(text: &str) -> String {
-    json!({"hookSpecificOutput": {"hookEventName": "Stop", "additionalContext": text}}).to_string()
+/// The Stop output: the send-back for Claude, and the notice of rule sets
+/// that started waiting this turn for the user, who alone sees it.
+fn stop_output(text: Option<&str>, notice: Option<&str>) -> Option<String> {
+    let mut out = serde_json::Map::new();
+    if let Some(n) = notice {
+        out.insert("systemMessage".to_string(), Value::String(n.to_string()));
+    }
+    if let Some(t) = text {
+        out.insert(
+            "hookSpecificOutput".to_string(),
+            json!({"hookEventName": "Stop", "additionalContext": t}),
+        );
+    }
+    (!out.is_empty()).then(|| Value::Object(out).to_string())
 }
 
 /// The last `TAIL_BYTES` of the file, from its first whole line.
@@ -222,7 +236,16 @@ pub fn stop(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
         log_error(&format!("hook stop: {e:#}"));
         None
     });
-    Ok(sent.map(|text| stop_output(&text)))
+    let events = crate::hook::autopilot_or_log(now);
+    let at = chrono::DateTime::from_timestamp(now, 0).unwrap_or_default();
+    let notice = config::load_file()
+        .map(Option::unwrap_or_default)
+        .and_then(|cfg| chat::notice_new(sid, cfg.private_allowed(cwd), &events, at))
+        .unwrap_or_else(|e| {
+            log_error(&format!("chat: {e:#}"));
+            None
+        });
+    Ok(stop_output(sent.as_deref(), notice.as_deref()))
 }
 
 /// The send-back text when this turn's drafts go back. An error, including
