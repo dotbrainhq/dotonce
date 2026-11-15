@@ -162,7 +162,7 @@ A tool call that breaks a `fix` set's tool check is denied. Claude sees which ru
 | Level | What it does |
 |---|---|
 | `remind` | Adds the set's reminder when it turns on. No checks. |
-| `warn` | Reminds and runs the checks, but only logs what fails. Nothing is sent back or denied. |
+| `warn` | Reminds and runs the checks, but only logs what fails. Nothing is sent back or denied. After a `skill-loaded` catch, your next prompt in that session tells Claude to load the skill before the next draft, once. |
 | `fix` | Reminds, runs the checks, sends a failing draft back once, and denies a tool call that fails a tool check. |
 
 A new set starts at `warn`, so it only logs. Once it catches the same slips in at least two sessions over its first week, dotonce moves it to `fix` by itself and tells you. If replies still break it after Claude corrects them, dotonce moves it back. To pick a level yourself, run this in a terminal. dotonce leaves a level you picked alone.
@@ -250,9 +250,22 @@ A draft is a fenced block whose info string is in `fence`. Use `""` for fences w
 | `forbid_regex = '...'` | The pattern matches. `^` and `$` match at each line. |
 | `require = [phrases]` | None of the phrases appears. |
 | `kind = "bare-url"` | A URL sits outside `[text](url)` and outside code. |
+| `kind = "skill-loaded"` | The draft reads as prose and none of the skills in `skills` has loaded in the session. |
 | `repeat_of = '...'` and `max = N` | The text the pattern's one group captures appears more than N times after its first match. |
 | `max_paragraphs = N` | The draft has more than N paragraphs. |
 | `max_words = N` | The draft has more than N words. |
+
+A `skill-loaded` check catches a draft written before its writing skill:
+
+```
+[[check]]
+id = "skill-first"
+kind = "skill-loaded"
+skills = ["support-reply", "writing-voice"]
+why = "Load the writing skill that fits before you write a draft."
+```
+
+It needs a `[draft]` table, and only a draft that reads as prose counts: 25 words or more, real sentences, and at most one line in five that looks like a command or code. A skill counts once Claude calls it, you run it as a slash command, or Claude reads its `SKILL.md`, at any point in the session, compaction included. Leave `skills` out to use the installed skills whose names start with `writing` or end in `reply`, `replies` or `descriptions`. With none of those installed, the check passes. `dotonce rules test` runs it as a session with no skill loaded yet.
 
 A tool check adds `on = "tool"` and a `tool`: `"Bash"`, `"Write"`, `"Edit"`, `"MultiEdit"` or `"NotebookEdit"`. It reads the command, or the file path and the new text. `path = ["*.rs"]` limits it to matching files. Tool checks turn on the same way reply checks do, so a coder's set usually uses `folders`. MCP tools that write files aren't covered.
 

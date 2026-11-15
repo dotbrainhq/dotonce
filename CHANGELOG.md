@@ -6,6 +6,8 @@ Every release of dotonce is listed here. Versions follow semantic versioning.
 
 ### Added
 
+- `kind = "skill-loaded"`: a check that catches a draft written before its writing skill loaded. It reads the skills Claude called, the slash commands you ran and the `SKILL.md` files Claude read, so a skill loaded early in the session still counts after compaction. At `warn` it logs the catch and your next prompt tells Claude to load the skill first; at `fix` the draft goes back once. Without a `skills` list it uses the installed skills named like writing skills, and with none installed it passes.
+- A skill-loaded check needs a `[draft]` table, and `rules new` writes a commented example of one.
 - A Claude Code plugin. `claude plugin marketplace add dotbrainhq/dotonce`, then `claude plugin install dotonce@dotonce`, adds all seven hooks, so nothing goes into settings.json by hand. The plugin runs the dotonce binary from your PATH or `~/.cargo/bin`, and tells you at the start of each session when the binary is missing or older than the plugin.
 - `dotonce doctor` reads Claude Code's plugin list too. It names the plugin as the source of each hook, says when the plugin is installed but off, and warns when a hook runs twice because it's in the plugin and in a settings file.
 - The guard stops Claude from turning the dotonce plugin off: `claude plugin disable` or `uninstall` on dotonce, `disable --all`, and `marketplace remove dotonce`.
