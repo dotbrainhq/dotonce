@@ -11,7 +11,7 @@ Every release of dotonce is listed here. Versions follow semantic versioning.
 - `dotonce rules propose FILE`: Claude can write a rule set and propose it. Every applied, replaced, undone or dropped file is kept in `~/.dotonce/proposals/done/`.
 - A starter from `dotonce rules new` stays off until you edit it, so its examples never run.
 - When Claude tries to change a rule file, the guard now tells it to propose the set instead of asking you to run a command.
-- An `aliases:` frontmatter list and `dotonce save --aliases`: other names for a fact's topic, matched like its title. The save hint in each facts block asks for at most three short ones and no general words.
+- An `aliases:` frontmatter list and `dotonce save --aliases`: other names for a fact's topic, matched like its title. The line on how to save a fact asks for at most three short ones and no general words.
 - `ignore_paths` in the config: inside those folders the hooks add nothing, check nothing and change nothing. The guard that keeps rule files out of Claude's reach still runs there.
 - `dotonce init` and `dotonce doctor` print the line to add to your shell config when dotonce's folder isn't on your PATH. They never edit a shell file.
 - Each conversation in the results shows its weekday and how many days before the question it happened, so the agent doesn't have to do date math.
@@ -48,3 +48,8 @@ Every release of dotonce is listed here. Versions follow semantic versioning.
 - A rule set's reminder comes once per session, and again after compaction or when its file changes, instead of on every turn.
 - Prompt-word triggers read only text the user typed, and a trigger of several words matches only as the whole phrase.
 - A hook could panic while writing to a stderr that Claude Code had closed. The hook path never writes to stderr now, even for bad arguments.
+- A fact comes once per session, and again after compaction or when the fact changes, instead of with every prompt that matches it. The line on how to save a fact comes once a session too, with the first facts.
+- Text pasted in the desktop app counts as pasted, not typed, and a paste brings at most one fact. Common words and short numbers in a paste are left out of the match, so a word like "what" can't pull in a fact whose name starts with it.
+- A fact whose name and aliases share no word with the prompt, only its description, comes only when the text search ranks it first.
+- A status line like "okay, waiting" gets no facts, and words like "both" and "all" don't count as a topic.
+- The session start names a rule set you turned off once, instead of at every session start.

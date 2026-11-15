@@ -490,6 +490,81 @@ fn save_hint_names_the_running_binary() {
 }
 
 #[test]
+fn a_fact_and_the_save_line_come_once_a_session_and_after_compaction() {
+    let h = home("hintonce");
+    run(&h, &["init"], None);
+    run(&h, &["save", "The staging site is acme.example.com"], None);
+    run(&h, &["save", "The deploy command is make ship"], None);
+    // The facts block for a prompt, or "" when nothing is sent.
+    let ask = |sid: &str, prompt: &str| {
+        let input = serde_json::json!({"session_id": sid, "prompt": prompt, "cwd": "/tmp"});
+        let (out, ok) = run(&h, &["hook", "prompt"], Some(&input.to_string()));
+        assert!(ok);
+        if out.trim().is_empty() {
+            String::new()
+        } else {
+            context(&out, "UserPromptSubmit")
+        }
+    };
+    let staging = "where is the staging site?";
+    let hint = "To keep something for next time";
+    let ctx = ask("s1", staging);
+    assert!(
+        ctx.contains("acme.example.com") && ctx.contains(hint),
+        "{ctx}"
+    );
+    assert_eq!(
+        ask("s1", staging),
+        "",
+        "a fact already given isn't sent again"
+    );
+    let ctx = ask("s1", "what is the deploy command?");
+    assert!(ctx.contains("make ship"), "{ctx}");
+    assert!(
+        !ctx.contains(hint),
+        "the save line isn't on every block: {ctx}"
+    );
+    let ctx = ask("s2", staging);
+    assert!(
+        ctx.contains("acme.example.com") && ctx.contains(hint),
+        "a new session: {ctx}"
+    );
+    let (out, ok) = run(
+        &h,
+        &["hook", "session-start"],
+        Some(r#"{"session_id":"s1","source":"compact","cwd":"/tmp"}"#),
+    );
+    assert!(ok && out.trim().is_empty(), "{out}");
+    let ctx = ask("s1", staging);
+    assert!(
+        ctx.contains("acme.example.com") && ctx.contains(hint),
+        "both again after compaction: {ctx}"
+    );
+    run(&h, &["save", "Reply in short lines", "--pinned"], None);
+    let (out, ok) = run(
+        &h,
+        &["hook", "session-start"],
+        Some(r#"{"session_id":"s3","source":"startup","cwd":"/tmp"}"#),
+    );
+    assert!(ok);
+    assert!(context(&out, "SessionStart").contains(hint), "{out}");
+    let ctx = ask("s3", staging);
+    assert!(ctx.contains("acme.example.com"), "{ctx}");
+    assert!(
+        !ctx.contains(hint),
+        "the pinned block already had it: {ctx}"
+    );
+    let ctx = ask("s4", "reply in short lines");
+    assert!(ctx.contains("Reply in short lines"), "{ctx}");
+    assert_eq!(
+        ask("s3", "reply in short lines"),
+        "",
+        "a pinned fact the session start gave isn't sent again"
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
 fn private_facts_show_inside_a_private_path() {
     let h = home("privpath");
     run(&h, &["init"], None);
@@ -1198,10 +1273,10 @@ fn prompt_hook_adds_reminders_before_facts() {
     );
     assert!(rule < fact, "{ctx}");
     assert_eq!(ctx.matches("<dotonce>").count(), 1, "{ctx}");
-    let ctx = context(&hook(&h, "prompt", input), "UserPromptSubmit");
+    let again = hook(&h, "prompt", input);
     assert!(
-        !ctx.contains("Links go inline"),
-        "the same turn gets the reminder once: {ctx}"
+        again.trim().is_empty(),
+        "the same turn gets the reminder and the fact once: {again}"
     );
     std::fs::remove_dir_all(&h).unwrap();
 }
@@ -1451,16 +1526,21 @@ fn session_start_names_approved_sets_that_stopped_running() {
         "reported every session"
     );
     approve(&h, "acme-replies", "fix");
+    assert_eq!(
+        start_message(&h, "s7", tmp),
+        "On now, and not on last session: acme-replies at fix."
+    );
     let path = h.join("dotonce/approvals.json");
     let mut v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     v["sets"]["acme-replies"]["off"] = serde_json::json!(true);
     std::fs::write(&path, v.to_string()).unwrap();
-    assert_eq!(start_message(&h, "s7", tmp), "Off: acme-replies.");
+    assert_eq!(start_message(&h, "s8", tmp), "Off: acme-replies.");
+    assert_eq!(start_message(&h, "s9", tmp), "", "off is named once");
     std::fs::remove_file(&f).unwrap();
-    assert_eq!(start_message(&h, "s8", tmp), "Missing: acme-replies.");
+    assert_eq!(start_message(&h, "s10", tmp), "Missing: acme-replies.");
     std::fs::write(&f, "id = \"acme-replies\"\n[[check]]\n").unwrap();
-    let msg = start_message(&h, "s9", tmp);
+    let msg = start_message(&h, "s11", tmp);
     assert!(msg.starts_with("File errors: acme-replies.toml ("), "{msg}");
     assert_eq!(msg.matches("acme-replies").count(), 1, "{msg}");
     std::fs::remove_dir_all(&h).unwrap();
@@ -1577,12 +1657,12 @@ fn session_start_groups_the_notice_by_reason() {
     assert!(!msg.contains("quiet") && !msg.contains("steady"), "{msg}");
     let msg = start_message(&h, "s2", &proj);
     assert!(
-        msg.contains("Off: off-one, off-two, quiet-off.")
-            && msg.contains(": edited, quiet-edited.")
+        msg.contains(": edited, quiet-edited.")
             && msg.contains("quiet-broken.toml (")
             && !msg.contains("private"),
         "inside private_paths every set is named: {msg}"
     );
+    assert!(!msg.contains("Off"), "off sets are named once: {msg}");
     std::fs::remove_dir_all(&h).unwrap();
 }
 
@@ -1807,7 +1887,7 @@ fn an_unusable_session_id_still_gives_the_notice() {
     let h = home("badsid");
     add_set(&h, "acme-replies", REPLIES);
     approve(&h, "acme-replies", "warn");
-    turn_off(&h, "acme-replies");
+    edit_set(&h, "acme-replies");
     for source in ["startup", "compact"] {
         let out = hook(
             &h,
@@ -1816,7 +1896,10 @@ fn an_unusable_session_id_still_gives_the_notice() {
         );
         let v: serde_json::Value =
             serde_json::from_str(&out).unwrap_or_else(|e| panic!("{source}: {e}: {out}"));
-        assert_eq!(v["systemMessage"], "Off: acme-replies.", "{source}: {out}");
+        assert_eq!(
+            v["systemMessage"], "Changed since approval: acme-replies.",
+            "{source}: {out}"
+        );
     }
     std::fs::remove_dir_all(&h).unwrap();
 }
