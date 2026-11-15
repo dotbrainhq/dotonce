@@ -1,0 +1,7 @@
+#!/bin/sh
+# Runs the dotonce binary for the plugin's hooks. Claude Code passes on its
+# own PATH, which may lack cargo's bin folder when it starts from the Dock.
+# Without the binary the hook adds nothing and blocks nothing.
+bin=$(command -v dotonce 2>/dev/null) || bin="${CARGO_HOME:-$HOME/.cargo}/bin/dotonce"
+[ -x "$bin" ] || exit 0
+exec "$bin" "$@"

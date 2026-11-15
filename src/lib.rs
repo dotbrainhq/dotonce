@@ -13,6 +13,7 @@ pub mod hook;
 pub mod index;
 pub mod model;
 pub mod names;
+pub mod plugin;
 pub mod query;
 pub mod reply;
 pub mod retrieve;

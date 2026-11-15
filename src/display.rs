@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use crate::approvals::Live;
 use crate::checks::{self, fence_closes, fence_open};
 use crate::hook::{log_error, prompt_id, session_id, str_field};
+use crate::plugin;
 use crate::session;
 
 /// The line shown below a draft that breaks the checks with these ids.
@@ -198,7 +199,7 @@ pub fn display(v: &Value, cwd: &Path) -> Result<Option<String>> {
     let fix = session::checks_now(&state, cwd, prompt_id(v))
         .map(|now| now.fix().into_iter().cloned().collect::<Vec<_>>())
         .map(|fix| {
-            if fix.is_empty() || settings_run_stop(cwd) {
+            if fix.is_empty() || runs_at_stop(cwd) {
                 fix
             } else {
                 Vec::new()
@@ -250,10 +251,11 @@ pub fn display(v: &Value, cwd: &Path) -> Result<Option<String>> {
 /// corrected draft follows, so display never labels. Read at every call
 /// that has a fix set, so display never writes the session state Stop
 /// keeps. Reads Claude Code's user settings and the project's settings
-/// under `cwd`, without changing them. A file that exists but can't be read
+/// under `cwd`, without changing them, and the hooks file of the plugin
+/// that started this hook. A settings file that exists but can't be read
 /// or parsed, or one that sets `"disableAllHooks": true`, counts as no Stop
 /// hook.
-fn settings_run_stop(cwd: &Path) -> bool {
+fn runs_at_stop(cwd: &Path) -> bool {
     let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
         return false;
     };
@@ -262,7 +264,7 @@ fn settings_run_stop(cwd: &Path) -> bool {
         cwd.join(".claude/settings.json"),
         cwd.join(".claude/settings.local.json"),
     ];
-    let mut found = false;
+    let mut found = plugin::hooks_here().is_some_and(|v| runs_stop(&v));
     for f in &files {
         let src = match fs::read_to_string(f) {
             Ok(src) => src,
