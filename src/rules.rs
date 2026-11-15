@@ -61,6 +61,22 @@ pub struct When {
 pub struct Draft {
     #[serde(default)]
     pub fence: Vec<String>,
+    /// A fenced block whose body one of these matches is not a draft: a
+    /// card, a form or a template the set shouldn't read.
+    #[serde(default)]
+    pub skip: Vec<String>,
+}
+
+impl Draft {
+    /// A block is a draft when its info string is in `fence` and no `skip`
+    /// pattern matches its body.
+    pub fn is_draft(&self, info: &str, body: &str) -> bool {
+        self.fence.iter().any(|f| f == info)
+            && !self
+                .skip
+                .iter()
+                .any(|p| compiled(p).is_ok_and(|r| r.is_match(body)))
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -451,6 +467,11 @@ pub fn parse(src: &str, file: &Path) -> Result<RuleSet> {
 /// Compiles every pattern in the set, so a bad one is an error here rather
 /// than a skipped check in a hook.
 pub fn validate(set: &RuleSet) -> Result<()> {
+    for p in set.draft.iter().flat_map(|d| &d.skip) {
+        if let Err(e) = compiled(p) {
+            bail!("[draft] skip pattern {p:?} doesn't compile: {e}");
+        }
+    }
     for c in &set.checks {
         if let CheckKind::ForbidRegex(p) | CheckKind::RepeatOf { pattern: p, .. } = &c.kind {
             if let Err(e) = p.regex() {
@@ -493,7 +514,10 @@ fn parse_lazy(src: &str, file: &Path) -> Result<RuleSet> {
                     "[draft] fence is empty: list the info strings that mark a draft, or drop [draft] to check whole replies"
                 );
             }
-            Some(Draft { fence })
+            Some(Draft {
+                fence,
+                skip: d.skip,
+            })
         }
         None => None,
     };
@@ -910,6 +934,10 @@ why = "No TODOs in Rust files."
             (
                 format!("{base}[draft]\nfence = []\n"),
                 "[draft] fence is empty",
+            ),
+            (
+                format!("{base}[draft]\nfence = [\"\"]\nskip = ['(']\n"),
+                "[draft] skip pattern \"(\" doesn't compile",
             ),
             (
                 format!("{base}[remind]\ntext = \"\"\n"),

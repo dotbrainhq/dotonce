@@ -4923,6 +4923,29 @@ fn a_draft_before_the_writing_skill_is_caught_and_nudged_once() {
 }
 
 #[test]
+fn a_block_a_skip_pattern_matches_is_not_a_draft() {
+    let set = WRITING.replace(
+        "fence = [\"\", \"markdown\"]\n",
+        "fence = [\"\", \"markdown\"]\nskip = ['\\A\\s*Summary:']\n",
+    );
+    let h = writing_home("skillskip", "warn", &set);
+    let card = "Here is what I found:\n\n```\nSummary: The acme order 1001 shipped late because the label printer was offline for two days.\nOwner: Sam on the warehouse team decides whether the late fee goes back to the customer this week.\n```";
+    ask(&h, "s1", "p1");
+    assert!(stop(&h, "s1", "p1", card, false).trim().is_empty());
+    assert!(
+        outcomes(&h, "catches.jsonl").is_empty(),
+        "a card isn't a draft"
+    );
+    ask(&h, "s1", "p2");
+    stop(&h, "s1", "p2", PROSE_DRAFT, false);
+    assert_eq!(
+        outcomes(&h, "catches.jsonl"),
+        pairs(&[("skill-first", "caught")])
+    );
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
 fn loading_the_writing_skill_clears_the_nudge_and_passes_the_next_draft() {
     let h = writing_home("skillclear", "warn", WRITING);
     ask(&h, "s1", "p1");
