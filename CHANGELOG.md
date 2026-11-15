@@ -49,7 +49,7 @@ Every release of dotonce is listed here. Versions follow semantic versioning.
 - Prompt-word triggers read only text the user typed, and a trigger of several words matches only as the whole phrase.
 - A hook could panic while writing to a stderr that Claude Code had closed. The hook path never writes to stderr now, even for bad arguments.
 - A fact comes once per session, and again after compaction or when the fact changes, instead of with every prompt that matches it. The line on how to save a fact comes once a session too, with the first facts.
-- Text pasted in the desktop app counts as pasted, not typed, and a paste brings at most one fact. Common words and short numbers in a paste no longer match fact names that start with them.
+- Text pasted in the desktop app counts as pasted, not typed, and a paste brings at most one fact. Common words and short numbers in a paste are left out of the match, so a word like "what" can't pull in a fact whose name starts with it.
 - A fact whose name and aliases share no word with the prompt, only its description, comes only when the text search ranks it first.
-- A status line like "okay, waiting" gets no facts, and words like "both" and "all" no longer count as a topic.
+- A status line like "okay, waiting" gets no facts, and words like "both" and "all" don't count as a topic.
 - The session start names a rule set you turned off once, instead of at every session start.
