@@ -189,6 +189,8 @@ dotonce rules new support-replies
 
 This writes a commented starter file with one example of each check kind. It asks whether the set checks fenced drafts or whole replies, or you can pass `--drafts` or `--whole-reply`.
 
+Claude can't run it. It writes its set to a file of its own and proposes it, as [Changes and undo](#changes-and-undo) explains.
+
 A coder's set that logs force pushes in your code folder, and denies them once it's at `fix`:
 
 ```
@@ -325,7 +327,7 @@ Each set's record holds its file's hash in `~/.dotonce/approvals.json`, outside 
 
 Approving, changing a level, `rules off` and `rules pause` only run from your own terminal. Each needs a real terminal and the set's id typed in, and each refuses to run when `CLAUDECODE` or `CLAUDE_CODE_ENTRYPOINT` is set. Claude Code sets both for every command its Bash tool runs.
 
-A guard runs before every Bash, Write, Edit, MultiEdit and NotebookEdit call, with or without rule sets. It stops Claude from editing rule files or approval state, and from running those four commands. Claude can still read a rule file with its file-reading tool, but a Bash read of the rules folder, like `cat ~/.dotonce/rules/acme.toml`, is blocked. The codes in `~/.dotonce/chat.json` get the same guard. It also stops Claude from turning the dotonce plugin off with `claude plugin disable` or `uninstall`, `claude plugin disable --all`, or `claude plugin marketplace remove dotonce`. You can still run those yourself.
+A guard runs before every Bash, Write, Edit, MultiEdit and NotebookEdit call, with or without rule sets. It stops Claude from editing rule files or approval state, and from running those four commands. `dotonce rules new` is blocked too, because Claude couldn't change or remove the starter it writes. Claude can read a rule file with its file-reading tool, or with a Bash command that only reads, like `cat ~/.dotonce/rules/acme.toml` or `grep -n id ~/.dotonce/rules/*.toml`. A command that names those files and does anything more, like `mv`, `sed -i`, a redirect to a file or `find -delete`, is still blocked. The codes in `~/.dotonce/chat.json` get the same guard. It also stops Claude from turning the dotonce plugin off with `claude plugin disable` or `uninstall`, `claude plugin disable --all`, or `claude plugin marketplace remove dotonce`. You can still run those yourself.
 
 The guard has limits. An agent with a shell can't be fully stopped from changing files it can reach. The guard reads only the text of the command Claude sends, so a script file, a command built while it runs, an alias, or a `cd` into the dotonce home followed by relative paths can get past it. Every change still shows in `dotonce rules list`, and the next session start shows a notice for a level you didn't set, a set turned off, or a file changed since approval. Changes dotonce makes by itself come with their own message, so they don't show up there twice.
 
