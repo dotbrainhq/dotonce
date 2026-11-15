@@ -39,6 +39,7 @@ Every release of dotonce is listed here. Versions follow semantic versioning.
 
 - A short status message, like "done, next batch", stops pulling in facts that share only common words with it.
 - Hooks ignore Claude Code's own messages (task notifications, agent reports, system reminders), so they add no facts or reminders there. Only a prompt that starts with one counts, so a prompt you type that pastes one keeps its facts and reminders. Reply checks still run in those turns.
+- A prompt you type keeps its facts and reminders when the desktop app puts a note in front of it, such as a status line about linked sessions. Only the typed words are matched. The app's own events (side-session, CI and cross-session messages) get none, alone or behind a note.
 - A rule set's reminder comes once per session, and again after compaction or when its file changes, instead of on every turn.
 - Prompt-word triggers read only text the user typed, and a trigger of several words matches only as the whole phrase.
 - A hook could panic while writing to a stderr that Claude Code had closed. The hook path never writes to stderr now, even for bad arguments.

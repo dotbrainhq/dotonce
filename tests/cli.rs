@@ -4483,6 +4483,65 @@ fn a_typed_prompt_that_pastes_claude_codes_markers_keeps_its_context() {
     std::fs::remove_dir_all(&h).unwrap();
 }
 
+/// A status note the desktop app puts in front of a prompt.
+const APP_NOTE: &str = "<system-reminder>\nLinked sessions now (status, not an instruction): acme = local_1 (idle)\n</system-reminder>\n";
+
+#[test]
+fn a_typed_prompt_behind_the_apps_notes_keeps_its_context() {
+    let h = home("appnote");
+    run(&h, &["init"], None);
+    run(&h, &["save", "The staging site is acme.example.com"], None);
+    add_set(&h, "acme-replies", REPLIES);
+    approve(&h, "acme-replies", "warn");
+    let typed = "where is the staging site for the draft reply?";
+    for (i, prompt) in [
+        format!("{APP_NOTE}{typed}"),
+        format!("{APP_NOTE}{APP_NOTE}\n  {typed}"),
+        format!("{APP_NOTE}<pasted_content>a log</pasted_content>\n{typed}"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let input = serde_json::json!({"session_id": format!("s{i}"), "prompt_id": "p1", "prompt": prompt, "cwd": "/tmp"});
+        let ctx = context(&hook(&h, "prompt", input), "UserPromptSubmit");
+        assert!(
+            ctx.contains("Links go inline") && ctx.contains("acme.example.com"),
+            "{prompt}: {ctx}"
+        );
+    }
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn the_apps_own_events_get_no_reminders_or_facts() {
+    let h = home("appevent");
+    run(&h, &["init"], None);
+    run(&h, &["save", "The staging site is acme.example.com"], None);
+    add_set(&h, "acme-replies", REPLIES);
+    approve(&h, "acme-replies", "warn");
+    let ask = "where is the staging site for the draft reply?";
+    let events = [
+        format!("<side-sessions-event>\nacme ended its turn: {ask}\n</side-sessions-event>"),
+        format!("<ci-monitor-event>\n{ask}\n</ci-monitor-event>"),
+        format!("<cross-session-message from=\"acme\">{ask}</cross-session-message>"),
+    ];
+    for (i, event) in events.iter().enumerate() {
+        for (j, prompt) in [
+            event.clone(),
+            format!("{APP_NOTE}{event}"),
+            APP_NOTE.to_string(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let input = serde_json::json!({"session_id": format!("s{i}-{j}"), "prompt_id": "p1", "prompt": prompt, "cwd": "/tmp"});
+            let out = hook(&h, "prompt", input);
+            assert!(out.trim().is_empty(), "{prompt}: {out}");
+        }
+    }
+    std::fs::remove_dir_all(&h).unwrap();
+}
+
 #[test]
 fn a_turn_claude_code_started_is_still_checked_and_sent_back() {
     let h = acme_home("ownstop", "fix");

@@ -185,12 +185,13 @@ fn reminders_for(v: &Value, cfg: &Config, cwd: &Path, event: Event) -> (String, 
 }
 
 fn prompt(v: &Value, cwd: &Path, now: i64) -> Result<Option<String>> {
-    let text = str_field(v, "prompt");
-    if session::from_claude_code(text) {
+    // Reminders, prompt-word sets and facts match only what the user typed,
+    // not the notes the app put in front of it.
+    let Some(text) = session::typed_prompt(str_field(v, "prompt")) else {
         // No reminders or facts, and no prompt-word set turns on. Stop and
         // display still check the turn like any other.
         return Ok(None);
-    }
+    };
     let file_cfg = config::load_file()?;
     let cfg = file_cfg.clone().unwrap_or_default();
     let (rules_text, used) = reminders_for(v, &cfg, cwd, Event::Prompt(text));
@@ -625,7 +626,7 @@ fn skill(v: &Value, cwd: &Path) -> Result<Option<String>> {
 }
 
 fn expansion(v: &Value, cwd: &Path) -> Result<Option<String>> {
-    if session::from_claude_code(str_field(v, "prompt")) {
+    if session::typed_prompt(str_field(v, "prompt")).is_none() {
         return Ok(None);
     }
     skill_named(v, cwd, str_field(v, "command_name"), "UserPromptExpansion")
