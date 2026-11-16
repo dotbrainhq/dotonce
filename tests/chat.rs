@@ -941,6 +941,22 @@ fn a_yes_on_the_proposal_leaves_the_old_undo_code_unused() {
 }
 
 #[test]
+fn a_wait_shows_once_per_session_when_sessions_take_turns() {
+    let h = home("ask-two-sessions");
+    propose_ask(&h, &asked_rule(&h), &[]);
+    let first = code_for(&stop(&h, "s1", &h, None), "acme");
+    assert_eq!(code_for(&stop(&h, "s2", &h, None), "acme"), first);
+    for sid in ["s1", "s2"] {
+        let notice = stop(&h, sid, &h, None);
+        assert!(notice.is_empty(), "{sid} showed it again: {notice}");
+    }
+    // A session start and dotonce still show it, with the same code.
+    assert_eq!(code_for(&start(&h, "s1", &h, None), "acme"), first);
+    let list = blocked(&prompt(&h, "s2", &h, "dotonce", None)).unwrap();
+    assert_eq!(code_for(&list, "acme"), first, "{list}");
+}
+
+#[test]
 fn a_proposal_that_changes_between_notices_gets_a_new_code() {
     let h = waiting_at_fix("fix-new-code");
     let first = code_for(&stop(&h, "s1", &h, None), "acme");
