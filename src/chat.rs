@@ -19,6 +19,7 @@
 //! Claude Code itself runs the hook and never in headless runs, and every
 //! change still shows in `rules list`.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read};
@@ -120,11 +121,36 @@ impl Code {
     }
 }
 
-/// chat.json: the current code of each shown change, by set id.
+/// chat.json, by set id: the code of each change that can still be undone,
+/// and apart from those the code of each waiting proposal, as a set can
+/// have both.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Store {
     #[serde(default)]
-    codes: std::collections::BTreeMap<String, Code>,
+    codes: BTreeMap<String, Code>,
+    #[serde(default)]
+    waits: BTreeMap<String, Code>,
+}
+
+impl Store {
+    /// The undo codes, or the codes of waiting proposals.
+    fn kind(&mut self, undo: bool) -> &mut BTreeMap<String, Code> {
+        if undo {
+            &mut self.codes
+        } else {
+            &mut self.waits
+        }
+    }
+
+    /// Moves wait codes out of `codes`, where stores before `waits` kept them.
+    fn split(mut self) -> Self {
+        let (undo, waits): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(&mut self.codes)
+            .into_iter()
+            .partition(|(_, c)| c.undo.is_some());
+        self.codes = undo;
+        self.waits.extend(waits);
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,7 +172,9 @@ pub fn proposals_dir() -> Result<PathBuf> {
 pub fn load_store() -> Result<Store> {
     let p = store_path()?;
     match fs::read_to_string(&p) {
-        Ok(s) => serde_json::from_str(&s).with_context(|| format!("parse {}", p.display())),
+        Ok(s) => serde_json::from_str(&s)
+            .map(Store::split)
+            .with_context(|| format!("parse {}", p.display())),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Store::default()),
         Err(e) => Err(e).with_context(|| format!("read {}", p.display())),
     }
@@ -311,7 +339,12 @@ fn new_code(store: &Store) -> Result<String> {
         let mut b = [0u8; 8];
         f.read_exact(&mut b)?;
         let code = format!("{:04}", u64::from_le_bytes(b) % 10_000);
-        if !store.codes.values().any(|c| c.is(&code)) {
+        if !store
+            .codes
+            .values()
+            .chain(store.waits.values())
+            .any(|c| c.is(&code))
+        {
             return Ok(code);
         }
     }
@@ -516,7 +549,7 @@ fn issue(store: &mut Store, blocks: &[Block], sid: &str) -> Result<Vec<String>> 
     let mut out = Vec::new();
     for b in blocks {
         let kept = store
-            .codes
+            .kind(b.undo.is_some())
             .get(&b.id)
             .filter(|c| c.made_for(b))
             .and_then(Code::recover);
@@ -525,7 +558,7 @@ fn issue(store: &mut Store, blocks: &[Block], sid: &str) -> Result<Vec<String>> 
             None => {
                 let code = new_code(store)?;
                 let salt = salt()?;
-                store.codes.insert(
+                store.kind(b.undo.is_some()).insert(
                     b.id.clone(),
                     Code {
                         file: b.file.clone(),
@@ -540,7 +573,7 @@ fn issue(store: &mut Store, blocks: &[Block], sid: &str) -> Result<Vec<String>> 
                 code
             }
         };
-        if let Some(c) = store.codes.get_mut(&b.id) {
+        if let Some(c) = store.kind(b.undo.is_some()).get_mut(&b.id) {
             c.session = sid.to_string();
             c.wait.clone_from(&b.wait);
         }
@@ -681,7 +714,7 @@ pub fn notice_new(
         .filter(|w| private_ok || !w.private)
         .filter(|w| {
             store
-                .codes
+                .waits
                 .get(&w.set.id)
                 .is_none_or(|c| c.session != sid || c.file != approvals::hash(&w.set.src))
         })
@@ -904,6 +937,7 @@ pub fn answer(
     let matched = store
         .codes
         .iter()
+        .chain(&store.waits)
         .find(|(_, c)| c.code == code_hash(&c.salt, code))
         .map(|(id, c)| (id.clone(), c.clone()));
     let Some((id, c)) = matched else {
@@ -925,7 +959,7 @@ pub fn answer(
                 .to_string(),
         ));
     }
-    store.codes.remove(&id);
+    store.kind(c.undo.is_some()).remove(&id);
     let stamp = now_text(now);
     let text = match (&c.undo, reply) {
         (Some(_), Reply::Yes(_)) => format!("dotonce: kept {shown_id} as it is."),
@@ -1043,8 +1077,9 @@ mod tests {
             let c = new_code(&store).unwrap();
             assert_eq!(c.len(), 4);
             assert!(c.chars().all(|x| x.is_ascii_digit()));
-            assert!(!store.codes.values().any(|k| k.is(&c)), "{c}");
-            store.codes.insert(format!("set-{n}"), kept(&c));
+            let mut all = store.codes.values().chain(store.waits.values());
+            assert!(!all.any(|k| k.is(&c)), "{c}");
+            store.kind(n % 2 == 0).insert(format!("set-{n}"), kept(&c));
         }
     }
 
@@ -1117,5 +1152,10 @@ mod tests {
         assert!(!plain.contains("undo"), "{plain}");
         let old: Store = serde_json::from_str(r#"{"codes":{},"declined":{"acme":"h"}}"#).unwrap();
         assert!(old.codes.is_empty());
+        // A store from before `waits` kept wait codes with the undo codes.
+        let old = serde_json::json!({"codes": {"acme": kept("0042"), "beta": c}});
+        let s = serde_json::from_value::<Store>(old).unwrap().split();
+        assert!(s.codes.contains_key("beta") && !s.codes.contains_key("acme"));
+        assert_eq!(s.waits["acme"].recover().as_deref(), Some("0042"));
     }
 }
