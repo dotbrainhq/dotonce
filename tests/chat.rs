@@ -402,7 +402,7 @@ fn a_proposal_for_a_set_at_fix_waits_for_yes() {
         reason.starts_with("dotonce: that code isn't current, so nothing changed."),
         "{reason}"
     );
-    assert_eq!(code_for(&reason, "acme"), code, "{reason}");
+    assert_eq!(yes_code(&reason), code, "{reason}");
     assert_eq!(state(&h, "acme"), "fix");
     let reason = blocked(&prompt(&h, "s1", &h, &format!("yes {code}"), None)).unwrap();
     assert_eq!(reason, "dotonce: acme is on at fix.");
@@ -839,6 +839,12 @@ fn undo_code(reply: &str) -> String {
     reply[at..at + 4].to_string()
 }
 
+/// The code after "Send yes " in a reply, which can also list undo codes.
+fn yes_code(reply: &str) -> String {
+    let at = reply.find("Send yes ").unwrap_or_else(|| panic!("{reply}")) + "Send yes ".len();
+    reply[at..at + 4].to_string()
+}
+
 /// Whether any string in the JSON value is `text`.
 fn holds(v: &serde_json::Value, text: &str) -> bool {
     match v {
@@ -896,6 +902,44 @@ fn a_yes_from_an_earlier_notice_works_after_another_notice_shows_it() {
     assert_eq!(reason, "dotonce: acme is off.");
 }
 
+/// acme's undo code from the notice that turned it on, then the code of a
+/// change to it that waits at fix.
+fn undo_then_wait(name: &str) -> (PathBuf, String, String) {
+    let h = home(name);
+    rule(&h, "acme", ACME);
+    let undo = code_for(&start(&h, "s0", &h, None), "acme");
+    record(&h, "acme", |r| r["level"] = "fix".into());
+    propose(&h, ACME_MORE);
+    let wait = code_for(&stop(&h, "s1", &h, None), "acme");
+    assert_ne!(wait, undo);
+    (h, undo, wait)
+}
+
+#[test]
+fn a_waiting_proposal_keeps_the_undo_code_of_its_set() {
+    let (h, undo, wait) = undo_then_wait("undo-and-wait");
+    let list = blocked(&prompt(&h, "s1", &h, "dotonce", None)).unwrap();
+    assert!(list.contains(&format!("Send no {undo} to turn")), "{list}");
+    assert!(list.contains(&format!("Send yes {wait} to use")), "{list}");
+    let reason = blocked(&prompt(&h, "s1", &h, &format!("no {undo}"), None)).unwrap();
+    assert_eq!(reason, "dotonce: acme is off.");
+    let reason = blocked(&prompt(&h, "s1", &h, &format!("no {wait}"), None)).unwrap();
+    assert_eq!(
+        reason,
+        "dotonce: dropped the proposed acme. Nothing changed."
+    );
+}
+
+#[test]
+fn a_yes_on_the_proposal_leaves_the_old_undo_code_unused() {
+    let (h, undo, wait) = undo_then_wait("wait-then-undo");
+    let reason = blocked(&prompt(&h, "s1", &h, &format!("yes {wait}"), None)).unwrap();
+    assert_eq!(reason, "dotonce: acme is on at fix.");
+    let out = prompt(&h, "s1", &h, &format!("no {undo}"), None);
+    assert_eq!(blocked(&out), None, "{out}");
+    assert_eq!(state(&h, "acme"), "fix");
+}
+
 #[test]
 fn a_proposal_that_changes_between_notices_gets_a_new_code() {
     let h = waiting_at_fix("fix-new-code");
@@ -905,7 +949,7 @@ fn a_proposal_that_changes_between_notices_gets_a_new_code() {
     assert_ne!(second, first);
     let reason = blocked(&prompt(&h, "s2", &h, &format!("yes {first}"), None)).unwrap();
     assert!(reason.contains("that code isn't current"), "{reason}");
-    assert_eq!(code_for(&reason, "acme"), second, "{reason}");
+    assert_eq!(yes_code(&reason), second, "{reason}");
     let reason = blocked(&prompt(&h, "s1", &h, &format!("yes {second}"), None)).unwrap();
     assert_eq!(reason, "dotonce: acme is on at fix.");
 }

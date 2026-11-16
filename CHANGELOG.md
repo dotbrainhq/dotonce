@@ -52,6 +52,7 @@ Every release of dotonce is listed here. Versions follow semantic versioning.
 
 ### Fixed
 
+- A set's undo code keeps working when a change to the same set starts waiting for your OK. `dotonce` lists both, each with its own code.
 - A `yes` or `no` from an earlier message works after the change shows again, in the same session or another. Each change keeps one code until you answer it, it expires or its file changes, and a wrong code leaves the codes on screen as they are.
 - A short status message, like "done, next batch", stops pulling in facts that share only common words with it.
 - Hooks ignore Claude Code's own messages (task notifications, agent reports, system reminders), so they add no facts or reminders there. Only a prompt that starts with one counts, so a prompt you type that pastes one keeps its facts and reminders. Reply checks still run in those turns.
