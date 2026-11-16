@@ -388,7 +388,7 @@ fn a_proposal_for_a_set_at_fix_waits_for_yes() {
         ACME
     );
 
-    // A wrong code changes nothing, shows a new code, and the old one stops working.
+    // A wrong code changes nothing and shows the same code again.
     let code = code_for(&notice, "acme");
     let reason = blocked(&prompt(
         &h,
@@ -402,15 +402,9 @@ fn a_proposal_for_a_set_at_fix_waits_for_yes() {
         reason.starts_with("dotonce: that code isn't current, so nothing changed."),
         "{reason}"
     );
-    let fresh = code_for(&reason, "acme");
-    let fresh = if fresh == code {
-        fresh
-    } else {
-        let reason = blocked(&prompt(&h, "s1", &h, &format!("yes {code}"), None)).unwrap();
-        assert!(reason.contains("isn't current"), "{reason}");
-        code_for(&reason, "acme")
-    };
-    let reason = blocked(&prompt(&h, "s1", &h, &format!("yes {fresh}"), None)).unwrap();
+    assert_eq!(code_for(&reason, "acme"), code, "{reason}");
+    assert_eq!(state(&h, "acme"), "fix");
+    let reason = blocked(&prompt(&h, "s1", &h, &format!("yes {code}"), None)).unwrap();
     assert_eq!(reason, "dotonce: acme is on at fix.");
     assert_eq!(
         std::fs::read_to_string(h.join("dotonce/rules/acme.toml")).unwrap(),
@@ -788,8 +782,10 @@ fn an_asked_rule_waits_for_a_yes_and_turns_on_at_fix() {
     );
     assert!(notice.contains("Send yes "), "{notice}");
     assert_eq!(state(&h, "acme"), "");
-    // Another session's turn ends: it shows the same ask with a new code.
+    // Another session's turn ends: it shows the same ask with the same code.
+    let first = code_for(&notice, "acme");
     let notice = stop(&h, "s2", &h, None);
+    assert_eq!(code_for(&notice, "acme"), first, "{notice}");
     assert_eq!(
         state(&h, "acme"),
         "",
@@ -835,6 +831,83 @@ fn an_asked_rule_waits_for_a_yes_and_turns_on_at_fix() {
     let reason = blocked(&prompt(&h, "s2", &h, &format!("no {code}"), None)).unwrap();
     assert_eq!(reason, "dotonce: acme is off.");
     assert_eq!(level_of(&h, "acme"), "off");
+}
+
+/// The code after "Send no " in a reply.
+fn undo_code(reply: &str) -> String {
+    let at = reply.find("Send no ").unwrap_or_else(|| panic!("{reply}")) + "Send no ".len();
+    reply[at..at + 4].to_string()
+}
+
+/// Whether any string in the JSON value is `text`.
+fn holds(v: &serde_json::Value, text: &str) -> bool {
+    match v {
+        serde_json::Value::String(s) => s == text,
+        serde_json::Value::Array(a) => a.iter().any(|x| holds(x, text)),
+        serde_json::Value::Object(o) => o.values().any(|x| holds(x, text)),
+        _ => false,
+    }
+}
+
+#[test]
+fn a_yes_from_an_earlier_notice_works_after_another_notice_shows_it() {
+    let h = home("ask-earlier");
+    propose_ask(&h, &asked_rule(&h), &[]);
+    let first = code_for(&stop(&h, "s1", &h, None), "acme");
+
+    // A second session shows the same ask at its start, and again when the
+    // user sends dotonce or a wrong code. The code stays the same.
+    let again = start(&h, "s2", &h, None);
+    assert_eq!(code_for(&again, "acme"), first, "{again}");
+    let list = blocked(&prompt(&h, "s2", &h, "dotonce", None)).unwrap();
+    assert_eq!(code_for(&list, "acme"), first, "{list}");
+    let wrong = blocked(&prompt(
+        &h,
+        "s2",
+        &h,
+        &format!("yes {}", other_code(&first)),
+        None,
+    ))
+    .unwrap();
+    assert!(wrong.contains("that code isn't current"), "{wrong}");
+    assert_eq!(code_for(&wrong, "acme"), first, "{wrong}");
+    assert_eq!(state(&h, "acme"), "");
+
+    // chat.json keeps only a salted hash of it.
+    let store: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(h.join("dotonce/chat.json")).unwrap())
+            .unwrap();
+    assert!(!holds(&store, &first), "{store}");
+
+    // The yes from the first session's notice works in the second.
+    let reason = blocked(&prompt(&h, "s2", &h, &format!("yes {first}"), None)).unwrap();
+    assert!(
+        reason.contains("dotonce: acme is on at fix. Send no "),
+        "{reason}"
+    );
+    assert_eq!(level_of(&h, "acme"), "fix");
+
+    // So does the undo code from that reply, after dotonce lists it again
+    // in another session.
+    let undo = undo_code(&reason);
+    let list = blocked(&prompt(&h, "s3", &h, "dotonce", None)).unwrap();
+    assert_eq!(code_for(&list, "acme"), undo, "{list}");
+    let reason = blocked(&prompt(&h, "s3", &h, &format!("no {undo}"), None)).unwrap();
+    assert_eq!(reason, "dotonce: acme is off.");
+}
+
+#[test]
+fn a_proposal_that_changes_between_notices_gets_a_new_code() {
+    let h = waiting_at_fix("fix-new-code");
+    let first = code_for(&stop(&h, "s1", &h, None), "acme");
+    propose(&h, &format!("{ACME_MORE}# again\n"));
+    let second = code_for(&start(&h, "s2", &h, None), "acme");
+    assert_ne!(second, first);
+    let reason = blocked(&prompt(&h, "s2", &h, &format!("yes {first}"), None)).unwrap();
+    assert!(reason.contains("that code isn't current"), "{reason}");
+    assert_eq!(code_for(&reason, "acme"), second, "{reason}");
+    let reason = blocked(&prompt(&h, "s1", &h, &format!("yes {second}"), None)).unwrap();
+    assert_eq!(reason, "dotonce: acme is on at fix.");
 }
 
 #[test]

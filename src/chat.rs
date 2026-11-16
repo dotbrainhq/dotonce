@@ -8,15 +8,17 @@
 //!
 //! The code is what makes the reply the user's. Claude, a scheduled prompt
 //! or another session can send text that looks typed, but can't see the
-//! code. dotonce keeps only a salted hash of it, makes a new one each time
-//! it shows a change, and ties it to the file as shown. Like the terminal
-//! check, this stops the plain case, not a determined one: a four-digit hash
-//! is easy to reverse, and a shown code also sits in the session transcript
-//! on disk. That's why the code store is guarded like approvals.json, codes
-//! are only shown or taken when Claude Code itself runs the hook and never
-//! in headless runs, and every change still shows in `rules list`.
+//! code. Each change keeps one code until it's answered, expires or its
+//! file changes, so every notice that shows it, in any session, gives the
+//! same code and any of them can be answered. dotonce keeps only a salted
+//! hash of it, finds the code again from the hash to show it, and ties it
+//! to the file as shown. Like the terminal check, this stops the plain case,
+//! not a determined one: a four-digit hash is easy to reverse, and a shown
+//! code also sits in the session transcript on disk. That's why the code
+//! store is guarded like approvals.json, codes are only shown or taken when
+//! Claude Code itself runs the hook and never in headless runs, and every
+//! change still shows in `rules list`.
 
-use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read};
@@ -91,6 +93,31 @@ struct Code {
     /// The user turned it on with a yes, so it didn't change by itself.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     asked: bool,
+    /// For a waiting proposal, what a yes does (see `waiting_block`). Empty
+    /// for an undo, and in stores from before it was kept.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    wait: String,
+}
+
+impl Code {
+    /// Whether this code was made for the change `b` shows, so `b` shows it
+    /// again. A code from before `wait` was kept matches any wait.
+    fn made_for(&self, b: &Block) -> bool {
+        self.file == b.file
+            && self.undo == b.undo
+            && self.since == b.since
+            && self.asked == b.asked
+            && (self.wait.is_empty() || self.wait == b.wait)
+    }
+
+    fn is(&self, code: &str) -> bool {
+        self.code == code_hash(&self.salt, code)
+    }
+
+    /// The code, found again from its hash by trying all 10,000.
+    fn recover(&self) -> Option<String> {
+        (0..10_000).map(|n| format!("{n:04}")).find(|c| self.is(c))
+    }
 }
 
 /// chat.json: the current code of each shown change, by set id.
@@ -277,14 +304,14 @@ pub fn waiting(a: &Approvals) -> Result<Vec<Waiting>> {
     Ok(out)
 }
 
-/// Four random digits not in `taken`.
-fn new_code(taken: &BTreeSet<String>) -> Result<String> {
+/// Four random digits no code in `store` has, so a reply finds one change.
+fn new_code(store: &Store) -> Result<String> {
     let mut f = fs::File::open("/dev/urandom").context("open /dev/urandom")?;
     loop {
         let mut b = [0u8; 8];
         f.read_exact(&mut b)?;
         let code = format!("{:04}", u64::from_le_bytes(b) % 10_000);
-        if !taken.contains(&code) {
+        if !store.codes.values().any(|c| c.is(&code)) {
             return Ok(code);
         }
     }
@@ -353,6 +380,7 @@ struct Block {
     undo: Option<Undo>,
     since: String,
     asked: bool,
+    wait: String,
     /// The text, with `CODE` where the code goes.
     text: String,
 }
@@ -399,6 +427,7 @@ fn event_block(e: &Event, since: &str) -> Block {
         undo: Some(undo),
         since: since.to_string(),
         asked: false,
+        wait: String::new(),
         text,
     }
 }
@@ -430,16 +459,19 @@ fn undo_block(set: &RuleSet, c: &Code) -> Option<Block> {
         undo: c.undo.clone(),
         since: c.since.clone(),
         asked: c.asked,
+        wait: String::new(),
         text,
     })
 }
 
+/// A waiting proposal. Its `wait` says what a yes does, so a code shown for
+/// one ask isn't shown again for a new ask of the same file.
 fn waiting_block(w: &Waiting, a: &Approvals) -> Block {
     let id = rules::printable(&w.set.id);
     let level = a.sets.get(&w.set.id).map_or(w.set.level, |p| p.level);
-    let what = match &w.wait {
-        Wait::Fix => "a change to a set at fix",
-        Wait::Off => "a change to a set you turned off",
+    let (what, wait) = match &w.wait {
+        Wait::Fix => ("a change to a set at fix", "fix"),
+        Wait::Off => ("a change to a set you turned off", "off"),
         Wait::Ask(q) => {
             let level = q.level.as_str();
             let text = format!(
@@ -455,6 +487,7 @@ fn waiting_block(w: &Waiting, a: &Approvals) -> Block {
                 undo: None,
                 since: String::new(),
                 asked: false,
+                wait: format!("ask {level} {}", q.created),
                 text,
             };
         }
@@ -471,35 +504,46 @@ fn waiting_block(w: &Waiting, a: &Approvals) -> Block {
         undo: None,
         since: String::new(),
         asked: false,
+        wait: wait.to_string(),
         text,
     }
 }
 
-/// Gives each block a fresh code, saved in `store`, and returns the texts.
-/// The caller saves the store before the notice goes out.
-fn issue(
-    store: &mut Store,
-    blocks: &[Block],
-    taken: &mut BTreeSet<String>,
-    sid: &str,
-) -> Result<Vec<String>> {
+/// Gives each block its code, saved in `store`, and returns the texts: the
+/// code it was shown with before, while that's for the same change, or a
+/// new one. The caller saves the store before the notice goes out.
+fn issue(store: &mut Store, blocks: &[Block], sid: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for b in blocks {
-        let code = new_code(taken)?;
-        taken.insert(code.clone());
-        let salt = salt()?;
-        store.codes.insert(
-            b.id.clone(),
-            Code {
-                file: b.file.clone(),
-                code: code_hash(&salt, &code),
-                salt,
-                session: sid.to_string(),
-                undo: b.undo.clone(),
-                since: b.since.clone(),
-                asked: b.asked,
-            },
-        );
+        let kept = store
+            .codes
+            .get(&b.id)
+            .filter(|c| c.made_for(b))
+            .and_then(Code::recover);
+        let code = match kept {
+            Some(code) => code,
+            None => {
+                let code = new_code(store)?;
+                let salt = salt()?;
+                store.codes.insert(
+                    b.id.clone(),
+                    Code {
+                        file: b.file.clone(),
+                        code: code_hash(&salt, &code),
+                        salt,
+                        undo: b.undo.clone(),
+                        since: b.since.clone(),
+                        asked: b.asked,
+                        ..Code::default()
+                    },
+                );
+                code
+            }
+        };
+        if let Some(c) = store.codes.get_mut(&b.id) {
+            c.session = sid.to_string();
+            c.wait.clone_from(&b.wait);
+        }
         out.push(b.text.replace(CODE, &code));
     }
     Ok(out)
@@ -513,8 +557,8 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     }
 }
 
-/// The notice: changes dotonce made, then proposals that wait, each with a
-/// fresh code. `hidden` counts private ones this folder doesn't show. None
+/// The notice: changes dotonce made, then proposals that wait, each with
+/// its code. `hidden` counts private ones this folder doesn't show. None
 /// when there is nothing to say.
 fn notice(
     store: &mut Store,
@@ -526,11 +570,10 @@ fn notice(
     if changes.is_empty() && waits.is_empty() && hidden == 0 {
         return Ok(None);
     }
-    let mut taken = BTreeSet::new();
     let mut parts = Vec::new();
     let private_note = " Only you see this message and its codes.";
     if !changes.is_empty() {
-        let texts = issue(store, changes, &mut taken, sid)?;
+        let texts = issue(store, changes, sid)?;
         let by = if changes.iter().any(|b| b.asked) {
             ""
         } else {
@@ -543,7 +586,7 @@ fn notice(
         ));
     }
     if !waits.is_empty() {
-        let texts = issue(store, waits, &mut taken, sid)?;
+        let texts = issue(store, waits, sid)?;
         let verb = if waits.len() == 1 { "waits" } else { "wait" };
         let note = if changes.is_empty() { private_note } else { "" };
         parts.push(format!(
@@ -586,7 +629,7 @@ fn event_blocks(
     let (shown, hidden): (Vec<&Event>, Vec<&Event>) =
         events.iter().partition(|e| private_ok || !e.private);
     let unseen: Vec<Block> = hidden.iter().map(|e| event_block(e, &since)).collect();
-    issue(store, &unseen, &mut BTreeSet::new(), sid)?;
+    issue(store, &unseen, sid)?;
     Ok((
         shown.iter().map(|e| event_block(e, &since)).collect(),
         hidden.len(),
@@ -926,13 +969,14 @@ pub fn answer(
                         undo: Some(how),
                         since: stamp.clone(),
                         asked: true,
+                        wait: String::new(),
                         text: format!(
                             "dotonce: {shown_id} is on at {}. Send no {CODE} within \
                              {UNDO_DAYS} days to {after}.",
                             q.level.as_str()
                         ),
                     };
-                    issue(&mut store, &[block], &mut BTreeSet::new(), sid)?.concat()
+                    issue(&mut store, &[block], sid)?.concat()
                 }
                 (_, Reply::Yes(_)) => {
                     let level = use_proposal(w, &stamp)?;
@@ -983,15 +1027,62 @@ mod tests {
         }
     }
 
+    fn kept(code: &str) -> Code {
+        let salt = salt().unwrap();
+        Code {
+            code: code_hash(&salt, code),
+            salt,
+            ..Code::default()
+        }
+    }
+
     #[test]
-    fn codes_are_four_digits_and_never_repeat_in_one_notice() {
-        let mut taken = BTreeSet::new();
-        for _ in 0..200 {
-            let c = new_code(&taken).unwrap();
+    fn codes_are_four_digits_and_never_match_a_kept_code() {
+        let mut store = Store::default();
+        for n in 0..200 {
+            let c = new_code(&store).unwrap();
             assert_eq!(c.len(), 4);
             assert!(c.chars().all(|x| x.is_ascii_digit()));
-            assert!(taken.insert(c));
+            assert!(!store.codes.values().any(|k| k.is(&c)), "{c}");
+            store.codes.insert(format!("set-{n}"), kept(&c));
         }
+    }
+
+    #[test]
+    fn a_kept_code_is_found_again_from_its_hash() {
+        assert_eq!(kept("0042").recover().as_deref(), Some("0042"));
+        let mut bad = kept("0042");
+        bad.code = "x".into();
+        assert_eq!(bad.recover(), None);
+    }
+
+    #[test]
+    fn a_code_is_shown_again_only_for_the_change_it_was_made_for() {
+        let b = Block {
+            id: "acme".into(),
+            file: "f".into(),
+            undo: None,
+            since: String::new(),
+            asked: false,
+            wait: "ask fix 2026-11-15T00:00:00Z".into(),
+            text: String::new(),
+        };
+        let mut c = Code {
+            file: "f".into(),
+            wait: b.wait.clone(),
+            ..Code::default()
+        };
+        assert!(c.made_for(&b));
+        c.wait = "fix".into();
+        assert!(!c.made_for(&b));
+        // A store from before `wait` was kept.
+        c.wait.clear();
+        assert!(c.made_for(&b));
+        c.file = "g".into();
+        assert!(!c.made_for(&b));
+        c.file = "f".into();
+        c.undo = Some(Undo::Off);
+        assert!(!c.made_for(&b));
     }
 
     #[test]
