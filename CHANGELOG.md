@@ -52,6 +52,7 @@ Every release of dotonce is listed here. Versions follow semantic versioning.
 
 ### Fixed
 
+- A `yes` or `no` from an earlier message works after the change shows again, in the same session or another. Each change keeps one code until you answer it, it expires or its file changes, and a wrong code leaves the codes on screen as they are.
 - A short status message, like "done, next batch", stops pulling in facts that share only common words with it.
 - Hooks ignore Claude Code's own messages (task notifications, agent reports, system reminders), so they add no facts or reminders there. Only a prompt that starts with one counts, so a prompt you type that pastes one keeps its facts and reminders. Reply checks still run in those turns.
 - A prompt you type keeps its facts and reminders when the desktop app puts a note in front of it, such as a status line about linked sessions. Only the typed words are matched. The app's own events (side-session, CI and cross-session messages) get none, alone or behind a note.

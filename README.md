@@ -298,7 +298,7 @@ support-replies is on, log-only, so it notes slips and changes nothing: 3 checks
   Send no 4821 to turn it off.
 ```
 
-Send `no 4821` to undo the change, any time in the next week. dotonce does the same when it moves a set to `fix` or back. Send `dotonce` to see what you can still undo.
+Send `no 4821` to undo the change, any time in the next week. dotonce does the same when it moves a set to `fix` or back. Send `dotonce` to see what you can still undo. A change keeps its code until you answer it or it expires, so every message that shows it, in any session, gives the same code. A waiting change gets a new code only if its file changes.
 
 Claude can write a rule set and run `dotonce rules propose FILE`. A new set, or a change to a set at `warn` or `remind`, goes on at the end of that turn, with the same kind of message. A change to a set at `fix`, or to one you turned off, waits for you instead: send `yes` and the code to use it, or `no` and the code to drop it. Every file that was applied, replaced, undone or dropped is kept in `~/.dotonce/proposals/done/`.
 
