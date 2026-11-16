@@ -52,6 +52,7 @@ Every release of dotonce is listed here. Versions follow semantic versioning.
 
 ### Fixed
 
+- A change that waits for your OK shows once in each session at the end of a turn, not again every turn when two sessions run side by side. A session start and `dotonce` still show every change that waits.
 - A set's undo code keeps working when a change to the same set starts waiting for your OK. `dotonce` lists both, each with its own code.
 - A `yes` or `no` from an earlier message works after the change shows again, in the same session or another. Each change keeps one code until you answer it, it expires or its file changes, and a wrong code leaves the codes on screen as they are.
 - A short status message, like "done, next batch", stops pulling in facts that share only common words with it.

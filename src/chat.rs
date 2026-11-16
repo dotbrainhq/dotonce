@@ -41,6 +41,8 @@ const MAX_REMIND: usize = 200;
 const MAX_WHY: usize = 120;
 /// Days a change can be undone from the chat.
 const UNDO_DAYS: i64 = 7;
+/// Sessions a code remembers it was shown in.
+const MAX_SEEN: usize = 8;
 /// Stands in for the code in a block of text until the code is made. Rule
 /// text goes through `printable`, which drops control characters, so it
 /// never holds this.
@@ -85,6 +87,10 @@ struct Code {
     code: String,
     /// The session it was last shown in.
     session: String,
+    /// The last `MAX_SEEN` sessions it was shown in, newest last, so the end
+    /// of a turn shows a waiting proposal once in each session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    seen: Vec<String>,
     /// Set for a change that can be undone. None for a waiting proposal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     undo: Option<Undo>,
@@ -113,6 +119,20 @@ impl Code {
 
     fn is(&self, code: &str) -> bool {
         self.code == code_hash(&self.salt, code)
+    }
+
+    fn shown_in(&mut self, sid: &str) {
+        self.session = sid.to_string();
+        self.seen.retain(|s| s != sid);
+        self.seen.push(sid.to_string());
+        let extra = self.seen.len().saturating_sub(MAX_SEEN);
+        self.seen.drain(..extra);
+    }
+
+    /// Whether session `sid` showed it. A store from before `seen` was kept
+    /// has only the last session.
+    fn seen_in(&self, sid: &str) -> bool {
+        self.session == sid || self.seen.iter().any(|s| s == sid)
     }
 
     /// The code, found again from its hash by trying all 10,000.
@@ -574,7 +594,7 @@ fn issue(store: &mut Store, blocks: &[Block], sid: &str) -> Result<Vec<String>> 
             }
         };
         if let Some(c) = store.kind(b.undo.is_some()).get_mut(&b.id) {
-            c.session = sid.to_string();
+            c.shown_in(sid);
             c.wait.clone_from(&b.wait);
         }
         out.push(b.text.replace(CODE, &code));
@@ -716,7 +736,7 @@ pub fn notice_new(
             store
                 .waits
                 .get(&w.set.id)
-                .is_none_or(|c| c.session != sid || c.file != approvals::hash(&w.set.src))
+                .is_none_or(|c| !c.seen_in(sid) || c.file != approvals::hash(&w.set.src))
         })
         .map(|w| waiting_block(w, &a))
         .collect();
@@ -1118,6 +1138,22 @@ mod tests {
         c.file = "f".into();
         c.undo = Some(Undo::Off);
         assert!(!c.made_for(&b));
+    }
+
+    #[test]
+    fn a_code_remembers_the_last_sessions_it_was_shown_in() {
+        let mut c: Code = serde_json::from_value(serde_json::json!(
+            {"file": "f", "salt": "s", "code": "h", "session": "old"}
+        ))
+        .unwrap();
+        assert!(c.seen_in("old") && !c.seen_in("s0"));
+        for n in 0..=MAX_SEEN {
+            c.shown_in(&format!("s{n}"));
+        }
+        c.shown_in("s1");
+        assert!(c.seen_in("s1") && c.seen_in(&format!("s{MAX_SEEN}")));
+        assert!(!c.seen_in("old") && !c.seen_in("s0"));
+        assert_eq!(c.seen.len(), MAX_SEEN);
     }
 
     #[test]
